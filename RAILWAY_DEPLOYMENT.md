@@ -23,14 +23,29 @@ railway init
 railway up
 ```
 
-## Step 2: Add PostgreSQL Database
+## Step 2: Add Persistence (Required)
 
-Railway has a native PostgreSQL addon with pgvector support:
+On Railway, the container filesystem is **ephemeral across redeploys**. If you run the bundled Postgres inside the container, you must attach a **Railway Volume** so the Postgres data directory survives redeploys.
+
+### Recommended: Persist the Bundled "Internal Postgres" with a Railway Volume
+
+In Railway Dashboard:
+
+1. Open your Letta service → Settings → Volumes
+2. Add a volume
+3. Set mount path to `/var/lib/postgresql/data`
+4. Redeploy
+
+Without a volume mounted at `/var/lib/postgresql/data`, Postgres re-initializes and you lose agents.
+
+### Alternative: Railway Managed PostgreSQL
+
+Railway also has a native PostgreSQL addon:
 
 1. In your Railway project, click "+ New"
 2. Select "Database" → "PostgreSQL"
 3. Wait for the database to provision
-4. Railway automatically sets `DATABASE_URL` environment variable
+4. Railway automatically sets the `DATABASE_URL` environment variable
 
 ## Step 3: Configure Environment Variables
 
@@ -39,7 +54,12 @@ In Railway Dashboard → Variables, add:
 ### Required Variables
 
 ```bash
-# Database (auto-set if you use Railway Postgres)
+# Database
+# - If you are using Railway Managed Postgres, set:
+#   LETTA_PG_URI=${{Postgres.DATABASE_URL}}
+# - If you are using the bundled internal Postgres (recommended with a volume),
+#   you can omit LETTA_PG_URI and it will default to localhost.
+#   (You still MUST mount a volume at /var/lib/postgresql/data for persistence.)
 LETTA_PG_URI=${{Postgres.DATABASE_URL}}
 
 # OpenAI API Key (for embeddings ONLY)

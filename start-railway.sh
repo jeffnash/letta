@@ -1,28 +1,39 @@
 #!/bin/bash
 set -e
 
-PGDATA="/var/lib/postgresql/data"
-PGLOG="/var/lib/postgresql/postgresql.log"
-HOST="0.0.0.0"
+# NOTE: On Railway, the container filesystem is ephemeral across redeploys.
+# To persist agents/data while running the bundled Postgres, you must attach
+# a Railway Volume mounted at $PGDATA (default: /var/lib/postgresql/data).
+PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+PGLOG="${PGLOG:-/var/lib/postgresql/postgresql.log}"
+HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8283}"
 
 echo "=== Railway Letta Startup ==="
 echo "PORT=$PORT, HOST=$HOST"
+echo "PGDATA=$PGDATA"
 
 # Start PostgreSQL
 echo "Starting internal PostgreSQL..."
+
+# Ensure PGDATA exists (Railway Volume should be mounted here)
+mkdir -p "$PGDATA"
+chown -R postgres:postgres "$PGDATA" || true
+
 if [ ! -d "$PGDATA/base" ]; then
     echo "Initializing PostgreSQL database..."
-    chown -R postgres:postgres /var/lib/postgresql
+
+    # initdb requires ownership of the data directory
+    chown -R postgres:postgres "$PGDATA"
     su postgres -c "/usr/lib/postgresql/15/bin/initdb -D $PGDATA"
-    
+
     su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PGDATA -l $PGLOG start"
     sleep 3
-    
+
     su postgres -c "psql -c \"CREATE USER letta WITH PASSWORD 'letta' SUPERUSER;\"" || true
     su postgres -c "psql -c \"CREATE DATABASE letta OWNER letta;\"" || true
     su postgres -c "psql -d letta -c \"CREATE EXTENSION IF NOT EXISTS vector;\"" || true
-    
+
     echo "PostgreSQL initialized with pgvector extension"
 else
     echo "Starting existing PostgreSQL..."
@@ -57,8 +68,10 @@ for i in {1..30}; do
 done
 
 # Set environment variables
-export LETTA_PG_URI="postgresql://letta:letta@localhost:5432/letta"
-export LETTA_REDIS_HOST="localhost"
+# If you want to use Railway managed Postgres instead, set LETTA_PG_URI in Railway Variables.
+# For the bundled internal Postgres (in this container), the default is localhost.
+export LETTA_PG_URI="${LETTA_PG_URI:-postgresql://letta:letta@localhost:5432/letta}"
+export LETTA_REDIS_HOST="${LETTA_REDIS_HOST:-localhost}"
 
 echo "LETTA_PG_URI=$LETTA_PG_URI"
 echo "LETTA_REDIS_HOST=$LETTA_REDIS_HOST"

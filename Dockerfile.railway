@@ -60,7 +60,8 @@ COPY --from=builder /app .
 COPY start-railway.sh /app/start-railway.sh
 RUN chmod +x /app/start-railway.sh
 
-# Create postgres directories with proper ownership
+# Create postgres directories with proper ownership.
+# NOTE: For persistence on Railway, mount a Railway Volume at /var/lib/postgresql/data.
 RUN mkdir -p /var/lib/postgresql/data && \
     chown -R postgres:postgres /var/lib/postgresql
 
