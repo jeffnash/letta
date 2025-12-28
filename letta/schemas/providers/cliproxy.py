@@ -24,6 +24,13 @@ CLIPROXY_MODELS = {
     "gpt-5.2-medium": {"context_window": 272000, "max_tokens": 128000},
     "gpt-5.2-low": {"context_window": 272000, "max_tokens": 128000},
     "gpt-5.2-minimal": {"context_window": 272000, "max_tokens": 128000},
+
+    # GPT-5.2 Codex variants
+    "gpt-5.2-codex": {"context_window": 400000, "max_tokens": 128000},
+    "gpt-5.2-codex-low": {"context_window": 400000, "max_tokens": 128000},
+    "gpt-5.2-codex-medium": {"context_window": 400000, "max_tokens": 128000},
+    "gpt-5.2-codex-high": {"context_window": 400000, "max_tokens": 128000},
+    "gpt-5.2-codex-xhigh": {"context_window": 400000, "max_tokens": 128000},
     # GPT-5.1 Codex variants
     "gpt-5.1-codex-max-xhigh": {"context_window": 272000, "max_tokens": 128000},
     "gpt-5.1-codex-max-high": {"context_window": 272000, "max_tokens": 128000},
@@ -50,7 +57,16 @@ CLIPROXY_MODELS = {
     "copilot-gpt-5": {"context_window": 272000, "max_tokens": 128000},
     "copilot-gpt-5-codex": {"context_window": 272000, "max_tokens": 128000},
     "copilot-gpt-4.1": {"context_window": 1047576, "max_tokens": 32768},
-    "copilot-gemini-3-pro-preview": {"context_window": 180000, "max_tokens": 64000},
+
+    # Copilot Gemini models (CLIProxyAPI supports these `copilot-` aliases)
+    "copilot-gemini-3-pro-preview": {"context_window": 128000, "max_tokens": 64000},
+    "copilot-gemini-3-flash-preview": {"context_window": 128000, "max_tokens": 64000},
+    "copilot-gemini-2.5-pro": {"context_window": 128000, "max_tokens": 64000},
+    "copilot-gemini-2.5-flash": {"context_window": 128000, "max_tokens": 64000},
+
+    # Gemini-provider variants for Claude via Gemini (see CLIProxyAPI: `gemini-claude-*-thinking`)
+    "gemini-claude-sonnet-4-5-thinking": {"context_window": 200000, "max_tokens": 64000},
+    "gemini-claude-opus-4-5-thinking": {"context_window": 200000, "max_tokens": 64000},
     # Qwen
     "qwen3-coder-plus": {"context_window": 128000, "max_tokens": 32768},
     "qwen3-coder-flash": {"context_window": 128000, "max_tokens": 32768},
