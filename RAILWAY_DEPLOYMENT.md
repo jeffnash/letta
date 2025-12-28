@@ -36,6 +36,8 @@ In Railway Dashboard:
 3. Set mount path to `/var/lib/postgresql/data`
 4. Redeploy
 
+Note: Railway volumes often create a `lost+found` directory at the mount root; the container startup script detects this and will initialize Postgres in a subdirectory (`/var/lib/postgresql/data/pgdata`) automatically.
+
 Without a volume mounted at `/var/lib/postgresql/data`, Postgres re-initializes and you lose agents.
 
 ### Alternative: Railway Managed PostgreSQL

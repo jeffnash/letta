@@ -4,10 +4,21 @@ set -e
 # NOTE: On Railway, the container filesystem is ephemeral across redeploys.
 # To persist agents/data while running the bundled Postgres, you must attach
 # a Railway Volume mounted at $PGDATA (default: /var/lib/postgresql/data).
+# If the mounted volume root contains `lost+found`, a `pgdata/` subdirectory
+# will be used automatically for `initdb`.
 PGDATA="${PGDATA:-/var/lib/postgresql/data}"
-PGLOG="${PGLOG:-/var/lib/postgresql/postgresql.log}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8283}"
+
+# Some volume providers (including Railway) mount an ext filesystem that creates
+# a `lost+found` directory at the mount root. `initdb` refuses to initialize a
+# cluster in a non-empty directory, so use a subdirectory when that happens.
+if [ -d "$PGDATA/lost+found" ] && [ ! -d "$PGDATA/base" ]; then
+    echo "Detected volume mountpoint at PGDATA with lost+found; using subdirectory: $PGDATA/pgdata"
+    PGDATA="$PGDATA/pgdata"
+fi
+
+PGLOG="${PGLOG:-$PGDATA/postgresql.log}"
 
 echo "=== Railway Letta Startup ==="
 echo "PORT=$PORT, HOST=$HOST"
@@ -18,16 +29,16 @@ echo "Starting internal PostgreSQL..."
 
 # Ensure PGDATA exists (Railway Volume should be mounted here)
 mkdir -p "$PGDATA"
-chown -R postgres:postgres "$PGDATA" || true
+chown postgres:postgres "$PGDATA" || true
 
 if [ ! -d "$PGDATA/base" ]; then
     echo "Initializing PostgreSQL database..."
 
     # initdb requires ownership of the data directory
-    chown -R postgres:postgres "$PGDATA"
-    su postgres -c "/usr/lib/postgresql/15/bin/initdb -D $PGDATA"
+    chown -R postgres:postgres "$PGDATA" || true
+    su postgres -c "/usr/lib/postgresql/15/bin/initdb -D \"$PGDATA\""
 
-    su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PGDATA -l $PGLOG start"
+    su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D \"$PGDATA\" -l \"$PGLOG\" start"
     sleep 3
 
     su postgres -c "psql -c \"CREATE USER letta WITH PASSWORD 'letta' SUPERUSER;\"" || true
@@ -37,7 +48,7 @@ if [ ! -d "$PGDATA/base" ]; then
     echo "PostgreSQL initialized with pgvector extension"
 else
     echo "Starting existing PostgreSQL..."
-    su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D $PGDATA -l $PGLOG start"
+    su postgres -c "/usr/lib/postgresql/15/bin/pg_ctl -D \"$PGDATA\" -l \"$PGLOG\" start"
     sleep 2
 fi
 
