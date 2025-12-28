@@ -192,6 +192,10 @@ class ModelSettings(BaseSettings):
     openllm_auth_type: Optional[str] = None
     openllm_api_key: Optional[str] = None
 
+    # CLIProxyAPI (OpenAI-compatible proxy)
+    cliproxy_api_key: Optional[str] = None
+    cliproxy_base_url: Optional[str] = None
+
 
 env_cors_origins = os.getenv("ACCEPTABLE_ORIGINS")
 

@@ -8,6 +8,14 @@
 
 # Letta (formerly MemGPT)
 
+> [!IMPORTANT]
+> This repository is a fork of `letta-ai/letta`.
+>
+> Fork note: this fork is intended to be used with the CLIProxy stack:
+> - Letta Code (fork): https://github.com/jeffnash/letta-code
+> - CLIProxyAPI (recommended fork): https://github.com/jeffnash/CLIProxyAPI
+> - Patch-22 (optional safety net): https://github.com/jeffnash/patch-22
+
 Letta is the platform for building stateful agents: open AI with advanced memory that can learn and self-improve over time.
 
 * [**Quickstart**](https://docs.letta.com/quickstart): Build your first stateful agent in 5 minutes using Python or TypeScript

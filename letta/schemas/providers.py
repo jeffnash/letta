@@ -122,6 +122,7 @@ class Provider(ProviderBase):
 
 
 class ProviderCreate(ProviderBase):
+    base_url: Optional[str] = Field(None, description="Base URL for the provider.")
     name: str = Field(..., description="The name of the provider.")
     provider_type: ProviderType = Field(..., description="The type of the provider.")
     api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
@@ -130,6 +131,7 @@ class ProviderCreate(ProviderBase):
 
 
 class ProviderUpdate(ProviderBase):
+    base_url: Optional[str] = Field(None, description="Base URL for the provider.")
     api_key: str = Field(..., description="API key or secret key used for requests to the provider.")
     access_key: Optional[str] = Field(None, description="Access key used for requests to the provider.")
     region: Optional[str] = Field(None, description="Region used for requests to the provider.")

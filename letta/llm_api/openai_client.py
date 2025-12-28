@@ -176,6 +176,13 @@ class OpenAIClient(LLMClientBase):
 
         kwargs = {"api_key": api_key, "base_url": llm_config.model_endpoint}
 
+        # CLIProxy-specific overrides: use CLIProxy key
+        is_cliproxy = llm_config.provider_name == "cliproxy"
+        if is_cliproxy:
+            cliproxy_key = model_settings.cliproxy_api_key or os.environ.get("CLIPROXY_API_KEY")
+            if cliproxy_key:
+                kwargs["api_key"] = cliproxy_key
+
         # OpenRouter-specific overrides: use OpenRouter key and optional headers
         is_openrouter = (llm_config.model_endpoint and "openrouter.ai" in llm_config.model_endpoint) or (
             llm_config.provider_name == "openrouter"
@@ -211,6 +218,13 @@ class OpenAIClient(LLMClientBase):
         if not api_key:
             api_key = model_settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
         kwargs = {"api_key": api_key, "base_url": llm_config.model_endpoint}
+
+        # CLIProxy-specific overrides: use CLIProxy key
+        is_cliproxy = llm_config.provider_name == "cliproxy"
+        if is_cliproxy:
+            cliproxy_key = model_settings.cliproxy_api_key or os.environ.get("CLIPROXY_API_KEY")
+            if cliproxy_key:
+                kwargs["api_key"] = cliproxy_key
 
         is_openrouter = (llm_config.model_endpoint and "openrouter.ai" in llm_config.model_endpoint) or (
             llm_config.provider_name == "openrouter"
@@ -383,8 +397,8 @@ class OpenAIClient(LLMClientBase):
         if tools and supports_parallel_tool_calling(model):
             data.parallel_tool_calls = llm_config.parallel_tool_calls
 
-        # always set user id for openai requests
-        if self.actor:
+        # always set user id for openai requests (skip for CLIProxy - doesn't support user param)
+        if self.actor and llm_config.provider_name != "cliproxy":
             data.user = self.actor.id
 
         if llm_config.model_endpoint == LETTA_MODEL_ENDPOINT:
@@ -530,8 +544,8 @@ class OpenAIClient(LLMClientBase):
                 # For text or json_object, just pass the type
                 data.response_format = {"type": llm_config.response_format.type}
 
-        # always set user id for openai requests
-        if self.actor:
+        # always set user id for openai requests (skip for CLIProxy - doesn't support user param)
+        if self.actor and llm_config.provider_name != "cliproxy":
             data.user = self.actor.id
 
         if llm_config.model_endpoint == LETTA_MODEL_ENDPOINT:

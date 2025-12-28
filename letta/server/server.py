@@ -56,6 +56,7 @@ from letta.schemas.providers import (
     AnthropicProvider,
     AzureProvider,
     BedrockProvider,
+    CLIProxyProvider,
     DeepSeekProvider,
     GoogleAIProvider,
     GoogleVertexProvider,
@@ -321,6 +322,14 @@ class SyncServer(object):
                 OpenRouterProvider(
                     name=model_settings.openrouter_handle_base if model_settings.openrouter_handle_base else "openrouter",
                     api_key_enc=Secret.from_plaintext(model_settings.openrouter_api_key),
+                )
+            )
+        if model_settings.cliproxy_base_url:
+            self._enabled_providers.append(
+                CLIProxyProvider(
+                    name="cliproxy",
+                    api_key_enc=Secret.from_plaintext(model_settings.cliproxy_api_key) if model_settings.cliproxy_api_key else None,
+                    base_url=model_settings.cliproxy_base_url,
                 )
             )
 

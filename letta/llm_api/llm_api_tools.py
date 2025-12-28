@@ -183,9 +183,14 @@ def create(
             is_openrouter = (llm_config.model_endpoint and "openrouter.ai" in llm_config.model_endpoint) or (
                 llm_config.provider_name == "openrouter"
             )
-            if is_openrouter:
+            # Use CLIProxy key when targeting CLIProxy
+            is_cliproxy = llm_config.provider_name == "cliproxy"
+            
+            if is_cliproxy:
+                api_key = model_settings.cliproxy_api_key or os.environ.get("CLIPROXY_API_KEY")
+            elif is_openrouter:
                 api_key = model_settings.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-            if not is_openrouter or not api_key:
+            if not is_cliproxy and not is_openrouter or not api_key:
                 api_key = model_settings.openai_api_key or os.environ.get("OPENAI_API_KEY")
             # the openai python client requires some API key string
             api_key = api_key or "DUMMY_API_KEY"

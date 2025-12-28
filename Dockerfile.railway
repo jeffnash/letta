@@ -1,0 +1,71 @@
+# Railway Dockerfile for Letta Server with CLIProxy support
+# Uses ankane/pgvector base (includes Postgres + pgvector extension)
+
+FROM ankane/pgvector:v0.5.1 AS builder
+
+# Install Python and build dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-venv \
+    python3-full \
+    build-essential \
+    libpq-dev \
+    python3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_NO_PROGRESS=1 \
+    UV_PYTHON_PREFERENCE=system \
+    UV_CACHE_DIR=/tmp/uv_cache
+
+WORKDIR /app
+
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Copy and install dependencies
+COPY pyproject.toml uv.lock ./
+COPY . .
+
+RUN uv sync --frozen --no-dev --all-extras --python 3.11
+
+# Runtime stage
+FROM ankane/pgvector:v0.5.1 AS runtime
+
+ARG NODE_VERSION=22
+
+RUN apt-get update && \
+    apt-get install -y curl python3 python3-venv libpq-dev redis-server postgresql-client && \
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - && \
+    apt-get install -y nodejs && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV="/app/.venv" \
+    PATH="/app/.venv/bin:$PATH" \
+    POSTGRES_USER=letta \
+    POSTGRES_PASSWORD=letta \
+    POSTGRES_DB=letta
+
+WORKDIR /app
+
+# Copy virtual environment and app from builder
+COPY --from=builder /app .
+
+# Copy startup script and make executable
+COPY start-railway.sh /app/start-railway.sh
+RUN chmod +x /app/start-railway.sh
+
+# Create postgres directories with proper ownership
+RUN mkdir -p /var/lib/postgresql/data && \
+    chown -R postgres:postgres /var/lib/postgresql
+
+# Railway uses PORT env variable
+ENV PORT=8283
+EXPOSE 8283
+
+CMD ["/app/start-railway.sh"]

@@ -5,6 +5,7 @@ from .azure import AzureProvider
 from .base import Provider, ProviderBase, ProviderCheck, ProviderCreate, ProviderUpdate
 from .bedrock import BedrockProvider
 from .cerebras import CerebrasProvider
+from .cliproxy import CLIProxyProvider
 from .deepseek import DeepSeekProvider
 from .google_gemini import GoogleAIProvider
 from .google_vertex import GoogleVertexProvider
@@ -30,7 +31,8 @@ __all__ = [
     "AnthropicProvider",
     "AzureProvider",
     "BedrockProvider",
-    "CerebrasProvider",  # NEW
+    "CerebrasProvider",
+    "CLIProxyProvider",  # NEW
     "DeepSeekProvider",
     "GoogleAIProvider",
     "GoogleVertexProvider",
@@ -41,7 +43,7 @@ __all__ = [
     "OllamaProvider",
     "OpenAIProvider",
     "TogetherProvider",
-    "VLLMProvider",  # Replaces ChatCompletions and Completions
+    "VLLMProvider",
     "XAIProvider",
     "OpenRouterProvider",
 ]
