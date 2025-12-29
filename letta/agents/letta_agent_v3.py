@@ -688,6 +688,11 @@ class LettaAgentV3(LettaAgentV2):
                                     messages, trigger_threshold=self.agent_state.llm_config.context_window
                                 )
                                 self.logger.info("Summarization succeeded, continuing to retry LLM request")
+
+                                # update the messages
+                                await self._checkpoint_messages(
+                                    run_id=run_id, step_id=step_id, new_messages=[summary_message], in_context_messages=messages
+                                )
                                 continue
                             except SystemPromptTokenExceededError:
                                 self.stop_reason = LettaStopReason(
@@ -698,11 +703,6 @@ class LettaAgentV3(LettaAgentV2):
                                 self.stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
                                 self.logger.error(f"Unknown error occured for summarization run {run_id}: {e}")
                                 raise e
-
-                            # update the messages
-                            await self._checkpoint_messages(
-                                run_id=run_id, step_id=step_id, new_messages=[summary_message], in_context_messages=messages
-                            )
 
                         else:
                             self.stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
