@@ -1,13 +1,16 @@
 """
 CLIProxyAPI Provider - OpenAI-compatible proxy for LLM calls only.
 Embeddings are NOT supported - use OpenAI directly for embeddings.
+
+This provider dynamically fetches available models from CLIProxyAPI,
+including passthru routes and any other configured models.
 """
 import os
-from typing import Literal
+import time
+from typing import ClassVar, Literal
 
 from pydantic import Field
 
-from letta.constants import LLM_MAX_CONTEXT_WINDOW
 from letta.log import get_logger
 from letta.schemas.embedding_config import EmbeddingConfig
 from letta.schemas.enums import ProviderCategory, ProviderType
@@ -16,74 +19,29 @@ from letta.schemas.providers.base import Provider
 
 logger = get_logger(__name__)
 
-# Models available through CLIProxyAPI
-CLIPROXY_MODELS = {
-    # GPT-5.2 variants
-    "gpt-5.2-xhigh": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.2-high": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.2-medium": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.2-low": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.2-minimal": {"context_window": 272000, "max_tokens": 128000},
+# Default values for models that don't provide metadata
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_MAX_TOKENS = 32000
 
-    # GPT-5.2 Codex variants
-    "gpt-5.2-codex": {"context_window": 400000, "max_tokens": 128000},
-    "gpt-5.2-codex-low": {"context_window": 400000, "max_tokens": 128000},
-    "gpt-5.2-codex-medium": {"context_window": 400000, "max_tokens": 128000},
-    "gpt-5.2-codex-high": {"context_window": 400000, "max_tokens": 128000},
-    "gpt-5.2-codex-xhigh": {"context_window": 400000, "max_tokens": 128000},
-    # GPT-5.1 Codex variants
-    "gpt-5.1-codex-max-xhigh": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-max-high": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-max-medium": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-max-low": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-high": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-medium": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-low": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-mini-medium": {"context_window": 272000, "max_tokens": 128000},
-    "gpt-5.1-codex-mini-high": {"context_window": 272000, "max_tokens": 128000},
-    # GPT-5 Codex
-    "gpt-5-codex": {"context_window": 272000, "max_tokens": 128000},
-    # Gemini via proxy
-    "gemini-3-pro-preview": {"context_window": 180000, "max_tokens": 64000},
-    "gemini-3-flash-preview": {"context_window": 180000, "max_tokens": 64000},
-    "gemini-2.5-pro": {"context_window": 180000, "max_tokens": 64000},
-    "gemini-2.5-flash": {"context_window": 180000, "max_tokens": 64000},
-    # Copilot proxied models
-    "copilot-claude-sonnet-4.5": {"context_window": 200000, "max_tokens": 64000},
-    "copilot-claude-opus-4.5": {"context_window": 200000, "max_tokens": 64000},
-    "copilot-claude-haiku-4.5": {"context_window": 200000, "max_tokens": 64000},
-    "copilot-gpt-5.1-codex": {"context_window": 272000, "max_tokens": 128000},
-    "copilot-gpt-5.1": {"context_window": 272000, "max_tokens": 128000},
-    "copilot-gpt-5": {"context_window": 272000, "max_tokens": 128000},
-    "copilot-gpt-5-codex": {"context_window": 272000, "max_tokens": 128000},
-    "copilot-gpt-4.1": {"context_window": 1047576, "max_tokens": 32768},
-
-    # Copilot Gemini models (CLIProxyAPI supports these `copilot-` aliases)
-    "copilot-gemini-3-pro-preview": {"context_window": 128000, "max_tokens": 64000},
-    "copilot-gemini-3-flash-preview": {"context_window": 128000, "max_tokens": 64000},
-    "copilot-gemini-2.5-pro": {"context_window": 128000, "max_tokens": 64000},
-    "copilot-gemini-2.5-flash": {"context_window": 128000, "max_tokens": 64000},
-
-    # Gemini-provider variants for Claude via Gemini (see CLIProxyAPI: `gemini-claude-*-thinking`)
-    "gemini-claude-sonnet-4-5-thinking": {"context_window": 200000, "max_tokens": 64000},
-    "gemini-claude-opus-4-5-thinking": {"context_window": 200000, "max_tokens": 64000},
-    # Qwen
-    "qwen3-coder-plus": {"context_window": 128000, "max_tokens": 32768},
-    "qwen3-coder-flash": {"context_window": 128000, "max_tokens": 32768},
-}
+# Cache TTL in seconds (5 minutes)
+MODEL_CACHE_TTL_SECONDS = 300
 
 
 class CLIProxyProvider(Provider):
     """
     CLIProxyAPI Provider - an OpenAI-compatible API proxy for LLM calls.
     
-    This provider handles LLM inference through your CLIProxyAPI instance.
+    This provider dynamically fetches available models from CLIProxyAPI,
+    including passthru routes and any other configured models.
     Embeddings should be configured separately using the standard OpenAI provider.
     
     Environment variables:
         CLIPROXY_API_KEY: API key for your CLIProxyAPI instance  
         CLIPROXY_BASE_URL: Base URL for your CLIProxyAPI instance
     """
+    
+    # Class-level cache for model data (shared across instances with same base_url)
+    _model_cache: ClassVar[dict[str, tuple[list[dict], float]]] = {}
     
     # Use cliproxy provider type to ensure we use our own credentials
     provider_type: Literal[ProviderType.cliproxy] = Field(
@@ -113,9 +71,33 @@ class CLIProxyProvider(Provider):
         except Exception as e:
             logger.warning(f"CLIProxyAPI key check failed (may be fine if no auth required): {e}")
     
+    def _get_cache_key(self) -> str:
+        """Generate a cache key based on base_url."""
+        base = (self.base_url or "").strip()
+        return base if base else "default"
+    
+    def _get_cached_models(self) -> list[dict] | None:
+        """Get cached models if still valid."""
+        cache_key = self._get_cache_key()
+        if cache_key in self._model_cache:
+            models, timestamp = self._model_cache[cache_key]
+            if time.time() - timestamp < MODEL_CACHE_TTL_SECONDS:
+                return models
+        return None
+    
+    def _set_cached_models(self, models: list[dict]):
+        """Cache the model list."""
+        cache_key = self._get_cache_key()
+        self._model_cache[cache_key] = (models, time.time())
+    
     async def _get_models_async(self) -> list[dict]:
-        """Fetch available models from CLIProxyAPI."""
+        """Fetch available models from CLIProxyAPI with caching."""
         from letta.llm_api.openai import openai_get_model_list_async
+        
+        # Check cache first
+        cached = self._get_cached_models()
+        if cached is not None:
+            return cached
         
         api_key = await self.api_key_enc.get_plaintext_async() if self.api_key_enc else self.api_key
         
@@ -123,12 +105,19 @@ class CLIProxyProvider(Provider):
             response = await openai_get_model_list_async(self.base_url, api_key=api_key)
             data = response.get("data", response)
             if isinstance(data, list):
+                self._set_cached_models(data)
                 return data
         except Exception as e:
-            logger.warning(f"Failed to fetch models from CLIProxyAPI, using hardcoded list: {e}")
+            logger.warning(f"Failed to fetch models from CLIProxyAPI: {e}")
+            # Return stale cache if available
+            cache_key = self._get_cache_key()
+            if cache_key in self._model_cache:
+                models, _ = self._model_cache[cache_key]
+                logger.info("Using stale cached models from CLIProxyAPI")
+                return models
         
-        # Fallback: return our known models
-        return [{"id": model} for model in CLIPROXY_MODELS.keys()]
+        # No cache, no API response - return empty list
+        return []
     
     async def list_llm_models_async(self) -> list[LLMConfig]:
         """List available LLM models from CLIProxyAPI."""
@@ -143,7 +132,7 @@ class CLIProxyProvider(Provider):
         return []
     
     def _list_llm_models(self, data: list[dict]) -> list[LLMConfig]:
-        """Convert model data to LLMConfig objects."""
+        """Convert model data to LLMConfig objects using dynamic metadata from API."""
         configs = []
         
         for model in data:
@@ -152,10 +141,18 @@ class CLIProxyProvider(Provider):
             
             model_name = model["id"]
             
-            # Get context window from our known models or use defaults
-            model_info = CLIPROXY_MODELS.get(model_name, {})
-            context_window = model_info.get("context_window", 128000)
-            max_tokens = model_info.get("max_tokens", 16384)
+            # Get context window from API response, with sensible defaults
+            # CLIProxyAPI returns: context_window, context_length, max_completion_tokens, max_tokens
+            context_window = (
+                model.get("context_window") or 
+                model.get("context_length") or 
+                DEFAULT_CONTEXT_WINDOW
+            )
+            max_tokens = (
+                model.get("max_completion_tokens") or 
+                model.get("max_tokens") or 
+                DEFAULT_MAX_TOKENS
+            )
             
             config = LLMConfig(
                 model=model_name,
@@ -173,13 +170,37 @@ class CLIProxyProvider(Provider):
         return configs
     
     def get_model_context_window_size(self, model_name: str) -> int | None:
-        """Get context window size for a model."""
-        if model_name in CLIPROXY_MODELS:
-            return CLIPROXY_MODELS[model_name]["context_window"]
-        return 128000  # Default
+        """Get context window size for a model.
+        
+        For dynamic models, returns default. The actual value is set
+        when the model is fetched via list_llm_models_async().
+        """
+        return DEFAULT_CONTEXT_WINDOW
     
     def get_model_context_window(self, model_name: str) -> int | None:
         return self.get_model_context_window_size(model_name)
     
     async def get_model_context_window_async(self, model_name: str) -> int | None:
-        return self.get_model_context_window_size(model_name)
+        """Async version that can fetch from API if needed."""
+        # Try to get from cached models first
+        cached = self._get_cached_models()
+        if cached:
+            for model in cached:
+                if model.get("id") == model_name:
+                    return (
+                        model.get("context_window") or 
+                        model.get("context_length") or 
+                        DEFAULT_CONTEXT_WINDOW
+                    )
+        
+        # Fetch fresh if not cached
+        models = await self._get_models_async()
+        for model in models:
+            if model.get("id") == model_name:
+                return (
+                    model.get("context_window") or 
+                    model.get("context_length") or 
+                    DEFAULT_CONTEXT_WINDOW
+                )
+        
+        return DEFAULT_CONTEXT_WINDOW
