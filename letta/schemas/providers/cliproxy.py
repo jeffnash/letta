@@ -5,6 +5,7 @@ Embeddings are NOT supported - use OpenAI directly for embeddings.
 This provider dynamically fetches available models from CLIProxyAPI,
 including passthru routes and any other configured models.
 """
+import math
 import os
 import time
 from typing import ClassVar, Literal
@@ -22,6 +23,18 @@ logger = get_logger(__name__)
 # Default values for models that don't provide metadata
 DEFAULT_CONTEXT_WINDOW = 128000
 DEFAULT_MAX_TOKENS = 32000
+
+# Apply a safety buffer to avoid hitting provider hard limits exactly.
+# Can be configured via env vars to avoid double-buffering when upstream already buffers.
+CONTEXT_WINDOW_SAFETY_FACTOR = float(os.environ.get("LETTA_CLIPROXY_CONTEXT_WINDOW_SAFETY_FACTOR", "0.95"))
+MAX_TOKENS_SAFETY_FACTOR = float(os.environ.get("LETTA_CLIPROXY_MAX_TOKENS_SAFETY_FACTOR", "0.95"))
+
+def _apply_safety_limit(value: int, safety_factor: float) -> int:
+    if not isinstance(value, int):
+        value = int(value)
+    if not math.isfinite(safety_factor) or safety_factor <= 0 or safety_factor > 1:
+        safety_factor = 1.0
+    return max(1, int(math.floor(value * safety_factor)))
 
 # Cache TTL in seconds (5 minutes)
 MODEL_CACHE_TTL_SECONDS = 300
@@ -143,16 +156,25 @@ class CLIProxyProvider(Provider):
             
             # Get context window from API response, with sensible defaults
             # CLIProxyAPI returns: context_window, context_length, max_completion_tokens, max_tokens
-            context_window = (
-                model.get("context_window") or 
-                model.get("context_length") or 
-                DEFAULT_CONTEXT_WINDOW
+            raw_context_window = (
+                model.get("context_window")
+                or model.get("context_length")
+                or DEFAULT_CONTEXT_WINDOW
             )
-            max_tokens = (
-                model.get("max_completion_tokens") or 
-                model.get("max_tokens") or 
-                DEFAULT_MAX_TOKENS
+            raw_max_tokens = (
+                model.get("max_completion_tokens")
+                or model.get("max_output_tokens")
+                or model.get("outputTokenLimit")
+                or model.get("output_token_limit")
+                or model.get("max_tokens")
+                or DEFAULT_MAX_TOKENS
             )
+
+            context_window = _apply_safety_limit(
+                int(raw_context_window),
+                CONTEXT_WINDOW_SAFETY_FACTOR,
+            )
+            max_tokens = _apply_safety_limit(int(raw_max_tokens), MAX_TOKENS_SAFETY_FACTOR)
             
             config = LLMConfig(
                 model=model_name,
@@ -175,7 +197,7 @@ class CLIProxyProvider(Provider):
         For dynamic models, returns default. The actual value is set
         when the model is fetched via list_llm_models_async().
         """
-        return DEFAULT_CONTEXT_WINDOW
+        return _apply_safety_limit(DEFAULT_CONTEXT_WINDOW, CONTEXT_WINDOW_SAFETY_FACTOR)
     
     def get_model_context_window(self, model_name: str) -> int | None:
         return self.get_model_context_window_size(model_name)
@@ -187,20 +209,22 @@ class CLIProxyProvider(Provider):
         if cached:
             for model in cached:
                 if model.get("id") == model_name:
-                    return (
-                        model.get("context_window") or 
-                        model.get("context_length") or 
-                        DEFAULT_CONTEXT_WINDOW
+                    raw = (
+                        model.get("context_window")
+                        or model.get("context_length")
+                        or DEFAULT_CONTEXT_WINDOW
                     )
+                    return _apply_safety_limit(int(raw), CONTEXT_WINDOW_SAFETY_FACTOR)
         
         # Fetch fresh if not cached
         models = await self._get_models_async()
         for model in models:
             if model.get("id") == model_name:
-                return (
-                    model.get("context_window") or 
-                    model.get("context_length") or 
-                    DEFAULT_CONTEXT_WINDOW
+                raw = (
+                    model.get("context_window")
+                    or model.get("context_length")
+                    or DEFAULT_CONTEXT_WINDOW
                 )
+                return _apply_safety_limit(int(raw), CONTEXT_WINDOW_SAFETY_FACTOR)
         
         return DEFAULT_CONTEXT_WINDOW

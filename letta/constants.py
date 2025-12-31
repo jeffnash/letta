@@ -236,21 +236,21 @@ LLM_MAX_CONTEXT_WINDOW = {
     "glm-4.5": 128000,
     ## OpenAI models: https://platform.openai.com/docs/models/overview
     # gpt-5
-    "gpt-5": 272000,
+    "gpt-5": 400000,
     "gpt-5-2025-08-07": 272000,
     "gpt-5-mini": 272000,
     "gpt-5-mini-2025-08-07": 272000,
     "gpt-5-nano": 272000,
     "gpt-5-nano-2025-08-07": 272000,
-    "gpt-5-codex": 272000,
+    "gpt-5-codex": 400000,
     # gpt-5.1
-    "gpt-5.1": 272000,
+    "gpt-5.1": 400000,
     "gpt-5.1-2025-11-13": 272000,
-    "gpt-5.1-codex": 272000,
-    "gpt-5.1-codex-mini": 272000,
-    "gpt-5.1-codex-max": 272000,
+    "gpt-5.1-codex": 400000,
+    "gpt-5.1-codex-mini": 400000,
+    "gpt-5.1-codex-max": 400000,
     # gpt-5.2
-    "gpt-5.2": 272000,
+    "gpt-5.2": 400000,
     "gpt-5.2-2025-12-11": 272000,
     "gpt-5.2-pro": 272000,
     "gpt-5.2-pro-2025-12-11": 272000,
@@ -361,7 +361,7 @@ LLM_MAX_CONTEXT_WINDOW = {
     "gemini-2.5-flash-lite-preview-09-2025": 1048576,
     "gemini-2.5-computer-use-preview-10-2025": 1048576,
     # gemini 3
-    "gemini-3-pro-preview": 1048576,
+    "gemini-3-pro-preview": 1000000,
     "gemini-3-flash-preview": 1048576,
     # gemini latest aliases
     "gemini-flash-latest": 1048576,
