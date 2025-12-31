@@ -40,22 +40,51 @@ def _apply_safety_limit(value: int, safety_factor: float) -> int:
 def _models_dev_fallback_limits(model_id: str, owned_by: str) -> tuple[int, int]:
     """Fallback limits when CLIProxyAPI /v1/models omits metadata.
 
-    We intentionally keep this mapping minimal and focused on the models we expose via
-    Letta Code's CLIProxy handles.
+    Strategy:
+    1) Prefer an explicit mapping based on CLIProxyAPI's owned_by, since it indicates the
+       underlying provider family (e.g. openai, copilot, antigravity, passthru).
+    2) Fall back to a conservative default when unknown.
 
-    Sources:
-    - https://models.dev/api.json (OpenAI + GitHub Copilot + Google)
+    Notes:
+    - This is intentionally defensive: even if some providers/models are missing here,
+      the result should never be *larger* than reality.
+    - Once CLIProxyAPI consistently returns context_length/max_completion_tokens for every
+      model (including passthru), this function becomes mostly unused.
     """
 
     owned_by_norm = (owned_by or "").strip().lower()
     model_norm = (model_id or "").strip()
 
+    # Passthru models should ideally include explicit limits in the /v1/models payload.
+    # If they don't, default conservatively.
+    if owned_by_norm == "passthru":
+        return DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS
+
+    # Antigravity (Gemini/Vertex-mediated routes) frequently includes Anthropic models.
+    # These ids match CLIProxyAPI's /v1/models entries (no provider prefix).
+    if owned_by_norm == "antigravity":
+        # Vertex Anthropic via Gemini / thinking
+        if model_norm in {
+            "gemini-claude-opus-4-5-thinking",
+            "gemini-claude-sonnet-4-5-thinking",
+        }:
+            return 200000, 64000
+        # Non-thinking Sonnet/Opus via Gemini can still have large context.
+        if model_norm in {
+            "gemini-claude-opus-4-5",
+            "gemini-claude-sonnet-4-5",
+        }:
+            return 200000, 64000
+        # Gemini-first models (when present under antigravity)
+        if model_norm == "gemini-3-pro-preview":
+            return 1000000, 64000
+        if model_norm in {"gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"}:
+            return 1048576, 65536
+
     # OpenAI (direct)
     if owned_by_norm == "openai":
         if model_norm.startswith("gpt-5"):
             # GPT-5.x and Codex variants on OpenAI are 400k/128k on models.dev
-            if "codex" in model_norm:
-                return 400000, 128000
             return 400000, 128000
         if model_norm.startswith("gpt-4.1"):
             return 1047576, 32768
@@ -64,15 +93,26 @@ def _models_dev_fallback_limits(model_id: str, owned_by: str) -> tuple[int, int]
 
     # GitHub Copilot
     if owned_by_norm == "copilot":
-        if model_norm in {"gpt-5", "gpt-5.1", "gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-max"}:
+        if model_norm in {
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-5-codex",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "copilot-gpt-5",
+            "copilot-gpt-5.1",
+            "copilot-gpt-5-codex",
+            "copilot-gpt-5.1-codex",
+            "copilot-gpt-5.1-codex-max",
+        }:
             return 128000, 128000
-        if model_norm == "gpt-5.2":
+        if model_norm in {"gpt-5.2", "copilot-gpt-5.2"}:
             return 128000, 64000
-        if model_norm == "gpt-5-mini":
+        if model_norm in {"gpt-5-mini", "copilot-gpt-5-mini"}:
             return 128000, 64000
-        if model_norm == "gpt-4.1":
+        if model_norm in {"gpt-4.1", "copilot-gpt-4.1"}:
             return 128000, 16384
-        if model_norm == "gpt-4o":
+        if model_norm in {"gpt-4o", "copilot-gpt-4o"}:
             return 64000, 16384
         if model_norm.startswith("gemini-3") or model_norm == "gemini-2.5-pro":
             return 128000, 64000
@@ -86,6 +126,7 @@ def _models_dev_fallback_limits(model_id: str, owned_by: str) -> tuple[int, int]
         if model_norm in {"gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"}:
             return 1048576, 65536
 
+    # Catch-all: unknown owner/provider.
     return DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS
 
 # Cache TTL in seconds (5 minutes)
