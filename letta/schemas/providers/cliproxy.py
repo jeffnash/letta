@@ -36,6 +36,58 @@ def _apply_safety_limit(value: int, safety_factor: float) -> int:
         safety_factor = 1.0
     return max(1, int(math.floor(value * safety_factor)))
 
+
+def _models_dev_fallback_limits(model_id: str, owned_by: str) -> tuple[int, int]:
+    """Fallback limits when CLIProxyAPI /v1/models omits metadata.
+
+    We intentionally keep this mapping minimal and focused on the models we expose via
+    Letta Code's CLIProxy handles.
+
+    Sources:
+    - https://models.dev/api.json (OpenAI + GitHub Copilot + Google)
+    """
+
+    owned_by_norm = (owned_by or "").strip().lower()
+    model_norm = (model_id or "").strip()
+
+    # OpenAI (direct)
+    if owned_by_norm == "openai":
+        if model_norm.startswith("gpt-5"):
+            # GPT-5.x and Codex variants on OpenAI are 400k/128k on models.dev
+            if "codex" in model_norm:
+                return 400000, 128000
+            return 400000, 128000
+        if model_norm.startswith("gpt-4.1"):
+            return 1047576, 32768
+        if model_norm.startswith("gpt-4o"):
+            return 128000, 16384
+
+    # GitHub Copilot
+    if owned_by_norm == "copilot":
+        if model_norm in {"gpt-5", "gpt-5.1", "gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-max"}:
+            return 128000, 128000
+        if model_norm == "gpt-5.2":
+            return 128000, 64000
+        if model_norm == "gpt-5-mini":
+            return 128000, 64000
+        if model_norm == "gpt-4.1":
+            return 128000, 16384
+        if model_norm == "gpt-4o":
+            return 64000, 16384
+        if model_norm.startswith("gemini-3") or model_norm == "gemini-2.5-pro":
+            return 128000, 64000
+        if model_norm == "gemini-2.0-flash-001":
+            return 1000000, 8192
+
+    # Google (AI Studio)
+    if owned_by_norm == "google":
+        if model_norm == "gemini-3-pro-preview":
+            return 1000000, 64000
+        if model_norm in {"gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"}:
+            return 1048576, 65536
+
+    return DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS
+
 # Cache TTL in seconds (5 minutes)
 MODEL_CACHE_TTL_SECONDS = 300
 
@@ -156,19 +208,29 @@ class CLIProxyProvider(Provider):
             
             # Get context window from API response, with sensible defaults
             # CLIProxyAPI returns: context_window, context_length, max_completion_tokens, max_tokens
-            raw_context_window = (
-                model.get("context_window")
-                or model.get("context_length")
-                or DEFAULT_CONTEXT_WINDOW
-            )
+            # Prefer metadata from /v1/models when provided.
+            # NOTE: some CLIProxyAPI deployments historically returned "thin" model objects
+            # (id/object/created/owned_by only). In that case, fall back to models.dev-derived
+            # defaults based on owned_by + model id.
+            raw_context_window = model.get("context_window") or model.get("context_length")
             raw_max_tokens = (
                 model.get("max_completion_tokens")
                 or model.get("max_output_tokens")
                 or model.get("outputTokenLimit")
                 or model.get("output_token_limit")
                 or model.get("max_tokens")
-                or DEFAULT_MAX_TOKENS
             )
+
+            if raw_context_window is None or raw_max_tokens is None:
+                fallback_ctx, fallback_out = _models_dev_fallback_limits(
+                    model_id=str(model_name),
+                    owned_by=str(model.get("owned_by") or ""),
+                )
+                raw_context_window = raw_context_window or fallback_ctx
+                raw_max_tokens = raw_max_tokens or fallback_out
+
+            raw_context_window = raw_context_window or DEFAULT_CONTEXT_WINDOW
+            raw_max_tokens = raw_max_tokens or DEFAULT_MAX_TOKENS
 
             context_window = _apply_safety_limit(
                 int(raw_context_window),
