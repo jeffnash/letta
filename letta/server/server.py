@@ -1197,12 +1197,18 @@ class SyncServer(object):
             llm_config = llm_configs[0]
 
         if context_window_limit is not None:
+            # Users (and clients) commonly provide the *raw* provider context size.
+            # However, provider configs may already have a safety buffer applied (e.g. 0.95).
+            # Instead of hard-failing, clamp to the maximum allowed.
             if context_window_limit > llm_config.context_window:
-                raise LettaInvalidArgumentError(
-                    f"Context window limit ({context_window_limit}) is greater than maximum of ({llm_config.context_window})",
-                    argument_name="context_window_limit",
+                logger.warning(
+                    "Requested context_window_limit (%s) exceeds model maximum (%s); clamping",
+                    context_window_limit,
+                    llm_config.context_window,
                 )
-            llm_config.context_window = context_window_limit
+                llm_config.context_window = llm_config.context_window
+            else:
+                llm_config.context_window = context_window_limit
         else:
             llm_config.context_window = min(llm_config.context_window, model_settings.global_max_context_window_limit)
 

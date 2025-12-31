@@ -858,12 +858,21 @@ async def test_get_llm_config_from_handle_uses_cached_models(default_user):
         context_window_limit=100000,
     )
 
+    # Oversized limit should clamp (not raise)
+    llm_config_clamped = await server.get_llm_config_from_handle_async(
+        actor=default_user,
+        handle="openai/gpt-4o",
+        context_window_limit=999999,
+    )
+
     # Verify it used the cached model data
     assert llm_config.model == "gpt-4o"
     assert llm_config.model_endpoint == "https://custom.openai.com/v1"
     assert llm_config.context_window == 100000  # Limited by context_window_limit
     assert llm_config.handle == "openai/gpt-4o"
     assert llm_config.provider_name == "openai"
+
+    assert llm_config_clamped.context_window == 128000  # Clamped to model max
 
     # Verify provider methods were called
     server.provider_manager.get_llm_config_from_handle.assert_called_once_with(
