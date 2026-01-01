@@ -167,6 +167,16 @@ class CLIProxyProvider(Provider):
         description="Base URL for CLIProxyAPI"
     )
     
+    @property
+    def is_configured(self) -> bool:
+        """
+        Check if CLIProxy provider is properly configured.
+        
+        Returns True if base_url is set, False otherwise.
+        This is used by the server to filter out unconfigured providers.
+        """
+        return bool(self.base_url)
+    
     async def check_api_key(self):
         """Validate the API key by attempting to list models."""
         from letta.llm_api.openai import openai_get_model_list_async

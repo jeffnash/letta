@@ -1130,6 +1130,138 @@ class SyncServer(object):
 
         return embedding_models
 
+    async def get_model_policy_async(self, actor: User) -> "ModelPolicy":
+        """
+        Get server-defined model groups and default model.
+        
+        Groups are derived from available models and can be used in model selectors.
+        """
+        # Get all available models
+        models = await self.list_llm_models_async(actor=actor)
+        return self._build_model_policy_from_models(models)
+
+    def _build_model_policy_from_models(self, models: list) -> "ModelPolicy":
+        """
+        Build a ModelPolicy from a pre-fetched model list.
+        """
+        from letta.schemas.model_policy import ModelPolicy
+
+        available_handles = {m.handle for m in models if m.handle}
+        groups = self._build_model_groups(available_handles, models)
+        default = self._get_default_model(available_handles, models)
+
+        return ModelPolicy(default_model=default, groups=groups)
+
+    async def resolve_model_selector_async(
+        self,
+        selector: list[str],
+        parent_model_handle: str | None,
+        actor: User,
+    ) -> "ModelSelectorResponse":
+        """
+        Resolve a model selector to the first available handle.
+        
+        Args:
+            selector: Ordered list of selector entries (group:X, inherit, any, or handles)
+            parent_model_handle: Parent agent's model handle for 'inherit'
+            actor: The user making the request
+            
+        Returns:
+            ModelSelectorResponse with resolved handle and expansion chain
+        """
+        from letta.schemas.model_policy import resolve_selector
+        
+        # Get available models once and build policy from it
+        models = await self.list_llm_models_async(actor=actor)
+        available_handles = {m.handle for m in models if m.handle}
+        policy = self._build_model_policy_from_models(models)
+        
+        # Resolve using the policy
+        return resolve_selector(
+            selector=selector,
+            available_handles=available_handles,
+            groups=policy.groups,
+            parent_model_handle=parent_model_handle,
+            default_model=policy.default_model,
+        )
+
+    def _build_model_groups(self, available_handles: set[str], models: list) -> dict[str, list[str]]:
+        """
+        Build model groups from available models.
+        
+        Groups are categorized by capability:
+        - fast: Smaller, faster models (mini, nano, haiku, flash)
+        - strong: Larger, more capable models (gpt-5.2, opus, pro)
+        - planning: Models good for planning tasks
+        - default: General fallback order
+        """
+        groups: dict[str, list[str]] = {
+            "fast": [],
+            "strong": [],
+            "planning": [],
+            "default": [],
+        }
+        
+        # Categorize models by name patterns
+        for handle in sorted(available_handles):
+            handle_lower = handle.lower()
+            
+            # Fast models (small/quick)
+            if any(x in handle_lower for x in ["mini", "nano", "haiku", "flash", "4.1-mini", "4.1-nano"]):
+                groups["fast"].append(handle)
+            
+            # Strong models (large/capable)
+            if any(x in handle_lower for x in ["gpt-5.2", "gpt-5.1", "opus", "pro", "strong", "codex"]):
+                groups["strong"].append(handle)
+            
+            # Planning models (reasoning-capable)
+            if any(x in handle_lower for x in ["gpt-5", "opus", "pro", "thinking", "reasoning"]):
+                groups["planning"].append(handle)
+        
+        # Default group: strong first, then fast
+        groups["default"] = ["group:strong", "group:fast"]
+        
+        # Remove empty groups (except default which references other groups)
+        groups = {k: v for k, v in groups.items() if v or k == "default"}
+        
+        return groups
+
+    def _get_default_model(self, available_handles: set[str], models: list) -> str:
+        """
+        Get the default model from available models.
+        
+        Priority:
+        1. First model explicitly marked as default in metadata/flags
+        2. First strong model (gpt-5.2, opus, etc.)
+        3. First available model
+        """
+        if not available_handles:
+            return ""
+        
+        # First pass: honor explicit default metadata or flags
+        for model in models:
+            handle = getattr(model, "handle", None)
+            if not handle:
+                continue
+            if getattr(model, "is_default", False) or getattr(model, "default", False):
+                return handle
+            metadata = getattr(model, "metadata", None)
+            if metadata is None:
+                metadata = getattr(model, "metadata_", None)
+            if isinstance(metadata, dict) and (
+                metadata.get("default") is True or metadata.get("is_default") is True
+            ):
+                return handle
+        
+        # Look for strong models next
+        for handle in sorted(available_handles):
+            handle_lower = handle.lower()
+            if any(x in handle_lower for x in ["gpt-5.2", "gpt-5.1-codex", "opus"]):
+                return handle
+        
+        # Fall back to first available
+        return sorted(available_handles)[0]
+
     async def get_enabled_providers_async(
         self,
         actor: User,
@@ -1139,8 +1271,17 @@ class SyncServer(object):
     ) -> List[Provider]:
         providers = []
         if not provider_category or ProviderCategory.base in provider_category:
-            providers_from_env = [p for p in self._enabled_providers]
-            providers.extend(providers_from_env)
+            # Filter base providers to only those that are properly configured
+            for p in self._enabled_providers:
+                # Check if provider has is_configured property and use it
+                if hasattr(p, 'is_configured') and not p.is_configured:
+                    logger.debug(f"Skipping provider {p.name}: not configured (is_configured=False)")
+                    continue
+                # Check for base_url on providers that require it
+                if hasattr(p, 'base_url') and p.base_url is None:
+                    logger.debug(f"Skipping provider {p.name}: no base_url configured")
+                    continue
+                providers.append(p)
 
         if not provider_category or ProviderCategory.byok in provider_category:
             providers_from_db = await self.provider_manager.list_providers_async(
@@ -1149,7 +1290,14 @@ class SyncServer(object):
                 actor=actor,
             )
             providers_from_db = [p.cast_to_subtype() for p in providers_from_db if p.provider_category == ProviderCategory.byok]
-            providers.extend(providers_from_db)
+            for p in providers_from_db:
+                if hasattr(p, 'is_configured') and not p.is_configured:
+                    logger.debug(f"Skipping provider {p.name}: not configured (is_configured=False)")
+                    continue
+                if hasattr(p, 'base_url') and p.base_url is None:
+                    logger.debug(f"Skipping provider {p.name}: no base_url configured")
+                    continue
+                providers.append(p)
 
         if provider_name is not None:
             providers = [p for p in providers if p.name == provider_name]
