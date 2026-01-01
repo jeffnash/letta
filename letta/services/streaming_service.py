@@ -12,6 +12,7 @@ from letta.agents.base_agent_v2 import BaseAgentV2
 from letta.constants import REDIS_RUN_ID_PREFIX
 from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
 from letta.errors import (
+    ContextWindowExceededError,
     LettaInvalidArgumentError,
     LettaServiceUnavailableError,
     LLMAuthenticationError,
@@ -395,6 +396,23 @@ class StreamingService:
                 )
                 error_data = {"error": error_message.model_dump()}
                 logger.warning(f"Run {run_id} stopped with LLM authentication error: {e}, error_data: {error_message.model_dump()}")
+                yield f"data: {stop_reason.model_dump_json()}\n\n"
+                yield f"event: error\ndata: {error_message.model_dump_json()}\n\n"
+                # Send [DONE] marker to properly close the stream
+                yield "data: [DONE]\n\n"
+            except ContextWindowExceededError as e:
+                run_status = RunStatus.failed
+                stop_reason = LettaStopReason(stop_reason=StopReasonType.context_window_exceeded)
+                error_message = LettaErrorMessage(
+                    run_id=run_id,
+                    error_type="context_window_exceeded",
+                    message="The request exceeded the model's context window limit.",
+                    detail=str(e),
+                )
+                error_data = {"error": error_message.model_dump()}
+                logger.warning(
+                    f"Run {run_id} stopped with context window exceeded: {e}, error_data: {error_message.model_dump()}"
+                )
                 yield f"data: {stop_reason.model_dump_json()}\n\n"
                 yield f"event: error\ndata: {error_message.model_dump_json()}\n\n"
                 # Send [DONE] marker to properly close the stream

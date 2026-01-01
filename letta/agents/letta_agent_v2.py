@@ -471,6 +471,15 @@ class LettaAgentV2(BaseAgentV2):
                                 force=True,
                             )
                         else:
+                            if isinstance(e, ContextWindowExceededError):
+                                self.stop_reason = LettaStopReason(
+                                    stop_reason=StopReasonType.context_window_exceeded.value
+                                )
+                                self.logger.warning(
+                                    f"Context window exceeded after {llm_request_attempt + 1} attempt(s) for run {run_id}: {e}"
+                                )
+                            else:
+                                self.stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
                             raise e
 
                 step_progression, step_metrics = self._step_checkpoint_llm_request_finish(

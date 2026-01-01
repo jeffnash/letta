@@ -17,6 +17,7 @@ from letta.constants import NON_USER_MSG_PREFIX
 from letta.errors import (
     ContextWindowExceededError,
     ErrorCode,
+    LettaError,
     LLMAuthenticationError,
     LLMBadRequestError,
     LLMConnectionError,
@@ -156,7 +157,8 @@ class GoogleVertexClient(LLMClientBase):
             )
         except Exception as e:
             logger.error(f"Error streaming {self._provider_name()} request: {e} with request data: {json.dumps(request_data)}")
-            raise e
+            # Convert provider-specific errors (e.g., context overflow) to Letta error types
+            raise self.handle_llm_error(e)
         # Direct yield - keeps response alive in generator's local scope throughout iteration
         # This is required because the SDK's connection lifecycle is tied to the response object
         async for chunk in response:
@@ -747,6 +749,10 @@ class GoogleVertexClient(LLMClientBase):
 
     @trace_method
     def handle_llm_error(self, e: Exception) -> Exception:
+        # Pass through already-converted Letta errors (e.g., from stream_async)
+        if isinstance(e, LettaError):
+            return e
+
         # Handle Google GenAI specific errors
         if isinstance(e, errors.ClientError):
             logger.warning(f"{self._provider_prefix()} Client error ({e.code}): {e}")

@@ -18,6 +18,7 @@ class StopReasonType(str, Enum):
     tool_rule = "tool_rule"
     cancelled = "cancelled"
     requires_approval = "requires_approval"
+    context_window_exceeded = "context_window_exceeded"
     context_window_overflow_in_system_prompt = "context_window_overflow_in_system_prompt"
 
     @property
@@ -37,6 +38,7 @@ class StopReasonType(str, Enum):
             StopReasonType.llm_api_error,
             # Treat context/token limit exhaustion as an error state (same as llm_api_error)
             StopReasonType.max_tokens_exceeded,
+            StopReasonType.context_window_exceeded,
             StopReasonType.context_window_overflow_in_system_prompt,
         ):
             return RunStatus.failed

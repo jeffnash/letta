@@ -16,6 +16,7 @@ from letta.constants import LETTA_MODEL_ENDPOINT, REQUEST_HEARTBEAT_PARAM
 from letta.errors import (
     ContextWindowExceededError,
     ErrorCode,
+    LettaError,
     LLMAuthenticationError,
     LLMBadRequestError,
     LLMConnectionError,
@@ -794,7 +795,9 @@ class OpenAIClient(LLMClientBase):
                 )
             except Exception as e:
                 logger.error(f"Error streaming OpenAI Responses request: {e} with request data: {json.dumps(request_data)}")
-                raise e
+                # Convert provider-specific errors (e.g., context overflow) to Letta error types
+                # This enables the agent loop to trigger auto-compaction for ContextWindowExceededError
+                raise self.handle_llm_error(e)
         else:
             try:
                 response_stream: AsyncStream[ChatCompletionChunk] = await client.chat.completions.create(
@@ -804,7 +807,9 @@ class OpenAIClient(LLMClientBase):
                 )
             except Exception as e:
                 logger.error(f"Error streaming OpenAI Chat Completions request: {e} with request data: {json.dumps(request_data)}")
-                raise e
+                # Convert provider-specific errors (e.g., context overflow) to Letta error types
+                # This enables the agent loop to trigger auto-compaction for ContextWindowExceededError
+                raise self.handle_llm_error(e)
         return response_stream
 
     @trace_method
@@ -954,6 +959,12 @@ class OpenAIClient(LLMClientBase):
         """
         Maps OpenAI-specific errors to common LLMError types.
         """
+        # Pass through already-converted Letta errors (e.g., from stream_async)
+        # This prevents double-wrapping when the adapter calls handle_llm_error
+        # on an exception that was already converted in the client
+        if isinstance(e, LettaError):
+            return e
+
         if isinstance(e, openai.APITimeoutError):
             timeout_duration = getattr(e, "timeout", "unknown")
             logger.warning(f"[OpenAI] Request timeout after {timeout_duration} seconds: {e}")

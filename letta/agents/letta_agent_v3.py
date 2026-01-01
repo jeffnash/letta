@@ -705,8 +705,16 @@ class LettaAgentV3(LettaAgentV2):
                                 raise e
 
                         else:
-                            self.stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
-                            self.logger.error(f"Unknown error occured for run {run_id}: {e}")
+                            if isinstance(e, ContextWindowExceededError):
+                                self.stop_reason = LettaStopReason(
+                                    stop_reason=StopReasonType.context_window_exceeded.value
+                                )
+                                self.logger.warning(
+                                    f"Context window exceeded after {llm_request_attempt + 1} attempt(s) for run {run_id}: {e}"
+                                )
+                            else:
+                                self.stop_reason = LettaStopReason(stop_reason=StopReasonType.error.value)
+                                self.logger.error(f"Unknown error occured for run {run_id}: {e}")
                             raise e
 
                 step_progression, step_metrics = self._step_checkpoint_llm_request_finish(

@@ -15,6 +15,7 @@ from letta.constants import FUNC_FAILED_HEARTBEAT_MESSAGE, REQ_HEARTBEAT_MESSAGE
 from letta.errors import (
     ContextWindowExceededError,
     ErrorCode,
+    LettaError,
     LLMAuthenticationError,
     LLMBadRequestError,
     LLMConnectionError,
@@ -173,7 +174,8 @@ class AnthropicClient(LLMClientBase):
             return await client.beta.messages.create(**request_data, betas=betas)
         except Exception as e:
             logger.error(f"Error streaming Anthropic request: {e} with request data: {json.dumps(request_data)}")
-            raise e
+            # Convert provider-specific errors (e.g., context overflow) to Letta error types
+            raise self.handle_llm_error(e)
 
     @trace_method
     async def send_llm_batch_request_async(
@@ -661,6 +663,10 @@ class AnthropicClient(LLMClientBase):
 
     @trace_method
     def handle_llm_error(self, e: Exception) -> Exception:
+        # Pass through already-converted Letta errors (e.g., from stream_async)
+        if isinstance(e, LettaError):
+            return e
+
         # make sure to check for overflow errors, regardless of error type
         error_str = str(e).lower()
         if (
