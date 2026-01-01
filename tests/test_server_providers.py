@@ -1010,6 +1010,53 @@ async def test_server_sync_provider_models_on_init(default_user):
 
 
 @pytest.mark.asyncio
+async def test_get_enabled_providers_filters_unconfigured_byok():
+    """BYOK providers should be filtered using the same config checks as base providers."""
+    from letta.server.server import SyncServer
+
+    server = SyncServer(init_with_default_org_and_user=False)
+    server._enabled_providers = []
+    server.provider_manager = AsyncMock()
+
+    db_provider_configured = MagicMock()
+    db_provider_configured.provider_category = ProviderCategory.byok
+    configured_provider = MagicMock()
+    configured_provider.name = "configured"
+    configured_provider.is_configured = True
+    configured_provider.base_url = "https://byok.example.com"
+    db_provider_configured.cast_to_subtype.return_value = configured_provider
+
+    db_provider_unconfigured = MagicMock()
+    db_provider_unconfigured.provider_category = ProviderCategory.byok
+    unconfigured_provider = MagicMock()
+    unconfigured_provider.name = "unconfigured"
+    unconfigured_provider.is_configured = False
+    unconfigured_provider.base_url = "https://byok.example.com"
+    db_provider_unconfigured.cast_to_subtype.return_value = unconfigured_provider
+
+    db_provider_missing_base = MagicMock()
+    db_provider_missing_base.provider_category = ProviderCategory.byok
+    missing_base_provider = MagicMock()
+    missing_base_provider.name = "missing-base"
+    missing_base_provider.is_configured = True
+    missing_base_provider.base_url = None
+    db_provider_missing_base.cast_to_subtype.return_value = missing_base_provider
+
+    server.provider_manager.list_providers_async.return_value = [
+        db_provider_configured,
+        db_provider_unconfigured,
+        db_provider_missing_base,
+    ]
+
+    providers = await server.get_enabled_providers_async(
+        actor=object(),
+        provider_category=[ProviderCategory.byok],
+    )
+
+    assert [p.name for p in providers] == ["configured"]
+
+
+@pytest.mark.asyncio
 async def test_provider_model_unique_constraint_per_org(default_user, provider_manager, org_manager, default_organization):
     """Test that provider models have unique handles within each organization (not globally)."""
     # Create a second organization
