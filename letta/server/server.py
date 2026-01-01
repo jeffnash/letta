@@ -1186,44 +1186,194 @@ class SyncServer(object):
         )
 
     def _build_model_groups(self, available_handles: set[str], models: list) -> dict[str, list[str]]:
+        """Build model groups from available models.
+
+        These groups back server-side selector resolution (e.g. `group:fast`).
+
+        The previous implementation used broad substring checks that accidentally made
+        minor version strings affect group membership (e.g. `gpt-5` vs `gpt-5.2`).
+        This implementation is provider-aware and relies primarily on explicit tier/
+        mode tags (e.g. `low`, `high`, `thinking`, `no-reasoning`) rather than minor
+        versions.
         """
-        Build model groups from available models.
-        
-        Groups are categorized by capability:
-        - fast: Smaller, faster models (mini, nano, haiku, flash)
-        - strong: Larger, more capable models (gpt-5.2, opus, pro)
-        - planning: Models good for planning tasks
-        - default: General fallback order
-        """
+
+        def _split_handle(model_handle: str) -> tuple[str, str]:
+            if "/" not in model_handle:
+                return "", model_handle
+            provider, model = model_handle.split("/", 1)
+            return provider.lower(), model.lower()
+
+        def _normalize_openai_family(model: str) -> str:
+            # Normalize gpt-5.* to gpt-5 family so minor versions don't affect grouping.
+            if model.startswith("gpt-5"):
+                return "gpt-5"
+            return model
+
+        def _parse_tokens(model: str) -> set[str]:
+            # Tokenize on common separators.
+            tokens = {t for t in model.replace("_", "-").split("-") if t}
+            return {t.lower() for t in tokens}
+
+        def _parse_cliproxy(model: str) -> tuple[str, set[str]]:
+            # cliproxy models encode the underlying family and tags into the model name.
+            # Example: cliproxy-gpt-5.2-codex-xhigh
+            tokens = _parse_tokens(model)
+            # Drop the cliproxy prefix if present.
+            if tokens and ("cliproxy" in tokens):
+                tokens.discard("cliproxy")
+            # Infer family from remaining tokens.
+            # We prefer explicit known families; otherwise keep the whole model string.
+            family = model
+
+            # OpenAI-ish
+            if any(t.startswith("gpt") for t in tokens):
+                # Find gpt-5 / gpt-5.1 / gpt-5.2, etc.
+                for t in tokens:
+                    if t.startswith("gpt"):
+                        family = _normalize_openai_family(t)
+                        break
+            # Anthropic-ish
+            if "opus" in tokens:
+                # handle `opus`, `opus-pro-max`, etc.
+                family = "opus"
+            elif "sonnet" in tokens:
+                family = "sonnet"
+            elif "haiku" in tokens:
+                family = "haiku"
+            # Gemini-ish
+            if "gemini" in tokens:
+                family = "gemini"
+
+            return family, tokens
+
+        def _tier_tags(tokens: set[str]) -> set[str]:
+            return tokens & {
+                "minimal",
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "mini",
+                "nano",
+                "flash",
+                "pro",
+                "max",
+            }
+
+        def _has_thinking(tokens: set[str]) -> bool:
+            return any(t in tokens for t in {"thinking", "reasoning"})
+
+        def _has_no_reasoning(tokens: set[str]) -> bool:
+            return any(t in tokens for t in {"no", "no-reasoning", "noreasoning"}) or (
+                "no" in tokens and "reasoning" in tokens
+            )
+
+        def _is_fast(provider: str, model: str) -> bool:
+            # Provider-aware fast signals.
+            tokens = _parse_tokens(model)
+            if provider == "cliproxy" or model.startswith("cliproxy-"):
+                _, cliproxy_tokens = _parse_cliproxy(model)
+                tokens |= cliproxy_tokens
+
+            # Explicit fast/cheap tiers
+            if tokens & {"minimal", "none", "low", "mini", "nano", "flash", "haiku"}:
+                return True
+
+            # Specific known fast models
+            if model in {"gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"}:
+                return True
+
+            # No-reasoning SKUs are intended to be fast
+            if "no-reasoning" in model:
+                return True
+
+            return False
+
+        def _is_strong(provider: str, model: str) -> bool:
+            tokens = _parse_tokens(model)
+            if provider == "cliproxy" or model.startswith("cliproxy-"):
+                _, cliproxy_tokens = _parse_cliproxy(model)
+                tokens |= cliproxy_tokens
+
+            # Anthropic
+            if provider in {"anthropic", "cliproxy"} and ("opus" in tokens or "sonnet" in tokens):
+                return True
+
+            # OpenAI gpt-5 family (regardless of minor) is strong unless it's explicitly fast tier
+            if provider in {"openai", "copilot", "cliproxy"} and "gpt" in model:
+                if _normalize_openai_family(model).startswith("gpt-5"):
+                    return not _is_fast(provider, model)
+
+            # Explicit strong signals
+            if tokens & {"high", "xhigh", "pro", "max", "codex"}:
+                return True
+
+            # Other strong families from your list (best-effort)
+            if any(model.startswith(x) for x in [
+                "gemini",
+                "glm",
+                "kimi",
+                "deepseek",
+                "minimax",
+            ]):
+                return True
+
+            if model in {"gpt-4.1"}:
+                return True
+
+            return False
+
+        def _is_planning(provider: str, model: str) -> bool:
+            tokens = _parse_tokens(model)
+            if provider == "cliproxy" or model.startswith("cliproxy-"):
+                _, cliproxy_tokens = _parse_cliproxy(model)
+                tokens |= cliproxy_tokens
+
+            if _has_no_reasoning(tokens) or "no-reasoning" in model:
+                return False
+
+            # Explicit thinking/reasoning SKUs
+            if _has_thinking(tokens):
+                return True
+
+            # Planning-capable families at sufficiently high tier (based on your Planning list)
+            if any(model.startswith(x) for x in ["opus", "sonnet-4.5", "kimi-k2-thinking", "grok"]):
+                return True
+
+            # OpenAI: only include higher tiers; do not treat minor versions differently.
+            if provider in {"openai", "copilot", "cliproxy"}:
+                if model.startswith("gpt-5"):
+                    # planning list includes medium+ and high/xhigh variants
+                    if tokens & {"medium", "high", "xhigh"}:
+                        return True
+
+            return False
+
         groups: dict[str, list[str]] = {
             "fast": [],
             "strong": [],
             "planning": [],
-            "default": [],
+            "default": ["group:strong", "group:fast"],
         }
-        
-        # Categorize models by name patterns
+
         for handle in sorted(available_handles):
-            handle_lower = handle.lower()
-            
-            # Fast models (small/quick)
-            if any(x in handle_lower for x in ["mini", "nano", "haiku", "flash", "4.1-mini", "4.1-nano"]):
+            provider, model = _split_handle(handle)
+            # Treat cliproxy- prefixed model names as cliproxy provider for classification.
+            if model.startswith("cliproxy-"):
+                provider = "cliproxy"
+
+            if _is_fast(provider, model):
                 groups["fast"].append(handle)
-            
-            # Strong models (large/capable)
-            if any(x in handle_lower for x in ["gpt-5.2", "gpt-5.1", "opus", "pro", "strong", "codex"]):
+
+            if _is_strong(provider, model):
                 groups["strong"].append(handle)
-            
-            # Planning models (reasoning-capable)
-            if any(x in handle_lower for x in ["gpt-5", "opus", "pro", "thinking", "reasoning"]):
+
+            if _is_planning(provider, model):
                 groups["planning"].append(handle)
-        
-        # Default group: strong first, then fast
-        groups["default"] = ["group:strong", "group:fast"]
-        
+
         # Remove empty groups (except default which references other groups)
         groups = {k: v for k, v in groups.items() if v or k == "default"}
-        
         return groups
 
     def _get_default_model(self, available_handles: set[str], models: list) -> str:
@@ -1253,13 +1403,18 @@ class SyncServer(object):
             ):
                 return handle
         
-        # Look for strong models next
-        for handle in sorted(available_handles):
-            handle_lower = handle.lower()
-            if any(x in handle_lower for x in ["gpt-5.2", "gpt-5.1-codex", "opus"]):
-                return handle
-        
-        # Fall back to first available
+        # Prefer a planning-capable model if possible, then strong, then anything.
+        try:
+            groups = self._build_model_groups(available_handles, models)
+        except Exception:
+            groups = {}
+
+        for group_name in ["planning", "strong", "fast"]:
+            for handle in groups.get(group_name, []):
+                if handle in available_handles:
+                    return handle
+
+        # Fall back to first available (stable)
         return sorted(available_handles)[0]
 
     async def get_enabled_providers_async(

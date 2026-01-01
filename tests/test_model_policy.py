@@ -325,6 +325,64 @@ class TestDefaultModelSelection:
 
         assert result == "openai/gpt-4.1"
 
+    def test_default_model_prefers_planning_group_when_no_explicit_default(self):
+        """When no explicit default exists, prefer planning-capable handles."""
+        server = SyncServer.__new__(SyncServer)
+        models = [
+            SimpleNamespace(handle="anthropic/sonnet-4.5-no-reasoning"),
+            SimpleNamespace(handle="openai/gpt-5.1-high"),
+            SimpleNamespace(handle="openai/gpt-4.1-mini"),
+        ]
+        available_handles = {m.handle for m in models if m.handle}
+
+        # gpt-5.1-high should land in planning; sonnet-no-reasoning must not.
+        result = server._get_default_model(available_handles, models)
+
+        assert result == "openai/gpt-5.1-high"
+
+
+class TestModelGroupingHeuristics:
+    def test_grouping_respects_reasoning_tiers_and_no_reasoning(self):
+        server = SyncServer.__new__(SyncServer)
+        handles = {
+            "anthropic/opus",
+            "anthropic/sonnet-4.5",
+            "anthropic/sonnet-4.5-no-reasoning",
+            "anthropic/haiku",
+            "openai/gpt-5.2-xhigh",
+            "openai/gpt-5.2-low",
+            "openai/gpt-4.1",
+            "openai/gpt-4.1-mini",
+            "cliproxy/cliproxy-gpt-5.2-codex-xhigh",
+            "cliproxy/cliproxy-gemini-3-flash",
+        }
+
+        groups = server._build_model_groups(handles, [SimpleNamespace(handle=h) for h in handles])
+
+        assert "anthropic/haiku" in groups.get("fast", [])
+        assert "openai/gpt-4.1-mini" in groups.get("fast", [])
+
+        assert "anthropic/opus" in groups.get("strong", [])
+        assert "openai/gpt-4.1" in groups.get("strong", [])
+        assert "cliproxy/cliproxy-gpt-5.2-codex-xhigh" in groups.get("strong", [])
+
+        assert "anthropic/opus" in groups.get("planning", [])
+        assert "anthropic/sonnet-4.5" in groups.get("planning", [])
+        assert "anthropic/sonnet-4.5-no-reasoning" not in groups.get("planning", [])
+        assert "openai/gpt-5.2-xhigh" in groups.get("planning", [])
+        assert "openai/gpt-5.2-low" not in groups.get("planning", [])
+
+    def test_openai_minor_versions_do_not_change_family_membership(self):
+        server = SyncServer.__new__(SyncServer)
+        handles = {
+            "openai/gpt-5.1-medium",
+            "openai/gpt-5.2-medium",
+        }
+        groups = server._build_model_groups(handles, [SimpleNamespace(handle=h) for h in handles])
+
+        assert "openai/gpt-5.1-medium" in groups.get("planning", [])
+        assert "openai/gpt-5.2-medium" in groups.get("planning", [])
+
 
 class TestResolveModelSelectorAsync:
     """Tests for resolve_model_selector_async behavior."""
