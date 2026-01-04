@@ -743,6 +743,25 @@ class OpenAIClient(LLMClientBase):
 
             return chat_completion_response
 
+        # Check if response_data is an error response (e.g., from OpenAI-compatible proxies
+        # that return error JSON instead of raising HTTP exceptions)
+        if "error" in response_data:
+            error_obj = response_data.get("error", {})
+            error_message = error_obj.get("message", str(response_data))
+            error_code = error_obj.get("code", "")
+            
+            # Check if this is a context window exceeded error
+            from letta.llm_api.error_utils import is_context_window_overflow_message
+            if error_code == "model_max_prompt_tokens_exceeded" or is_context_window_overflow_message(error_message):
+                from letta.errors import ContextWindowExceededError
+                raise ContextWindowExceededError(
+                    message=f"Context window exceeded: {error_message}",
+                )
+            
+            # For other errors, raise a generic LLM error
+            from letta.errors import LLMError
+            raise LLMError(message=f"LLM API error: {error_message}")
+
         # OpenAI's response structure directly maps to ChatCompletionResponse
         # We just need to instantiate the Pydantic model for validation and type safety.
         chat_completion_response = ChatCompletionResponse(**response_data)
