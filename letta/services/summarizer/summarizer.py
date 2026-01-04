@@ -17,7 +17,7 @@ from letta.log import get_logger
 from letta.otel.tracing import trace_method
 from letta.prompts import gpt_summarize
 from letta.schemas.enums import AgentType, MessageRole, ProviderType
-from letta.schemas.letta_message_content import TextContent
+from letta.schemas.letta_message_content import ImageContent, TextContent
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.message import Message, MessageCreate
 from letta.schemas.user import User
@@ -28,6 +28,34 @@ from letta.system import package_summarize_message_no_counts
 from letta.utils import safe_create_task
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Chunked Summarization Constants
+# ---------------------------------------------------------------------------
+
+# Default chunk size (in messages) for chunked summarization
+# This is conservative - most models can handle more, but we want safety margin
+DEFAULT_CHUNK_SIZE_MESSAGES = 30
+
+# Default char budget per chunk (rough estimate: ~4 chars per token, 60% of context window)
+# This provides headroom for system prompt, output, etc.
+DEFAULT_CHUNK_CHAR_BUDGET = 40000
+
+# Maximum recursion depth for hierarchical summarization
+MAX_HIERARCHICAL_DEPTH = 3
+
+# Prompt for combining multiple chunk summaries into one
+CHUNK_COMBINE_PROMPT = """You are combining multiple summaries of different parts of a conversation into one coherent summary.
+
+The summaries below are from consecutive chunks of the same conversation, in chronological order.
+Combine them into a single, coherent summary that:
+1. Preserves all important information from each chunk
+2. Removes redundancy between chunks
+3. Maintains chronological flow
+4. Stays concise while being complete
+
+Output only the combined summary, nothing else."""
 
 
 # NOTE: legacy, new version is functional
@@ -590,11 +618,407 @@ async def simple_summary(
                 try:
                     summary = await _run_summarizer_request(request_data, input_messages_obj)
                 except Exception as fallback_error_b:
-                    logger.error(f"Transcript truncation fallback also failed: {fallback_error_b}. Propagating error.")
-                    logger.info(f"Full fallback summarization payload: {request_data}")
-                    raise llm_client.handle_llm_error(fallback_error_b)
+                    # Fallback C: Use chunked/hierarchical summarization
+                    logger.warning(f"Transcript truncation fallback failed ({fallback_error_b}). Falling back to chunked summarization.")
+                    
+                    try:
+                        summary = await chunked_summary(
+                            messages=messages,
+                            llm_config=llm_config,
+                            actor=actor,
+                            prompt=prompt,
+                        )
+                        logger.info(f"Chunked summarization succeeded for {len(messages)} messages")
+                    except Exception as chunked_error:
+                        logger.error(f"Chunked summarization also failed: {chunked_error}. Propagating original error.")
+                        raise llm_client.handle_llm_error(fallback_error_b)
 
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Chunked / Hierarchical Summarization
+# ---------------------------------------------------------------------------
+
+
+def _estimate_message_chars(messages: List[Message]) -> int:
+    """Estimate the character count of messages when formatted as a transcript."""
+    return len(simple_formatter(messages, tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS))
+
+
+def _compute_chunk_budget(llm_config: LLMConfig) -> int:
+    """Compute a safe character budget for each chunk based on model context window."""
+    try:
+        # Use 50% of context window, assuming ~4 chars per token
+        # This is conservative to leave room for system prompt, output, etc.
+        budget = int(llm_config.context_window * 0.5 * 4)
+        return max(10000, min(budget, 100000))  # Clamp between 10k and 100k chars
+    except Exception:
+        return DEFAULT_CHUNK_CHAR_BUDGET
+
+
+def _split_messages_into_chunks(
+    messages: List[Message],
+    chunk_char_budget: int,
+) -> List[List[Message]]:
+    """
+    Split messages into chunks that fit within the character budget.
+    
+    Tries to split on natural boundaries (user messages) to maintain context.
+    """
+    if not messages:
+        return []
+    
+    chunks: List[List[Message]] = []
+    current_chunk: List[Message] = []
+    current_chars = 0
+    
+    for msg in messages:
+        msg_chars = len(simple_formatter([msg], tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS))
+        
+        # If adding this message would exceed budget and we have content, start new chunk
+        if current_chars + msg_chars > chunk_char_budget and current_chunk:
+            # Try to find a good split point (user message boundary)
+            # If the last message is not a user message, include it in current chunk anyway
+            chunks.append(current_chunk)
+            current_chunk = [msg]
+            current_chars = msg_chars
+        else:
+            current_chunk.append(msg)
+            current_chars += msg_chars
+    
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+
+@trace_method
+async def _summarize_single_chunk(
+    messages: List[Message],
+    llm_config: LLMConfig,
+    actor: User,
+    prompt: str | None = None,
+    chunk_index: int = 0,
+    total_chunks: int = 1,
+) -> str:
+    """
+    Summarize a single chunk of messages.
+    
+    This is a simplified version of simple_summary with aggressive truncation
+    as the fallback since we know we're already working with smaller chunks.
+    """
+    llm_client = LLMClient.create(
+        provider_type=llm_config.model_endpoint_type,
+        put_inner_thoughts_first=True,
+        actor=actor,
+    )
+    
+    system_prompt = prompt or gpt_summarize.SYSTEM
+    if total_chunks > 1:
+        system_prompt = f"{system_prompt}\n\n(Note: This is chunk {chunk_index + 1} of {total_chunks} from a larger conversation.)"
+    
+    # Format with truncated tool returns from the start
+    summary_transcript = simple_formatter(messages, tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS)
+    
+    # Build a local LLMConfig for summarization
+    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
+    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
+    summarizer_llm_config.enable_reasoner = False
+    
+    input_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": summary_transcript},
+    ]
+    input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
+    
+    async def _run_chunk_request(req_data: dict, req_messages_obj: list[Message]) -> str:
+        """Run the chunk summarization request."""
+        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
+            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
+                SimpleAnthropicStreamingInterface,
+            )
+            interface = SimpleAnthropicStreamingInterface(
+                requires_approval_tools=[],
+                run_id=None,
+                step_id=None,
+            )
+            stream = await llm_client.stream_async(req_data, summarizer_llm_config)
+            async for _chunk in interface.process(stream):
+                pass
+            content_parts = interface.get_content()
+            text = "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
+            if not text:
+                raise Exception("Chunk summary failed to generate")
+            return text
+        
+        response_data = await llm_client.request_async(req_data, summarizer_llm_config)
+        response = await llm_client.convert_response_to_chat_completion(
+            response_data,
+            req_messages_obj,
+            summarizer_llm_config,
+        )
+        if response.choices[0].message.content is None:
+            raise Exception("Chunk summary failed to generate")
+        return response.choices[0].message.content.strip()
+    
+    request_data = llm_client.build_request_data(
+        AgentType.letta_v1_agent,
+        input_messages_obj,
+        summarizer_llm_config,
+        tools=[],
+    )
+    
+    try:
+        return await _run_chunk_request(request_data, input_messages_obj)
+    except Exception as e:
+        # Fallback: aggressive truncation
+        logger.warning(f"Chunk {chunk_index + 1}/{total_chunks} summarization failed ({e}), using aggressive truncation")
+        
+        try:
+            budget_chars = int(summarizer_llm_config.context_window * 0.4 * 4)
+        except Exception:
+            budget_chars = 30000
+        
+        truncated_transcript, _ = middle_truncate_text(summary_transcript, budget_chars=budget_chars, head_frac=0.4, tail_frac=0.4)
+        
+        input_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": truncated_transcript},
+        ]
+        input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
+        request_data = llm_client.build_request_data(
+            AgentType.letta_v1_agent,
+            input_messages_obj,
+            summarizer_llm_config,
+            tools=[],
+        )
+        
+        return await _run_chunk_request(request_data, input_messages_obj)
+
+
+@trace_method
+async def _combine_chunk_summaries(
+    summaries: List[str],
+    llm_config: LLMConfig,
+    actor: User,
+    depth: int = 0,
+) -> str:
+    """
+    Combine multiple chunk summaries into one.
+    
+    If the combined summaries are still too large, recursively chunk and summarize.
+    """
+    if len(summaries) == 1:
+        return summaries[0]
+    
+    if depth >= MAX_HIERARCHICAL_DEPTH:
+        logger.warning(f"Max hierarchical summarization depth ({MAX_HIERARCHICAL_DEPTH}) reached, concatenating summaries")
+        return "\n\n---\n\n".join(summaries)
+    
+    llm_client = LLMClient.create(
+        provider_type=llm_config.model_endpoint_type,
+        put_inner_thoughts_first=True,
+        actor=actor,
+    )
+    
+    combined_input = "\n\n---\n\n".join([f"[Summary {i+1}]\n{s}" for i, s in enumerate(summaries)])
+    
+    # Check if combined input fits in context
+    chunk_budget = _compute_chunk_budget(llm_config)
+    
+    if len(combined_input) > chunk_budget:
+        # Need to recursively summarize
+        logger.info(f"Combined summaries ({len(combined_input)} chars) exceed budget ({chunk_budget}), recursively summarizing")
+        
+        # Split summaries into groups and summarize each group
+        group_size = max(2, len(summaries) // 2)
+        groups = [summaries[i:i + group_size] for i in range(0, len(summaries), group_size)]
+        
+        sub_summaries = []
+        for group in groups:
+            group_text = "\n\n---\n\n".join([f"[Summary]\n{s}" for s in group])
+            sub_summary = await _summarize_text_directly(group_text, llm_config, actor, CHUNK_COMBINE_PROMPT)
+            sub_summaries.append(sub_summary)
+        
+        return await _combine_chunk_summaries(sub_summaries, llm_config, actor, depth + 1)
+    
+    # Combine summaries with a single LLM call
+    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
+    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
+    summarizer_llm_config.enable_reasoner = False
+    
+    input_messages = [
+        {"role": "system", "content": CHUNK_COMBINE_PROMPT},
+        {"role": "user", "content": combined_input},
+    ]
+    input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
+    
+    request_data = llm_client.build_request_data(
+        AgentType.letta_v1_agent,
+        input_messages_obj,
+        summarizer_llm_config,
+        tools=[],
+    )
+    
+    try:
+        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
+            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
+                SimpleAnthropicStreamingInterface,
+            )
+            interface = SimpleAnthropicStreamingInterface(
+                requires_approval_tools=[],
+                run_id=None,
+                step_id=None,
+            )
+            stream = await llm_client.stream_async(request_data, summarizer_llm_config)
+            async for _chunk in interface.process(stream):
+                pass
+            content_parts = interface.get_content()
+            return "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
+        
+        response_data = await llm_client.request_async(request_data, summarizer_llm_config)
+        response = await llm_client.convert_response_to_chat_completion(
+            response_data,
+            input_messages_obj,
+            summarizer_llm_config,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Failed to combine chunk summaries: {e}")
+        # Fallback: just concatenate
+        return "\n\n---\n\n".join(summaries)
+
+
+async def _summarize_text_directly(
+    text: str,
+    llm_config: LLMConfig,
+    actor: User,
+    prompt: str,
+) -> str:
+    """Helper to summarize raw text directly."""
+    llm_client = LLMClient.create(
+        provider_type=llm_config.model_endpoint_type,
+        put_inner_thoughts_first=True,
+        actor=actor,
+    )
+    
+    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
+    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
+    summarizer_llm_config.enable_reasoner = False
+    
+    input_messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text},
+    ]
+    input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
+    
+    request_data = llm_client.build_request_data(
+        AgentType.letta_v1_agent,
+        input_messages_obj,
+        summarizer_llm_config,
+        tools=[],
+    )
+    
+    if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
+        from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
+            SimpleAnthropicStreamingInterface,
+        )
+        interface = SimpleAnthropicStreamingInterface(
+            requires_approval_tools=[],
+            run_id=None,
+            step_id=None,
+        )
+        stream = await llm_client.stream_async(request_data, summarizer_llm_config)
+        async for _chunk in interface.process(stream):
+            pass
+        content_parts = interface.get_content()
+        return "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
+    
+    response_data = await llm_client.request_async(request_data, summarizer_llm_config)
+    response = await llm_client.convert_response_to_chat_completion(
+        response_data,
+        input_messages_obj,
+        summarizer_llm_config,
+    )
+    return response.choices[0].message.content.strip()
+
+
+@trace_method
+async def chunked_summary(
+    messages: List[Message],
+    llm_config: LLMConfig,
+    actor: User,
+    prompt: str | None = None,
+) -> str:
+    """
+    Summarize a large list of messages using chunked/hierarchical summarization.
+    
+    This is the main entry point for summarizing conversations that may exceed
+    the model's context window. It:
+    1. Splits messages into manageable chunks
+    2. Summarizes each chunk in parallel
+    3. Combines chunk summaries (recursively if needed)
+    
+    Args:
+        messages: List of messages to summarize
+        llm_config: LLM configuration for the summarizer model
+        actor: User making the request
+        prompt: Optional custom summarization prompt
+    
+    Returns:
+        A single summary string covering all messages
+    """
+    if not messages:
+        return ""
+    
+    # Compute chunk budget based on model
+    chunk_budget = _compute_chunk_budget(llm_config)
+    
+    # Split messages into chunks
+    chunks = _split_messages_into_chunks(messages, chunk_budget)
+    
+    logger.info(f"Chunked summarization: {len(messages)} messages -> {len(chunks)} chunks (budget={chunk_budget} chars)")
+    
+    if len(chunks) == 1:
+        # Single chunk - just use regular summarization
+        return await _summarize_single_chunk(
+            chunks[0],
+            llm_config,
+            actor,
+            prompt,
+            chunk_index=0,
+            total_chunks=1,
+        )
+    
+    # Summarize chunks in parallel
+    chunk_tasks = [
+        _summarize_single_chunk(
+            chunk,
+            llm_config,
+            actor,
+            prompt,
+            chunk_index=i,
+            total_chunks=len(chunks),
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    
+    chunk_summaries = await asyncio.gather(*chunk_tasks, return_exceptions=True)
+    
+    # Filter out failures and log them
+    valid_summaries = []
+    for i, result in enumerate(chunk_summaries):
+        if isinstance(result, Exception):
+            logger.error(f"Chunk {i + 1}/{len(chunks)} failed: {result}")
+            # Add a placeholder for failed chunks
+            valid_summaries.append(f"[Chunk {i + 1}: summarization failed]")
+        else:
+            valid_summaries.append(result)
+    
+    # Combine summaries
+    return await _combine_chunk_summaries(valid_summaries, llm_config, actor)
 
 
 def format_transcript(messages: List[Message], include_system: bool = False) -> List[str]:
