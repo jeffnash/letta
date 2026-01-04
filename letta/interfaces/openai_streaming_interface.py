@@ -284,9 +284,6 @@ class OpenAIStreamingInterface:
         # Track events for diagnostics
         self.total_events_received += 1
         self.last_event_type = "ChatCompletionChunk"
-        # Track events for diagnostics
-        self.total_events_received += 1
-        self.last_event_type = "ChatCompletionChunk"
 
         if not self.model or not self.message_id:
             self.model = chunk.model
@@ -294,8 +291,14 @@ class OpenAIStreamingInterface:
 
         # track usage
         if chunk.usage:
-            self.input_tokens += chunk.usage.prompt_tokens
-            self.output_tokens += chunk.usage.completion_tokens
+            # Some OpenAI-compatible proxies/providers may omit usage fields or set them to null.
+            # Treat missing values as 0 to avoid crashing the stream.
+            prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
+            completion_tokens = getattr(chunk.usage, "completion_tokens", None)
+            if isinstance(prompt_tokens, int):
+                self.input_tokens += prompt_tokens
+            if isinstance(completion_tokens, int):
+                self.output_tokens += completion_tokens
 
         if chunk.choices:
             choice = chunk.choices[0]
@@ -784,8 +787,14 @@ class SimpleOpenAIStreamingInterface:
 
         # track usage
         if chunk.usage:
-            self.input_tokens += chunk.usage.prompt_tokens
-            self.output_tokens += chunk.usage.completion_tokens
+            # Some OpenAI-compatible proxies/providers may omit usage fields or set them to null.
+            # Treat missing values as 0 to avoid crashing the stream.
+            prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
+            completion_tokens = getattr(chunk.usage, "completion_tokens", None)
+            if isinstance(prompt_tokens, int):
+                self.input_tokens += prompt_tokens
+            if isinstance(completion_tokens, int):
+                self.output_tokens += completion_tokens
             # Store raw usage for transparent provider trace logging
             try:
                 self.raw_usage = chunk.usage.model_dump(exclude_none=True)
