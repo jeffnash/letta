@@ -2105,7 +2105,7 @@ class Message(BaseMessage):
             messages.remove(idx)
 
         # Filter last message if it is a lone approval request without a response - this only occurs for token counting
-        if messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
+        if messages and messages[-1].role == "approval" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
             messages.remove(messages[-1])
             # Also filter pending tool call message if this turn invoked parallel tool calling
             if messages and messages[-1].role == "assistant" and messages[-1].tool_calls is not None and len(messages[-1].tool_calls) > 0:
@@ -2113,7 +2113,8 @@ class Message(BaseMessage):
 
         # Filter last message if it is a lone reasoning message without assistant message or tool call
         if (
-            messages[-1].role == "assistant"
+            messages
+            and messages[-1].role == "assistant"
             and messages[-1].tool_calls is None
             and (not messages[-1].content or all(not isinstance(content_part, TextContent) for content_part in messages[-1].content))
         ):
