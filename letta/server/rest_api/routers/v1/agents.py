@@ -1700,8 +1700,15 @@ async def cancel_message(
         results[run_id] = "cancelled"
         logger.info(f"Cancelled run {run_id}")
 
+    # Cancellation should be best-effort: it's common for runs to already be terminal
+    # or for a race to occur between completion and cancel.
     if failed_to_cancel:
-        raise RunCancelError(f"Failed to cancel runs: {failed_to_cancel}")
+        logger.warning(f"Failed to cancel runs: {failed_to_cancel}")
+        return {
+            "results": results,
+            "failed_to_cancel": failed_to_cancel,
+        }
+
     return results
 
 
