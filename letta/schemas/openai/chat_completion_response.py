@@ -71,7 +71,9 @@ class Message(BaseModel):
 
 class Choice(BaseModel):
     finish_reason: str
-    index: int
+    # Some OpenAI-compatible proxies incorrectly return null for index.
+    # Default to 0 so we can continue processing.
+    index: int = 0
     message: Message
     logprobs: Optional[ChoiceLogprobs] = None
     seed: Optional[int] = None  # found in TogetherAI
@@ -158,13 +160,17 @@ class UsageStatistics(BaseModel):
 class ChatCompletionResponse(BaseModel):
     """https://platform.openai.com/docs/api-reference/chat/object"""
 
+    # Allow providers to send extra fields without failing validation.
+    model_config = {"extra": "allow"}
+
     id: str
     choices: List[Choice]
     created: Union[datetime.datetime, int]
-    model: Optional[str] = None  # NOTE: this is not consistent with OpenAI API standard, however is necessary to support local LLMs
+    model: Optional[str] = None  # NOTE: not consistent with OpenAI API standard, necessary for local/proxy LLMs
     # system_fingerprint: str  # docs say this is mandatory, but in reality API returns None
     system_fingerprint: Optional[str] = None
-    # object: str = Field(default="chat.completion")
+    # Some OpenAI-compatible proxies incorrectly return null for object.
+    # Treat missing/None as the canonical value.
     object: Literal["chat.completion"] = "chat.completion"
     usage: UsageStatistics
 

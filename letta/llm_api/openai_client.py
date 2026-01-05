@@ -28,6 +28,7 @@ from letta.errors import (
     LLMUnprocessableEntityError,
 )
 from letta.llm_api.error_utils import is_context_window_overflow_message
+from letta.llm_api.response_normalizer import normalize_chat_completion_response
 from letta.llm_api.helpers import (
     add_inner_thoughts_to_functions,
     convert_response_format_to_responses_api,
@@ -763,7 +764,15 @@ class OpenAIClient(LLMClientBase):
             raise LLMError(message=f"LLM API error: {error_message}")
 
         # OpenAI's response structure directly maps to ChatCompletionResponse
-        # We just need to instantiate the Pydantic model for validation and type safety.
+        # We instantiate the Pydantic model for validation/type safety, but tolerate
+        # common proxy bugs (e.g., null choice.index or null object).
+        # Use the centralized normalizer for consistent handling across all providers.
+        response_data = normalize_chat_completion_response(
+            response_data,
+            provider=llm_config.model_endpoint_type,
+            model=llm_config.model,
+        )
+
         chat_completion_response = ChatCompletionResponse(**response_data)
         chat_completion_response = self._fix_truncated_json_response(chat_completion_response)
 
