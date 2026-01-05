@@ -385,6 +385,121 @@ def middle_truncate_text(
     return head + marker + tail, dropped
 
 
+def _summarizer_llm_config(base: LLMConfig) -> LLMConfig:
+    """Create a safe LLMConfig for summarization.
+
+    Summarization requests should:
+    - not put inner thoughts in kwargs (provider formatting conflicts)
+    - not enable extended reasoning
+    """
+    cfg = LLMConfig(**base.model_dump())
+    cfg.put_inner_thoughts_in_kwargs = False
+    cfg.enable_reasoner = False
+    return cfg
+
+
+def _summarizer_supports_provider_streaming(llm_config: LLMConfig) -> bool:
+    return llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]
+
+
+async def _run_summarizer_request(
+    llm_client: LLMClient,
+    summarizer_llm_config: LLMConfig,
+    request_data: dict,
+    input_messages_obj: list[Message],
+) -> str:
+    """Run a summarization request and return assistant text.
+
+    DRY helper shared by both one-pass and chunked summarization.
+
+    For Anthropic/Bedrock, use provider-side streaming to avoid long-request failures.
+    Otherwise, use non-streaming request and normalize via chat-completions conversion.
+    """
+    if _summarizer_supports_provider_streaming(summarizer_llm_config):
+        logger.info(
+            "Summarizer: using provider streaming (%s/%s) to avoid long-request failures",
+            summarizer_llm_config.model_endpoint_type,
+            summarizer_llm_config.model,
+        )
+        from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
+            SimpleAnthropicStreamingInterface,
+        )
+
+        interface = SimpleAnthropicStreamingInterface(
+            requires_approval_tools=[],
+            run_id=None,
+            step_id=None,
+        )
+
+        # Provider client sets request_data["stream"] = True internally.
+        stream = await llm_client.stream_async(request_data, summarizer_llm_config)
+        async for _chunk in interface.process(stream):
+            pass
+
+        content_parts = interface.get_content()
+        text = "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
+        if not text:
+            raise Exception("Summary failed to generate")
+        return text
+
+    logger.debug(
+        "Summarizer: using non-streaming request (%s/%s)",
+        summarizer_llm_config.model_endpoint_type,
+        summarizer_llm_config.model,
+    )
+    response_data = await llm_client.request_async(request_data, summarizer_llm_config)
+    response = await llm_client.convert_response_to_chat_completion(
+        response_data,
+        input_messages_obj,
+        summarizer_llm_config,
+    )
+    content = response.choices[0].message.content
+    if content is None:
+        raise Exception("Summary failed to generate")
+    return content.strip()
+
+
+def _compute_safe_transcript_budget_chars(
+    llm_config: LLMConfig,
+    system_prompt: str,
+    include_ack: bool,
+    safety_frac: float = 0.6,
+    min_budget_chars: int = 2000,
+    default_budget_chars: int = 48000,
+) -> int:
+    """Compute a conservative transcript char budget for summarization.
+
+    Uses a rough 4 chars/token heuristic with a safety fraction, and subtracts overhead
+    for the system prompt + optional ACK + small JSON overhead.
+
+    This is intentionally approximate; providers vary, and tool output can have high
+    token density.
+    """
+    try:
+        budget_chars = int(llm_config.context_window * safety_frac * 4)
+    except Exception:
+        budget_chars = default_budget_chars
+
+    overhead = len(system_prompt) + (len(MESSAGE_SUMMARY_REQUEST_ACK) if include_ack else 0) + 1024
+    return max(min_budget_chars, budget_chars - overhead)
+
+
+def _truncate_to_budget(
+    text: str,
+    *,
+    budget_chars: int,
+    head_frac: float,
+    tail_frac: float,
+) -> str:
+    truncated, _ = middle_truncate_text(
+        text,
+        budget_chars=budget_chars,
+        head_frac=head_frac,
+        tail_frac=tail_frac,
+    )
+    return truncated
+
+
 def build_summary_request_text(retain_count: int, evicted_messages: List[str], in_context_messages: List[str]) -> str:
     parts: List[str] = []
     if retain_count == 0:
@@ -459,9 +574,27 @@ async def simple_summary(
 
     # Prepare the messages payload to send to the LLM
     system_prompt = prompt or gpt_summarize.SYSTEM
-    # Build the initial transcript without clamping to preserve fidelity
-    # TODO proactively clip here?
+    # Build the initial transcript.
+    # Do a conservative pre-clamp to reduce repeated provider 400s when the
+    # conversation is extremely large (tool output can explode token counts).
     summary_transcript = simple_formatter(messages)
+    try:
+        preclamp_budget_chars = _compute_safe_transcript_budget_chars(
+            llm_config=llm_config,
+            system_prompt=system_prompt,
+            include_ack=include_ack,
+            safety_frac=0.6,
+        )
+        if len(summary_transcript) > preclamp_budget_chars:
+            summary_transcript = _truncate_to_budget(
+                summary_transcript,
+                budget_chars=preclamp_budget_chars,
+                head_frac=0.35,
+                tail_frac=0.35,
+            )
+    except Exception:
+        # Best-effort only
+        pass
 
     if include_ack:
         logger.info(f"Summarizing with ACK for model {llm_config.model}")
@@ -477,71 +610,42 @@ async def simple_summary(
             {"role": "user", "content": summary_transcript},
         ]
     input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
-    # Build a local LLMConfig for v1-style summarization which uses native content and must not
-    # include inner thoughts in kwargs to avoid conflicts in Anthropic formatting.
-    # We also disable enable_reasoner to avoid extended thinking requirements (Anthropic requires
-    # assistant messages to start with thinking blocks when extended thinking is enabled).
-    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
-    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
-    summarizer_llm_config.enable_reasoner = False
-
-    async def _run_summarizer_request(req_data: dict, req_messages_obj: list[Message]) -> str:
-        """Run summarization request and return assistant text.
-
-        For Anthropic, use provider-side streaming to avoid long-request failures
-        (Anthropic requires streaming for requests that may exceed ~10 minutes).
-        """
-
-        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
-            logger.info(
-                "Summarizer: using provider streaming (%s/%s) to avoid long-request failures",
-                summarizer_llm_config.model_endpoint_type,
-                summarizer_llm_config.model,
-            )
-            # Stream from provider and accumulate the final assistant text.
-            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
-                SimpleAnthropicStreamingInterface,
-            )
-
-            interface = SimpleAnthropicStreamingInterface(
-                requires_approval_tools=[],
-                run_id=None,
-                step_id=None,
-            )
-
-            # AnthropicClient.stream_async sets request_data["stream"] = True internally.
-            stream = await llm_client.stream_async(req_data, summarizer_llm_config)
-            async for _chunk in interface.process(stream):
-                # We don't emit anything; we just want the fully-accumulated content.
-                pass
-
-            content_parts = interface.get_content()
-            text = "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
-            if not text:
-                logger.warning("No content returned from summarizer (streaming path)")
-                raise Exception("Summary failed to generate")
-            return text
-
-        # Default: non-streaming provider request, then normalize via chat-completions conversion.
-        logger.debug(
-            "Summarizer: using non-streaming request (%s/%s)",
-            summarizer_llm_config.model_endpoint_type,
-            summarizer_llm_config.model,
-        )
-        response_data = await llm_client.request_async(req_data, summarizer_llm_config)
-        response = await llm_client.convert_response_to_chat_completion(
-            response_data,
-            req_messages_obj,
-            summarizer_llm_config,
-        )
-        if response.choices[0].message.content is None:
-            logger.warning("No content returned from summarizer")
-            raise Exception("Summary failed to generate")
-        return response.choices[0].message.content.strip()
+    summarizer_llm_config = _summarizer_llm_config(llm_config)
 
     request_data = llm_client.build_request_data(AgentType.letta_v1_agent, input_messages_obj, summarizer_llm_config, tools=[])
+
+
+    # Choose summarization strategy up-front.
+    # For very large transcripts, prefer chunked/hierarchical summarization to avoid
+    # repeated provider 400s and fallback churn.
     try:
-        summary = await _run_summarizer_request(request_data, input_messages_obj)
+        estimated_chars = len(summary_transcript)
+    except Exception:
+        estimated_chars = 0
+
+    strategy_budget_chars = _compute_safe_transcript_budget_chars(
+        llm_config=summarizer_llm_config,
+        system_prompt=system_prompt,
+        include_ack=include_ack,
+        safety_frac=0.6,
+        default_budget_chars=48000,
+    )
+
+    if estimated_chars and estimated_chars > strategy_budget_chars:
+        logger.info(
+            "Summarizer: transcript too large (%d chars > %d), using chunked summarization",
+            estimated_chars,
+            strategy_budget_chars,
+        )
+        return await chunked_summary(messages=messages, llm_config=llm_config, actor=actor, prompt=prompt)
+
+    try:
+        summary = await _run_summarizer_request(
+            llm_client=llm_client,
+            summarizer_llm_config=summarizer_llm_config,
+            request_data=request_data,
+            input_messages_obj=input_messages_obj,
+        )
     except Exception as e:
         # handle LLM error (likely a context window exceeded error)
         try:
@@ -554,7 +658,8 @@ async def simple_summary(
                 messages,
                 tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS,
             )
-            logger.info(f"Full summarization payload: {request_data}")
+            # Avoid logging full payloads at INFO (can be extremely large and contain sensitive data)
+            logger.debug("Summarization payload prepared (keys=%s, model=%s)", list(request_data.keys()), request_data.get("model"))
 
             if include_ack:
                 logger.info(f"Fallback summarization with ACK for model {llm_config.model}")
@@ -579,22 +684,36 @@ async def simple_summary(
             )
 
             try:
-                summary = await _run_summarizer_request(request_data, input_messages_obj)
+                summary = await _run_summarizer_request(
+                    llm_client=llm_client,
+                    summarizer_llm_config=summarizer_llm_config,
+                    request_data=request_data,
+                    input_messages_obj=input_messages_obj,
+                )
             except Exception as fallback_error_a:
                 # Fallback B: hard-truncate the user transcript to fit a conservative char budget
                 logger.warning(f"Clamped tool returns still overflowed ({fallback_error_a}). Falling back to transcript truncation.")
-                logger.info(f"Full fallback summarization payload: {request_data}")
+                logger.debug(
+                    "Fallback summarization payload prepared (keys=%s, model=%s)",
+                    list(request_data.keys()),
+                    request_data.get("model"),
+                )
 
                 # Compute a conservative char budget for the transcript based on context window
-                try:
-                    budget_chars = int(summarizer_llm_config.context_window * 0.6 * 4)
-                except Exception:
-                    budget_chars = 48000
+                budget_chars = _compute_safe_transcript_budget_chars(
+                    llm_config=summarizer_llm_config,
+                    system_prompt=system_prompt,
+                    include_ack=include_ack,
+                    safety_frac=0.6,
+                    default_budget_chars=48000,
+                )
 
-                overhead = len(system_prompt) + (len(MESSAGE_SUMMARY_REQUEST_ACK) if include_ack else 0) + 1024
-                budget_chars = max(2000, budget_chars - overhead)
-
-                truncated_transcript, _ = middle_truncate_text(summary_transcript, budget_chars=budget_chars, head_frac=0.3, tail_frac=0.3)
+                truncated_transcript = _truncate_to_budget(
+                    summary_transcript,
+                    budget_chars=budget_chars,
+                    head_frac=0.3,
+                    tail_frac=0.3,
+                )
 
                 if include_ack:
                     input_messages = [
@@ -616,7 +735,12 @@ async def simple_summary(
                     tools=[],
                 )
                 try:
-                    summary = await _run_summarizer_request(request_data, input_messages_obj)
+                    summary = await _run_summarizer_request(
+                        llm_client=llm_client,
+                        summarizer_llm_config=summarizer_llm_config,
+                        request_data=request_data,
+                        input_messages_obj=input_messages_obj,
+                    )
                 except Exception as fallback_error_b:
                     # Fallback C: Use chunked/hierarchical summarization
                     logger.warning(f"Transcript truncation fallback failed ({fallback_error_b}). Falling back to chunked summarization.")
@@ -723,9 +847,7 @@ async def _summarize_single_chunk(
     summary_transcript = simple_formatter(messages, tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS)
     
     # Build a local LLMConfig for summarization
-    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
-    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
-    summarizer_llm_config.enable_reasoner = False
+    summarizer_llm_config = _summarizer_llm_config(llm_config)
     
     input_messages = [
         {"role": "system", "content": system_prompt},
@@ -734,34 +856,12 @@ async def _summarize_single_chunk(
     input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
     
     async def _run_chunk_request(req_data: dict, req_messages_obj: list[Message]) -> str:
-        """Run the chunk summarization request."""
-        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
-            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
-                SimpleAnthropicStreamingInterface,
-            )
-            interface = SimpleAnthropicStreamingInterface(
-                requires_approval_tools=[],
-                run_id=None,
-                step_id=None,
-            )
-            stream = await llm_client.stream_async(req_data, summarizer_llm_config)
-            async for _chunk in interface.process(stream):
-                pass
-            content_parts = interface.get_content()
-            text = "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
-            if not text:
-                raise Exception("Chunk summary failed to generate")
-            return text
-        
-        response_data = await llm_client.request_async(req_data, summarizer_llm_config)
-        response = await llm_client.convert_response_to_chat_completion(
-            response_data,
-            req_messages_obj,
-            summarizer_llm_config,
+        return await _run_summarizer_request(
+            llm_client=llm_client,
+            summarizer_llm_config=summarizer_llm_config,
+            request_data=req_data,
+            input_messages_obj=req_messages_obj,
         )
-        if response.choices[0].message.content is None:
-            raise Exception("Chunk summary failed to generate")
-        return response.choices[0].message.content.strip()
     
     request_data = llm_client.build_request_data(
         AgentType.letta_v1_agent,
@@ -775,13 +875,20 @@ async def _summarize_single_chunk(
     except Exception as e:
         # Fallback: aggressive truncation
         logger.warning(f"Chunk {chunk_index + 1}/{total_chunks} summarization failed ({e}), using aggressive truncation")
-        
-        try:
-            budget_chars = int(summarizer_llm_config.context_window * 0.4 * 4)
-        except Exception:
-            budget_chars = 30000
-        
-        truncated_transcript, _ = middle_truncate_text(summary_transcript, budget_chars=budget_chars, head_frac=0.4, tail_frac=0.4)
+        budget_chars = _compute_safe_transcript_budget_chars(
+            llm_config=summarizer_llm_config,
+            system_prompt=system_prompt,
+            include_ack=False,
+            safety_frac=0.4,
+            default_budget_chars=30000,
+        )
+
+        truncated_transcript = _truncate_to_budget(
+            summary_transcript,
+            budget_chars=budget_chars,
+            head_frac=0.4,
+            tail_frac=0.4,
+        )
         
         input_messages = [
             {"role": "system", "content": system_prompt},
@@ -845,9 +952,7 @@ async def _combine_chunk_summaries(
         return await _combine_chunk_summaries(sub_summaries, llm_config, actor, depth + 1)
     
     # Combine summaries with a single LLM call
-    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
-    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
-    summarizer_llm_config.enable_reasoner = False
+    summarizer_llm_config = _summarizer_llm_config(llm_config)
     
     input_messages = [
         {"role": "system", "content": CHUNK_COMBINE_PROMPT},
@@ -863,28 +968,12 @@ async def _combine_chunk_summaries(
     )
     
     try:
-        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
-            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
-                SimpleAnthropicStreamingInterface,
-            )
-            interface = SimpleAnthropicStreamingInterface(
-                requires_approval_tools=[],
-                run_id=None,
-                step_id=None,
-            )
-            stream = await llm_client.stream_async(request_data, summarizer_llm_config)
-            async for _chunk in interface.process(stream):
-                pass
-            content_parts = interface.get_content()
-            return "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
-        
-        response_data = await llm_client.request_async(request_data, summarizer_llm_config)
-        response = await llm_client.convert_response_to_chat_completion(
-            response_data,
-            input_messages_obj,
-            summarizer_llm_config,
+        return await _run_summarizer_request(
+            llm_client=llm_client,
+            summarizer_llm_config=summarizer_llm_config,
+            request_data=request_data,
+            input_messages_obj=input_messages_obj,
         )
-        return response.choices[0].message.content.strip()
     except Exception as e:
         logger.error(f"Failed to combine chunk summaries: {e}")
         # Fallback: just concatenate
@@ -904,9 +993,7 @@ async def _summarize_text_directly(
         actor=actor,
     )
     
-    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
-    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
-    summarizer_llm_config.enable_reasoner = False
+    summarizer_llm_config = _summarizer_llm_config(llm_config)
     
     input_messages = [
         {"role": "system", "content": prompt},
@@ -921,28 +1008,12 @@ async def _summarize_text_directly(
         tools=[],
     )
     
-    if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
-        from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
-            SimpleAnthropicStreamingInterface,
-        )
-        interface = SimpleAnthropicStreamingInterface(
-            requires_approval_tools=[],
-            run_id=None,
-            step_id=None,
-        )
-        stream = await llm_client.stream_async(request_data, summarizer_llm_config)
-        async for _chunk in interface.process(stream):
-            pass
-        content_parts = interface.get_content()
-        return "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
-    
-    response_data = await llm_client.request_async(request_data, summarizer_llm_config)
-    response = await llm_client.convert_response_to_chat_completion(
-        response_data,
-        input_messages_obj,
-        summarizer_llm_config,
+    return await _run_summarizer_request(
+        llm_client=llm_client,
+        summarizer_llm_config=summarizer_llm_config,
+        request_data=request_data,
+        input_messages_obj=input_messages_obj,
     )
-    return response.choices[0].message.content.strip()
 
 
 @trace_method
