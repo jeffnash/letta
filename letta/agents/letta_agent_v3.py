@@ -1047,10 +1047,14 @@ class LettaAgentV3(LettaAgentV2):
 
         # 5a. Validate parallel tool calling constraints
         if len(tool_calls) > 1:
-            # No parallel tool calls with tool rules
+            # When tool rules are present, we still allow multiple tool calls but execute them
+            # serially to preserve tool-rule semantics (required tool ordering/prefills).
+            # The LLM might emit multiple calls in one response; hard-failing here causes
+            # unnecessary run failures.
             if self.agent_state.tool_rules and len([r for r in self.agent_state.tool_rules if r.type != "requires_approval"]) > 0:
-                raise ValueError(
-                    "Parallel tool calling is not allowed when tool rules are present. Disable tool rules to use parallel tool calls."
+                self.logger.info(
+                    "Tool rules present: executing %d tool calls serially (no parallel tool calling)",
+                    len(tool_calls),
                 )
 
         # 5b. Prepare execution specs for all tools
@@ -1126,26 +1130,36 @@ class LettaAgentV3(LettaAgentV2):
         if len(exec_specs) == 1:
             results = [await _run_one(exec_specs[0])]
         else:
-            # separate tools by parallel execution capability
-            parallel_items = []
-            serial_items = []
+            # When tool rules are present, always run serially.
+            # Tool rules can require strict ordering and can prefill args based on
+            # previous tool outputs; parallel execution can violate these semantics.
+            tool_rules_present = bool(self.agent_state.tool_rules) and len(
+                [r for r in self.agent_state.tool_rules if r.type != "requires_approval"]
+            ) > 0
 
-            for idx, spec in enumerate(exec_specs):
-                target_tool = next((x for x in self.agent_state.tools if x.name == spec["name"]), None)
-                if target_tool and target_tool.enable_parallel_execution:
-                    parallel_items.append((idx, spec))
-                else:
-                    serial_items.append((idx, spec))
+            if tool_rules_present:
+                results = [await _run_one(spec) for spec in exec_specs]
+            else:
+                # separate tools by parallel execution capability
+                parallel_items = []
+                serial_items = []
 
-            # execute all parallel tools concurrently and all serial tools sequentially
-            results = [None] * len(exec_specs)
+                for idx, spec in enumerate(exec_specs):
+                    target_tool = next((x for x in self.agent_state.tools if x.name == spec["name"]), None)
+                    if target_tool and target_tool.enable_parallel_execution:
+                        parallel_items.append((idx, spec))
+                    else:
+                        serial_items.append((idx, spec))
 
-            parallel_results = await asyncio.gather(*[_run_one(spec) for _, spec in parallel_items]) if parallel_items else []
-            for (idx, _), result in zip(parallel_items, parallel_results):
-                results[idx] = result
+                # execute all parallel tools concurrently and all serial tools sequentially
+                results = [None] * len(exec_specs)
 
-            for idx, spec in serial_items:
-                results[idx] = await _run_one(spec)
+                parallel_results = await asyncio.gather(*[_run_one(spec) for _, spec in parallel_items]) if parallel_items else []
+                for (idx, _), result in zip(parallel_items, parallel_results):
+                    results[idx] = result
+
+                for idx, spec in serial_items:
+                    results[idx] = await _run_one(spec)
 
         # 5d. Update metrics with execution time
         if step_metrics is not None and results:
@@ -1370,32 +1384,54 @@ class LettaAgentV3(LettaAgentV2):
         )
 
         summarization_mode_used = summarizer_config.mode
-        if summarizer_config.mode == "all":
-            summary, compacted_messages = await summarize_all(
-                actor=self.actor,
-                llm_config=summarizer_llm_config,
-                summarizer_config=summarizer_config,
-                in_context_messages=messages,
-            )
-        elif summarizer_config.mode == "sliding_window":
-            try:
-                summary, compacted_messages = await summarize_via_sliding_window(
-                    actor=self.actor,
-                    llm_config=summarizer_llm_config,
-                    summarizer_config=summarizer_config,
-                    in_context_messages=messages,
-                )
-            except Exception as e:
-                self.logger.error(f"Sliding window summarization failed with exception: {str(e)}. Falling back to all mode.")
+        summary = None
+        compacted_messages = None
+        
+        # Wrap all summarization in try/except for graceful degradation
+        try:
+            if summarizer_config.mode == "all":
                 summary, compacted_messages = await summarize_all(
                     actor=self.actor,
                     llm_config=summarizer_llm_config,
                     summarizer_config=summarizer_config,
                     in_context_messages=messages,
                 )
-                summarization_mode_used = "all"
-        else:
-            raise ValueError(f"Invalid summarizer mode: {summarizer_config.mode}")
+            elif summarizer_config.mode == "sliding_window":
+                try:
+                    summary, compacted_messages = await summarize_via_sliding_window(
+                        actor=self.actor,
+                        llm_config=summarizer_llm_config,
+                        summarizer_config=summarizer_config,
+                        in_context_messages=messages,
+                    )
+                except Exception as e:
+                    self.logger.error(f"Sliding window summarization failed with exception: {str(e)}. Falling back to all mode.")
+                    summary, compacted_messages = await summarize_all(
+                        actor=self.actor,
+                        llm_config=summarizer_llm_config,
+                        summarizer_config=summarizer_config,
+                        in_context_messages=messages,
+                    )
+                    summarization_mode_used = "all"
+            else:
+                raise ValueError(f"Invalid summarizer mode: {summarizer_config.mode}")
+        except Exception as summarization_error:
+            # Graceful degradation: if all summarization attempts fail,
+            # fall back to hard eviction (keep only system prompt + minimal context)
+            self.logger.error(
+                "All summarization attempts failed, falling back to hard eviction: %s",
+                str(summarization_error),
+                extra={"agent_id": self.agent_state.id, "error_type": type(summarization_error).__name__},
+            )
+            # Keep system prompt and last few messages to preserve some context
+            system_prompt = messages[0]
+            # Try to keep last 3 messages if possible, otherwise just system prompt
+            if len(messages) > 4:
+                compacted_messages = [system_prompt] + messages[-3:]
+            else:
+                compacted_messages = [system_prompt]
+            summary = "[Summarization failed - context was hard-evicted to prevent run failure]"
+            summarization_mode_used = "hard_eviction"
 
         # update the token count
         self.context_token_estimate = await count_tokens(
