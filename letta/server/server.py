@@ -119,6 +119,44 @@ logger = get_logger(__name__)
 class SyncServer(object):
     """Simple single-threaded / blocking server process"""
 
+    async def _resolve_model_input_async(
+        self,
+        model: str,
+        actor: User,
+        parent_model_handle: str | None,
+    ) -> str:
+        """
+        Resolve a model input to a concrete, available handle.
+
+        Accepts either:
+        - a concrete handle (e.g. "openai/gpt-5.2")
+        - a selector list encoded as a string, e.g. "group:planning" or "any" or "inherit"
+
+        For string inputs:
+        - If it is a selector token (group:*, any, inherit), resolve it via the selector resolver.
+        - Otherwise, treat it as a concrete handle.
+
+        This is a server-side safety net so clients can send selectors directly.
+        """
+        token = (model or "").strip()
+        if not token:
+            return token
+
+        if token == "any" or token == "inherit" or token.startswith("group:"):
+            parent = parent_model_handle
+            if token == "inherit" and parent is None:
+                # Best-effort: inherit the current server default.
+                parent = None
+            response = await self.resolve_model_selector_async(
+                selector=[token],
+                parent_model_handle=parent,
+                actor=actor,
+            )
+            return response.resolved_handle
+
+        return token
+
+
     def __init__(
         self,
         chaining: bool = True,
@@ -449,10 +487,18 @@ class SyncServer(object):
                 if settings.default_llm_handle is None:
                     raise LettaInvalidArgumentError("Must specify either model or llm_config in request", argument_name="model")
                 else:
-                    handle = settings.default_llm_handle
+                    handle = await self._resolve_model_input_async(
+                        model=settings.default_llm_handle,
+                        actor=actor,
+                        parent_model_handle=None,
+                    )
             else:
                 if isinstance(request.model, str):
-                    handle = request.model
+                    handle = await self._resolve_model_input_async(
+                        model=request.model,
+                        actor=actor,
+                        parent_model_handle=None,
+                    )
                 elif isinstance(request.model, list):
                     raise LettaInvalidArgumentError("Multiple models are not supported yet")
                 else:
@@ -549,8 +595,13 @@ class SyncServer(object):
             if request.model is None:
                 agent = await self.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
                 request.model = agent.llm_config.handle
+            resolved_model = await self._resolve_model_input_async(
+                model=request.model,
+                actor=actor,
+                parent_model_handle=None,
+            )
             config_params = {
-                "handle": request.model,
+                "handle": resolved_model,
                 "context_window_limit": request.context_window_limit,
                 "max_tokens": request.max_tokens,
             }
@@ -636,7 +687,7 @@ class SyncServer(object):
                     value=get_persona_text("voice_memory_persona"),
                 ),
             ],
-            llm_config=LLMConfig.default_config("gpt-4.1"),
+            llm_config=main_agent.llm_config,
             embedding_config=main_agent.embedding_config,
             project_id=main_agent.project_id,
         )
