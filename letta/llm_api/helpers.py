@@ -88,8 +88,30 @@ def _convert_to_structured_output_helper(property: dict) -> dict:
         return property_dict
 
     if param_type == "object":
+        # Handle objects with additionalProperties but no explicit properties (dynamic dictionaries)
+        # OpenAI structured outputs don't support true dynamic objects, so we convert to a
+        # simple object with additionalProperties: false and empty properties
         if "properties" not in property:
-            raise ValueError(f"Property {property} of type object is missing properties")
+            if "additionalProperties" in property:
+                # Dynamic dictionary pattern - convert to empty object schema
+                # This is a lossy conversion but allows the tool to be used
+                logger.warning(
+                    f"Object schema uses additionalProperties without explicit properties: {property}. "
+                    "Converting to empty object schema for OpenAI structured output compatibility."
+                )
+                property_dict = {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                    "required": [],
+                }
+                if param_description is not None:
+                    property_dict["description"] = param_description
+                if "title" in property:
+                    property_dict["title"] = property["title"]
+                return property_dict
+            else:
+                raise ValueError(f"Property {property} of type object is missing properties")
         properties = property["properties"]
         property_dict = {
             "type": "object",
