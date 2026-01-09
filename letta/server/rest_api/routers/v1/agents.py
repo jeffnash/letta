@@ -1648,6 +1648,11 @@ async def send_message_streaming(
 
 class CancelAgentRunRequest(BaseModel):
     run_ids: list[str] | None = Field(None, description="Optional list of run IDs to cancel")
+    clear_pending_approval: bool = Field(
+        True,
+        description="If True, also clear any pending approval state on the agent even if no runs are found/cancelled. "
+        "This is useful for recovering from stuck approval states.",
+    )
 
 
 @router.post("/{agent_id}/messages/cancel", operation_id="cancel_message")
@@ -1660,48 +1665,65 @@ async def cancel_message(
     """
     Cancel runs associated with an agent. If run_ids are passed in, cancel those in particular.
 
+    This endpoint also clears any pending approval state on the agent, allowing recovery
+    from stuck approval deadlocks even when no active runs exist.
+
     Note to cancel active runs associated with an agent, redis is required.
     """
-    # TODO: WHY DOES THIS CANCEL A LIST OF RUNS?
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    if not settings.track_agent_run:
-        raise HTTPException(status_code=400, detail="Agent run tracking is disabled")
-    run_ids = request.run_ids if request else None
-    if not run_ids:
-        redis_client = await get_redis_client()
-        run_id = await redis_client.get(f"{REDIS_RUN_ID_PREFIX}:{agent_id}")
-        if run_id is None:
-            logger.warning("Cannot find run associated with agent to cancel in redis, fetching from db.")
-            run_ids = await server.run_manager.list_runs(
-                actor=actor,
-                statuses=[RunStatus.created, RunStatus.running],
-                ascending=False,
-                agent_id=agent_id,  # NOTE: this will override agent_ids if provided
-                limit=100,  # Limit to 10 most recent active runs for cancellation
-            )
-            run_ids = [run.id for run in run_ids]
-        else:
-            run_ids = [run_id]
 
     results = {}
     failed_to_cancel = []
-    for run_id in run_ids:
-        run = await server.run_manager.get_run_by_id(run_id=run_id, actor=actor)
-        if run.metadata.get("lettuce"):
-            lettuce_client = await LettuceClient.create()
-            await lettuce_client.cancel(run_id)
-        try:
-            run = await server.run_manager.cancel_run(actor=actor, agent_id=agent_id, run_id=run_id)
-        except Exception as e:
-            results[run_id] = "failed"
-            logger.error(f"Failed to cancel run {run_id}: {str(e)}")
-            failed_to_cancel.append(run_id)
-            continue
-        results[run_id] = "cancelled"
-        logger.info(f"Cancelled run {run_id}")
+    cleared_approval = False
 
-    # Cancellation should be best-effort: it's common for runs to already be terminal
-    # or for a race to occur between completion and cancel.
+    # First, try to cancel any active runs if run tracking is enabled
+    if settings.track_agent_run:
+        run_ids = request.run_ids if request else None
+        if not run_ids:
+            redis_client = await get_redis_client()
+            run_id = await redis_client.get(f"{REDIS_RUN_ID_PREFIX}:{agent_id}")
+            if run_id is None:
+                logger.warning("Cannot find run associated with agent to cancel in redis, fetching from db.")
+                runs = await server.run_manager.list_runs(
+                    actor=actor,
+                    statuses=[RunStatus.created, RunStatus.running],
+                    ascending=False,
+                    agent_id=agent_id,
+                    limit=100,
+                )
+                run_ids = [run.id for run in runs]
+            else:
+                run_ids = [run_id]
+
+        for run_id in run_ids:
+            try:
+                run = await server.run_manager.get_run_by_id(run_id=run_id, actor=actor)
+                if run.metadata.get("lettuce"):
+                    lettuce_client = await LettuceClient.create()
+                    await lettuce_client.cancel(run_id)
+                run = await server.run_manager.cancel_run(actor=actor, agent_id=agent_id, run_id=run_id)
+                results[run_id] = "cancelled"
+                logger.info(f"Cancelled run {run_id}")
+                cleared_approval = True  # cancel_run handles approval cleanup
+            except Exception as e:
+                results[run_id] = "failed"
+                logger.error(f"Failed to cancel run {run_id}: {str(e)}")
+                failed_to_cancel.append(run_id)
+
+    # Even if no runs were cancelled (or run tracking is disabled), clear any stuck approval state
+    # This handles the deadlock scenario where a run completed with requires_approval but the
+    # agent is still blocked waiting for approval
+    clear_pending = request.clear_pending_approval if request else True
+    if clear_pending and not cleared_approval:
+        try:
+            cleared = await _clear_pending_approval_state(server, agent_id, actor)
+            if cleared:
+                results["pending_approval_cleared"] = True
+                logger.info(f"Cleared pending approval state for agent {agent_id}")
+        except Exception as e:
+            logger.error(f"Failed to clear pending approval state for agent {agent_id}: {str(e)}")
+            results["pending_approval_error"] = str(e)
+
     if failed_to_cancel:
         logger.warning(f"Failed to cancel runs: {failed_to_cancel}")
         return {
@@ -1710,6 +1732,109 @@ async def cancel_message(
         }
 
     return results
+
+
+async def _clear_pending_approval_state(server: SyncServer, agent_id: str, actor: User) -> bool:
+    """
+    Clear any pending approval state on an agent by inserting denial messages.
+
+    This is used when the agent is stuck in a pending approval state but there's no
+    active run to cancel. This can happen when:
+    - A run completed with requires_approval stop reason
+    - The run is no longer active (can't be cancelled)
+    - But the agent's last message is still an approval request
+
+    Returns True if approval state was cleared, False if no clearing was needed.
+    """
+    from letta.constants import TOOL_CALL_DENIAL_ON_CANCEL
+    from letta.schemas.letta_message import ApprovalReturn
+    from letta.schemas.message import ApprovalCreate
+    from letta.server.rest_api.utils import (
+        create_approval_response_message_from_input,
+        create_tool_message_from_returns,
+        create_tool_returns_for_denials,
+    )
+
+    agent_state = await server.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+    current_in_context_messages = await server.message_manager.get_messages_by_ids_async(
+        message_ids=agent_state.message_ids, actor=actor
+    )
+
+    if not current_in_context_messages or not current_in_context_messages[-1].is_approval_request():
+        logger.debug(f"Agent {agent_id} is not waiting for approval, no cleanup needed")
+        return False
+
+    approval_request_message = current_in_context_messages[-1]
+    logger.info(
+        f"Clearing stuck pending approval state for agent {agent_id}, "
+        f"approval_request_id={approval_request_message.id}, "
+        f"tool_calls={[tc.id for tc in (approval_request_message.tool_calls or [])]}"
+    )
+
+    if not approval_request_message.tool_calls:
+        logger.warning(
+            f"Approval request message {approval_request_message.id} has no tool_calls, skipping cleanup"
+        )
+        return False
+
+    # Create denials for ALL pending tool calls
+    denials = [
+        ApprovalReturn(
+            tool_call_id=tool_call.id,
+            approve=False,
+            reason=TOOL_CALL_DENIAL_ON_CANCEL,
+        )
+        for tool_call in approval_request_message.tool_calls
+    ]
+
+    # Create an ApprovalCreate input with the denials
+    approval_input = ApprovalCreate(
+        approvals=denials,
+        approval_request_id=approval_request_message.id,
+    )
+
+    # Use the standard function to create properly formatted approval response messages
+    approval_response_messages = create_approval_response_message_from_input(
+        agent_state=agent_state,
+        input_message=approval_input,
+        run_id=None,  # No run associated with this cleanup
+    )
+
+    # Create tool returns for ALL denied tool calls
+    tool_returns = create_tool_returns_for_denials(
+        tool_calls=approval_request_message.tool_calls,
+        denial_reason=TOOL_CALL_DENIAL_ON_CANCEL,
+        timezone=agent_state.timezone,
+    )
+
+    # Create tool message with all denial returns
+    tool_message = create_tool_message_from_returns(
+        agent_id=agent_state.id,
+        model=agent_state.llm_config.model,
+        tool_returns=tool_returns,
+        run_id=None,
+    )
+
+    # Combine approval response and tool messages
+    new_messages = approval_response_messages + [tool_message]
+
+    # Checkpoint the new messages using AgentLoop
+    from letta.agents.agent_loop import AgentLoop
+
+    agent_loop = AgentLoop.load(agent_state=agent_state, actor=actor)
+    new_in_context_messages = current_in_context_messages + new_messages
+    await agent_loop._checkpoint_messages(
+        run_id=None,
+        step_id=approval_request_message.step_id,
+        new_messages=new_messages,
+        in_context_messages=new_in_context_messages,
+    )
+
+    logger.info(
+        f"Successfully cleared pending approval state for agent {agent_id}. "
+        f"Inserted {len(new_messages)} denial messages."
+    )
+    return True
 
 
 @router.post("/messages/search", response_model=List[MessageSearchResult], operation_id="search_messages")

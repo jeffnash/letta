@@ -451,7 +451,28 @@ def create_application() -> "FastAPI":
     app.add_exception_handler(ForeignKeyConstraintViolationError, _error_handler_409)
     app.add_exception_handler(UniqueConstraintViolationError, _error_handler_409)
     app.add_exception_handler(IntegrityError, _error_handler_409)
-    app.add_exception_handler(PendingApprovalError, _error_handler_409)
+
+    # Specialized handler for PendingApprovalError to include actionable identifiers
+    async def pending_approval_error_handler(request: Request, exc: PendingApprovalError):
+        logger.error(
+            f"PendingApprovalError: pending_request_id={exc.pending_request_id}, "
+            f"agent_id={getattr(exc, 'agent_id', None)}, run_id={getattr(exc, 'run_id', None)}"
+        )
+        # Build a machine-readable response with all available identifiers
+        content = {
+            "detail": str(exc),
+            "error_code": "PENDING_APPROVAL",
+            "pending_request_id": exc.pending_request_id,
+        }
+        # Include agent_id if available (set by the agent helpers)
+        if hasattr(exc, "agent_id") and exc.agent_id:
+            content["agent_id"] = exc.agent_id
+        # Include run_id if available (helps client cancel the correct run)
+        if hasattr(exc, "run_id") and exc.run_id:
+            content["run_id"] = exc.run_id
+        return JSONResponse(status_code=409, content=content)
+
+    app.add_exception_handler(PendingApprovalError, pending_approval_error_handler)
 
     # 415 Unsupported Media Type errors
     app.add_exception_handler(LettaUnsupportedFileUploadError, _error_handler_415)

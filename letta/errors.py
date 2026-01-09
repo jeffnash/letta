@@ -43,13 +43,33 @@ class LettaError(Exception):
 
 
 class PendingApprovalError(LettaError):
-    """Error raised when attempting an operation while agent is waiting for tool approval."""
+    """Error raised when attempting an operation while agent is waiting for tool approval.
 
-    def __init__(self, pending_request_id: Optional[str] = None):
+    This error includes machine-usable identifiers to help clients recover:
+    - pending_request_id: The ID of the approval request message
+    - agent_id: The agent that is waiting for approval (optional)
+    - run_id: The run associated with the pending approval (optional)
+    """
+
+    def __init__(
+        self,
+        pending_request_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ):
         self.pending_request_id = pending_request_id
+        self.agent_id = agent_id
+        self.run_id = run_id
         message = "Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing."
         code = ErrorCode.CONFLICT
-        details = {"error_code": "PENDING_APPROVAL", "pending_request_id": pending_request_id}
+        details = {
+            "error_code": "PENDING_APPROVAL",
+            "pending_request_id": pending_request_id,
+        }
+        if agent_id:
+            details["agent_id"] = agent_id
+        if run_id:
+            details["run_id"] = run_id
         super().__init__(message=message, code=code, details=details)
 
 

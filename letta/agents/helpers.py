@@ -178,7 +178,16 @@ async def _prepare_in_context_messages_no_persist_async(
     else:
         # User is trying to send a regular message
         if current_in_context_messages and current_in_context_messages[-1].is_approval_request():
-            raise PendingApprovalError(pending_request_id=current_in_context_messages[-1].id)
+            pending_message = current_in_context_messages[-1]
+            logger.warning(
+                f"PendingApprovalError: agent_id={agent_state.id}, pending_request_id={pending_message.id}, "
+                f"run_id={run_id}, tool_calls={[tc.id for tc in (pending_message.tool_calls or [])]}"
+            )
+            raise PendingApprovalError(
+                pending_request_id=pending_message.id,
+                agent_id=agent_state.id,
+                run_id=run_id,
+            )
 
         # Create a new user message from the input but dont store it yet
         new_in_context_messages = await create_input_messages(

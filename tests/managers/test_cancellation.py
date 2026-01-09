@@ -1754,3 +1754,209 @@ class TestErrorDataPersistence:
         assert fetched_run.metadata is not None, "Run metadata should contain error info for generic exception"
         assert "error" in fetched_run.metadata
         assert fetched_run.metadata["error"]["error_type"] == "internal_error"
+
+
+class TestPendingApprovalDeadlockRecovery:
+    """
+    Test cases for recovering from the persistent approval deadlock scenario.
+
+    The deadlock occurs when:
+    1. An agent calls a tool requiring approval
+    2. The agent stops with requires_approval
+    3. The run completes (no longer active)
+    4. User tries to send a new message → 409 CONFLICT
+    5. Cancel endpoint can't find an active run to cancel
+
+    These tests verify that the new clear_pending_approval functionality
+    in the cancel_message endpoint properly recovers from this state.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pending_approval_error_includes_identifiers(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        test_run,
+        bash_tool,
+    ):
+        """
+        Test that PendingApprovalError includes machine-usable identifiers.
+
+        Verifies:
+        - pending_request_id is set
+        - agent_id is set
+        - run_id is set (when available)
+        """
+        from letta.errors import PendingApprovalError
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        input_messages = [MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")]
+        result = await agent_loop.step(
+            input_messages=input_messages,
+            max_steps=5,
+            run_id=test_run.id,
+        )
+
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Now try to send another message (should raise PendingApprovalError)
+        agent_loop_2 = AgentLoop.load(
+            agent_state=await server.agent_manager.get_agent_by_id_async(
+                agent_id=test_agent_with_tool.id,
+                actor=default_user,
+                include_relationships=["memory", "tools", "sources"],
+            ),
+            actor=default_user,
+        )
+
+        test_run_2 = await server.run_manager.create_run(
+            pydantic_run=PydanticRun(
+                agent_id=test_agent_with_tool.id,
+                status=RunStatus.created,
+            ),
+            actor=default_user,
+        )
+
+        with pytest.raises(PendingApprovalError) as exc_info:
+            await agent_loop_2.step(
+                input_messages=[MessageCreate(role=MessageRole.user, content="Hello")],
+                max_steps=5,
+                run_id=test_run_2.id,
+            )
+
+        error = exc_info.value
+        # Verify identifiers are present
+        assert error.pending_request_id is not None, "pending_request_id should be set"
+        assert error.agent_id == test_agent_with_tool.id, "agent_id should match"
+        # run_id should be the second run's ID (the one that triggered the error)
+        assert error.run_id == test_run_2.id, f"run_id should be {test_run_2.id}, got {error.run_id}"
+
+    @pytest.mark.asyncio
+    async def test_clear_pending_approval_state_direct(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        test_run,
+        bash_tool,
+    ):
+        """
+        Test the _clear_pending_approval_state helper function directly.
+
+        Verifies:
+        - Function correctly identifies pending approval state
+        - Function inserts denial messages
+        - Agent can be messaged after clearing
+        """
+        from letta.server.rest_api.routers.v1.agents import _clear_pending_approval_state
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Verify agent is in pending approval state
+        agent_state = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state.message_ids, actor=default_user
+        )
+        assert messages[-1].is_approval_request(), "Last message should be approval request"
+
+        # Clear the pending approval state
+        cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
+        assert cleared is True, "Should have cleared approval state"
+
+        # Verify agent is no longer in pending approval state
+        agent_state_after = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages_after = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state_after.message_ids, actor=default_user
+        )
+        assert not messages_after[-1].is_approval_request(), "Last message should not be approval request after clearing"
+
+        # Verify agent can be messaged
+        test_run_2 = await server.run_manager.create_run(
+            pydantic_run=PydanticRun(
+                agent_id=test_agent_with_tool.id,
+                status=RunStatus.created,
+            ),
+            actor=default_user,
+        )
+
+        agent_loop_2 = AgentLoop.load(
+            agent_state=await server.agent_manager.get_agent_by_id_async(
+                agent_id=test_agent_with_tool.id,
+                actor=default_user,
+                include_relationships=["memory", "tools", "sources"],
+            ),
+            actor=default_user,
+        )
+
+        # This should NOT raise PendingApprovalError
+        result_2 = await agent_loop_2.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Hello, how are you?")],
+            max_steps=5,
+            run_id=test_run_2.id,
+        )
+
+        assert result_2.stop_reason.stop_reason != "requires_approval", (
+            f"Should not require approval after clearing, got {result_2.stop_reason.stop_reason}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_clear_pending_approval_state_no_approval(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+    ):
+        """
+        Test that _clear_pending_approval_state returns False when no approval is pending.
+        """
+        from letta.server.rest_api.routers.v1.agents import _clear_pending_approval_state
+
+        # Agent should not be in pending approval state
+        cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
+        assert cleared is False, "Should return False when no approval is pending"
