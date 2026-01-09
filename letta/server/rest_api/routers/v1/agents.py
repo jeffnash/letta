@@ -1494,6 +1494,9 @@ async def send_message(
 
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
 
+    # Pre-check for pending approval BEFORE starting the stream to return proper 409 HTTP response
+    await _check_pending_approval_and_raise(server, agent_id, actor, request.messages)
+
     if request.streaming and is_1_0_sdk:
         streaming_service = StreamingService(server)
         run, result = await streaming_service.create_agent_stream(
@@ -1629,6 +1632,9 @@ async def send_message_streaming(
     It will stream the steps of the response always, and stream the tokens if 'stream_tokens' is set to True.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+
+    # Pre-check for pending approval BEFORE starting the stream to return proper 409 HTTP response
+    await _check_pending_approval_and_raise(server, agent_id, actor, request.messages)
 
     # Since this is the dedicated streaming endpoint, ensure streaming is enabled
     request.streaming = True
@@ -1837,6 +1843,53 @@ async def _clear_pending_approval_state(server: SyncServer, agent_id: str, actor
     return True
 
 
+async def _check_pending_approval_and_raise(
+    server: SyncServer,
+    agent_id: str,
+    actor: User,
+    input_messages: list,
+) -> None:
+    """
+    Check if the agent has a pending approval request and raise PendingApprovalError if so.
+
+    This pre-check is done BEFORE starting a stream to return a proper HTTP 409 response
+    instead of letting the error propagate through the streaming infrastructure.
+
+    Args:
+        server: The Letta server instance
+        agent_id: The agent ID to check
+        actor: The user making the request
+        input_messages: The input messages being sent (to check if this is an approval response)
+    """
+    # If the first message is an approval, the user is responding to a pending approval - let it through
+    if input_messages and len(input_messages) > 0:
+        first_msg = input_messages[0]
+        if hasattr(first_msg, 'type') and first_msg.type == "approval":
+            return
+
+    # Get the agent state and check the last message
+    agent_state = await server.agent_manager.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+    if not agent_state.message_ids:
+        return
+
+    # Get the last message
+    last_message = await server.message_manager.get_message_by_id_async(
+        message_id=agent_state.message_ids[-1], actor=actor
+    )
+
+    if last_message and last_message.is_approval_request():
+        logger.warning(
+            f"Pre-stream PendingApprovalError: agent_id={agent_id}, "
+            f"pending_request_id={last_message.id}, "
+            f"tool_calls={[tc.id for tc in (last_message.tool_calls or [])]}"
+        )
+        raise PendingApprovalError(
+            pending_request_id=last_message.id,
+            agent_id=agent_id,
+            run_id=None,  # No run created yet
+        )
+
+
 @router.post("/messages/search", response_model=List[MessageSearchResult], operation_id="search_messages")
 async def search_messages(
     request: MessageSearchRequest = Body(...),
@@ -2021,6 +2074,9 @@ async def send_message_async(
     """
     MetricRegistry().user_message_counter.add(1, get_ctx_attributes())
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+
+    # Pre-check for pending approval BEFORE creating the run to return proper 409 HTTP response
+    await _check_pending_approval_and_raise(server, agent_id, actor, request.messages)
 
     try:
         is_message_input = request.messages[0].type == MessageCreateType.message
