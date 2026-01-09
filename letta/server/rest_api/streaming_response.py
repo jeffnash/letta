@@ -319,6 +319,21 @@ class StreamingResponseWithStatusCode(StreamingResponse):
             capture_sentry_exception(exc)
             raise LettaUnexpectedStreamCancellationError("Stream was terminated due to unexpected cancellation from server")
 
+        # Handle pending approval conflicts - re-raise as HTTPException for proper client handling
+        except PendingApprovalError as e:
+            logger.info(f"Pending approval conflict in protected stream response: {e}")
+            detail = {
+                "code": "PENDING_APPROVAL",
+                "error_code": "PENDING_APPROVAL",
+                "message": str(e),
+                "pending_request_id": e.pending_request_id,
+            }
+            if hasattr(e, "agent_id") and e.agent_id:
+                detail["agent_id"] = e.agent_id
+            if hasattr(e, "run_id") and e.run_id:
+                detail["run_id"] = e.run_id
+            raise HTTPException(status_code=409, detail=detail)
+
         except Exception as exc:
             logger.exception(f"Unhandled Streaming Error: {str(exc)}")
             more_body = False
