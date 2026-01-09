@@ -1960,3 +1960,409 @@ class TestPendingApprovalDeadlockRecovery:
         # Agent should not be in pending approval state
         cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
         assert cleared is False, "Should return False when no approval is pending"
+
+
+class TestCheckPendingApprovalAndRaise:
+    """
+    Integration tests for the _check_pending_approval_and_raise helper function.
+    """
+
+    @pytest.mark.asyncio
+    async def test_check_raises_when_pending_approval_exists(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        bash_tool,
+        test_run,
+    ):
+        """Test that the pre-check raises PendingApprovalError when approval is pending."""
+        from letta.errors import PendingApprovalError
+        from letta.server.rest_api.routers.v1.agents import _check_pending_approval_and_raise
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Now the pre-check should raise PendingApprovalError
+        with pytest.raises(PendingApprovalError) as exc_info:
+            await _check_pending_approval_and_raise(
+                server=server,
+                agent_id=test_agent_with_tool.id,
+                actor=default_user,
+                input_messages=[MessageCreate(role=MessageRole.user, content="Hello")],
+            )
+
+        error = exc_info.value
+        assert error.pending_request_id is not None
+        assert error.agent_id == test_agent_with_tool.id
+
+    @pytest.mark.asyncio
+    async def test_check_does_not_raise_for_approval_response(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        bash_tool,
+        test_run,
+    ):
+        """Test that the pre-check allows approval responses through."""
+        from letta.server.rest_api.routers.v1.agents import _check_pending_approval_and_raise
+        from letta.schemas.message import ApprovalCreate
+        from letta.schemas.letta_message import ApprovalReturn
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Get the approval request message to find the tool call ID
+        agent_state = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state.message_ids, actor=default_user
+        )
+        approval_request = messages[-1]
+        tool_call_id = approval_request.tool_calls[0].id
+
+        # Create an approval response
+        approval_input = ApprovalCreate(
+            approvals=[ApprovalReturn(tool_call_id=tool_call_id, approve=True)],
+            approval_request_id=approval_request.id,
+        )
+
+        # The pre-check should NOT raise for approval responses
+        # This should not raise
+        await _check_pending_approval_and_raise(
+            server=server,
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            input_messages=[approval_input],
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_does_not_raise_when_no_pending_approval(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+    ):
+        """Test that the pre-check does not raise when no approval is pending."""
+        from letta.server.rest_api.routers.v1.agents import _check_pending_approval_and_raise
+
+        # Should not raise - no pending approval
+        await _check_pending_approval_and_raise(
+            server=server,
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            input_messages=[MessageCreate(role=MessageRole.user, content="Hello")],
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_does_not_raise_for_empty_messages(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+    ):
+        """Test that the pre-check handles empty input_messages gracefully."""
+        from letta.server.rest_api.routers.v1.agents import _check_pending_approval_and_raise
+
+        # Should not raise with empty messages
+        await _check_pending_approval_and_raise(
+            server=server,
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            input_messages=[],
+        )
+
+
+class TestEndToEndPendingApprovalFlow:
+    """
+    End-to-end tests for the pending approval deadlock recovery flow.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_deadlock_recovery_flow(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        bash_tool,
+        test_run,
+    ):
+        """
+        Test the complete flow:
+        1. Agent enters pending approval state
+        2. Pre-check raises PendingApprovalError with identifiers
+        3. Cancel endpoint clears the state
+        4. Agent can receive new messages
+        """
+        from letta.errors import PendingApprovalError
+        from letta.server.rest_api.routers.v1.agents import (
+            _check_pending_approval_and_raise,
+            _clear_pending_approval_state,
+        )
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Step 1: Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Step 2: Verify pre-check raises with identifiers
+        with pytest.raises(PendingApprovalError) as exc_info:
+            await _check_pending_approval_and_raise(
+                server=server,
+                agent_id=test_agent_with_tool.id,
+                actor=default_user,
+                input_messages=[MessageCreate(role=MessageRole.user, content="Hello")],
+            )
+
+        error = exc_info.value
+        assert error.pending_request_id is not None, "Error should have pending_request_id"
+        assert error.agent_id == test_agent_with_tool.id, "Error should have agent_id"
+
+        # Step 3: Clear the pending approval state
+        cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
+        assert cleared is True, "Should have cleared approval state"
+
+        # Step 4: Verify pre-check no longer raises
+        await _check_pending_approval_and_raise(
+            server=server,
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            input_messages=[MessageCreate(role=MessageRole.user, content="Hello")],
+        )
+
+        # Step 5: Verify agent can receive new messages
+        test_run_2 = await server.run_manager.create_run(
+            pydantic_run=PydanticRun(
+                agent_id=test_agent_with_tool.id,
+                status=RunStatus.created,
+            ),
+            actor=default_user,
+        )
+
+        agent_loop_2 = AgentLoop.load(
+            agent_state=await server.agent_manager.get_agent_by_id_async(
+                agent_id=test_agent_with_tool.id,
+                actor=default_user,
+                include_relationships=["memory", "tools", "sources"],
+            ),
+            actor=default_user,
+        )
+
+        result_2 = await agent_loop_2.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Hello, how are you?")],
+            max_steps=5,
+            run_id=test_run_2.id,
+        )
+
+        assert result_2.stop_reason.stop_reason != "requires_approval", (
+            f"Should not require approval after clearing, got {result_2.stop_reason.stop_reason}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_endpoint_clears_stuck_approval(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        bash_tool,
+        test_run,
+    ):
+        """
+        Test that the cancel endpoint successfully clears stuck approval state.
+        """
+        from letta.server.rest_api.routers.v1.agents import _clear_pending_approval_state
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Verify last message is approval request
+        agent_state = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages_before = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state.message_ids, actor=default_user
+        )
+        assert messages_before[-1].is_approval_request(), "Last message should be approval request"
+        message_count_before = len(messages_before)
+
+        # Call cancel endpoint (simulated by calling the helper)
+        cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
+        assert cleared is True
+
+        # Verify approval state is cleared
+        agent_state_after = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages_after = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state_after.message_ids, actor=default_user
+        )
+
+        assert not messages_after[-1].is_approval_request(), "Last message should not be approval request after cancel"
+        assert len(messages_after) > message_count_before, "Should have more messages after adding denial"
+
+        # Verify the denial message was added
+        denial_messages = [m for m in messages_after if m.role == MessageRole.tool]
+        assert len(denial_messages) > 0, "Should have tool denial messages"
+
+    @pytest.mark.asyncio
+    async def test_multiple_tool_calls_all_denied(
+        self,
+        server: SyncServer,
+        default_user,
+        test_agent_with_tool,
+        bash_tool,
+        test_run,
+    ):
+        """
+        Test that when multiple tool calls require approval, all are denied on cancel.
+        """
+        from letta.server.rest_api.routers.v1.agents import _clear_pending_approval_state
+
+        # Add bash_tool which requires approval
+        await server.agent_manager.attach_tool_async(
+            agent_id=test_agent_with_tool.id,
+            tool_id=bash_tool.id,
+            actor=default_user,
+        )
+
+        # Reload agent
+        test_agent_with_tool = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+            include_relationships=["memory", "tools", "sources"],
+        )
+
+        agent_loop = AgentLoop.load(agent_state=test_agent_with_tool, actor=default_user)
+
+        # Trigger approval request
+        result = await agent_loop.step(
+            input_messages=[MessageCreate(role=MessageRole.user, content="Call bash_tool with operation 'test'")],
+            max_steps=5,
+            run_id=test_run.id,
+        )
+        assert result.stop_reason.stop_reason == "requires_approval"
+
+        # Get the approval request message
+        agent_state = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state.message_ids, actor=default_user
+        )
+        approval_request = messages[-1]
+        num_tool_calls = len(approval_request.tool_calls) if approval_request.tool_calls else 0
+
+        # Clear the state
+        cleared = await _clear_pending_approval_state(server, test_agent_with_tool.id, default_user)
+        assert cleared is True
+
+        # Verify all tool calls were denied
+        agent_state_after = await server.agent_manager.get_agent_by_id_async(
+            agent_id=test_agent_with_tool.id,
+            actor=default_user,
+        )
+        messages_after = await server.message_manager.get_messages_by_ids_async(
+            message_ids=agent_state_after.message_ids, actor=default_user
+        )
+
+        # Find the tool return message
+        tool_messages = [m for m in messages_after if m.role == MessageRole.tool]
+        assert len(tool_messages) > 0, "Should have tool return messages"
+
+        # The last tool message should have returns for all tool calls
+        last_tool_message = tool_messages[-1]
+        if last_tool_message.tool_returns:
+            assert len(last_tool_message.tool_returns) == num_tool_calls, (
+                f"Tool message should have {num_tool_calls} returns, got {len(last_tool_message.tool_returns)}"
+            )
+
