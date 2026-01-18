@@ -595,6 +595,7 @@ async def simple_summary(
     except Exception:
         # Best-effort only
         pass
+    logger.info(f"Summarizing {len(messages)} messages with prompt: {system_prompt}")
 
     if include_ack:
         logger.info(f"Summarizing with ACK for model {llm_config.model}")
@@ -757,6 +758,7 @@ async def simple_summary(
                         logger.error(f"Chunked summarization also failed: {chunked_error}. Propagating original error.")
                         raise llm_client.handle_llm_error(fallback_error_b)
 
+    logger.info(f"Summarized {len(messages)}: {summary}")
     return summary
 
 
