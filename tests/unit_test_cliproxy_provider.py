@@ -8,6 +8,9 @@ from letta.schemas.providers.cliproxy import (
     CLIProxyProvider,
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_MAX_TOKENS,
+    CONTEXT_WINDOW_SAFETY_FACTOR,
+    MAX_TOKENS_SAFETY_FACTOR,
+    _apply_safety_limit,
 )
 
 
@@ -50,29 +53,29 @@ class TestCLIProxyProvider:
         ]
 
     def test_list_llm_models_uses_dynamic_context_window(self, provider, sample_models_response):
-        """Test that _list_llm_models uses context_window from API response."""
+        """Test that _list_llm_models uses context_window from API response with safety factor."""
         configs = provider._list_llm_models(sample_models_response)
 
         assert len(configs) == 3
 
-        # Check model with explicit context_window
+        # Check model with explicit context_window (safety factor applied)
         gpt_model = next(c for c in configs if c.model == "gpt-5.2-medium")
-        assert gpt_model.context_window == 272000
-        assert gpt_model.max_tokens == 128000
+        assert gpt_model.context_window == _apply_safety_limit(272000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert gpt_model.max_tokens == _apply_safety_limit(128000, MAX_TOKENS_SAFETY_FACTOR)
 
-        # Check passthru model
+        # Check passthru model (safety factor applied)
         passthru_model = next(c for c in configs if c.model == "zai-glm-4.7")
-        assert passthru_model.context_window == 128000
-        assert passthru_model.max_tokens == 32000
+        assert passthru_model.context_window == _apply_safety_limit(128000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert passthru_model.max_tokens == _apply_safety_limit(32000, MAX_TOKENS_SAFETY_FACTOR)
 
     def test_list_llm_models_uses_defaults_when_missing(self, provider, sample_models_response):
-        """Test that _list_llm_models uses defaults when metadata is missing."""
+        """Test that _list_llm_models uses defaults (with safety factor) when metadata is missing."""
         configs = provider._list_llm_models(sample_models_response)
 
-        # Check model without metadata uses defaults
+        # Check model without metadata uses defaults with safety factor applied
         unknown_model = next(c for c in configs if c.model == "model-without-metadata")
-        assert unknown_model.context_window == DEFAULT_CONTEXT_WINDOW
-        assert unknown_model.max_tokens == DEFAULT_MAX_TOKENS
+        assert unknown_model.context_window == _apply_safety_limit(DEFAULT_CONTEXT_WINDOW, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert unknown_model.max_tokens == _apply_safety_limit(DEFAULT_MAX_TOKENS, MAX_TOKENS_SAFETY_FACTOR)
 
     def test_list_llm_models_handles_context_length_alias(self, provider):
         """Test that _list_llm_models handles context_length as alias for context_window."""
@@ -88,8 +91,9 @@ class TestCLIProxyProvider:
 
         configs = provider._list_llm_models(models)
         assert len(configs) == 1
-        assert configs[0].context_window == 200000
-        assert configs[0].max_tokens == 50000
+        # Safety factor is applied to both values
+        assert configs[0].context_window == _apply_safety_limit(200000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert configs[0].max_tokens == _apply_safety_limit(50000, MAX_TOKENS_SAFETY_FACTOR)
 
     def test_list_llm_models_generates_correct_handles(self, provider, sample_models_response):
         """Test that _list_llm_models generates correct handles."""
@@ -111,9 +115,9 @@ class TestCLIProxyProvider:
         assert configs[0].model == "valid-model"
 
     def test_get_model_context_window_size_returns_default(self, provider):
-        """Test that get_model_context_window_size returns default for unknown models."""
+        """Test that get_model_context_window_size returns default (with safety factor) for unknown models."""
         result = provider.get_model_context_window_size("unknown-model")
-        assert result == DEFAULT_CONTEXT_WINDOW
+        assert result == _apply_safety_limit(DEFAULT_CONTEXT_WINDOW, CONTEXT_WINDOW_SAFETY_FACTOR)
 
     def test_cache_key_uses_base_url(self, provider):
         """Test that cache key is based on base_url."""
@@ -156,12 +160,13 @@ class TestCLIProxyProvider:
 
     @pytest.mark.asyncio
     async def test_get_model_context_window_async_fetches_from_api(self, provider, sample_models_response):
-        """Test that get_model_context_window_async can fetch from API."""
+        """Test that get_model_context_window_async can fetch from API (with safety factor)."""
         with patch("letta.llm_api.openai.openai_get_model_list_async") as mock_fetch:
             mock_fetch.return_value = {"data": sample_models_response}
 
             result = await provider.get_model_context_window_async("zai-glm-4.7")
-            assert result == 128000
+            # Safety factor applied to the raw 128000 from sample_models_response
+            assert result == _apply_safety_limit(128000, CONTEXT_WINDOW_SAFETY_FACTOR)
 
     @pytest.mark.asyncio
     async def test_get_model_context_window_async_returns_default_for_unknown(self, provider, sample_models_response):
@@ -191,7 +196,7 @@ class TestCLIProxyProviderPassthruModels:
         )
 
     def test_passthru_model_with_full_metadata(self, provider):
-        """Test passthru model with all metadata fields."""
+        """Test passthru model with all metadata fields (safety factor applied)."""
         models = [
             {
                 "id": "zai-glm-4.7",
@@ -209,12 +214,12 @@ class TestCLIProxyProviderPassthruModels:
 
         config = configs[0]
         assert config.model == "zai-glm-4.7"
-        assert config.context_window == 128000
-        assert config.max_tokens == 32000
+        assert config.context_window == _apply_safety_limit(128000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert config.max_tokens == _apply_safety_limit(32000, MAX_TOKENS_SAFETY_FACTOR)
         assert "cliproxy" in config.handle
 
     def test_passthru_model_uses_context_length_fallback(self, provider):
-        """Test passthru model using context_length instead of context_window."""
+        """Test passthru model using context_length instead of context_window (safety factor applied)."""
         models = [
             {
                 "id": "custom-passthru",
@@ -229,11 +234,11 @@ class TestCLIProxyProviderPassthruModels:
         assert len(configs) == 1
 
         config = configs[0]
-        assert config.context_window == 256000
-        assert config.max_tokens == 64000
+        assert config.context_window == _apply_safety_limit(256000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert config.max_tokens == _apply_safety_limit(64000, MAX_TOKENS_SAFETY_FACTOR)
 
     def test_multiple_passthru_models(self, provider):
-        """Test handling multiple passthru models."""
+        """Test handling multiple passthru models (safety factor applied)."""
         models = [
             {
                 "id": "passthru-model-1",
@@ -257,5 +262,5 @@ class TestCLIProxyProviderPassthruModels:
         model1 = next(c for c in configs if c.model == "passthru-model-1")
         model2 = next(c for c in configs if c.model == "passthru-model-2")
 
-        assert model1.context_window == 100000
-        assert model2.context_window == 200000
+        assert model1.context_window == _apply_safety_limit(100000, CONTEXT_WINDOW_SAFETY_FACTOR)
+        assert model2.context_window == _apply_safety_limit(200000, CONTEXT_WINDOW_SAFETY_FACTOR)

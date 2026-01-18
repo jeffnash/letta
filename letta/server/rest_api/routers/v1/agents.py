@@ -2223,6 +2223,50 @@ async def reset_messages(
     )
 
 
+class RepairMessageHistoryResponse(BaseModel):
+    """Response model for the repair-message-history endpoint."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: Literal["ok", "repaired", "error"] = Field(
+        ..., description="Status of the repair operation: 'ok' (no issues found), 'repaired' (issues fixed), 'error' (repair failed)"
+    )
+    message: str = Field(..., description="Human-readable description of the repair result")
+    orphaned_tool_calls: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of orphaned tool_use blocks that were detected. Each entry contains message_id, tool_call_id, tool_name, and reason.",
+    )
+    removed_message_ids: List[str] = Field(
+        default_factory=list, description="List of message IDs that were removed from the agent's context during repair"
+    )
+
+
+@router.post("/{agent_id}/repair-message-history", response_model=RepairMessageHistoryResponse, operation_id="repair_message_history")
+async def repair_message_history(
+    agent_id: AgentId,
+    server: "SyncServer" = Depends(get_letta_server),
+    headers: HeaderParams = Depends(get_headers),
+):
+    """
+    Repair corrupted message history by detecting and fixing orphaned tool_use blocks.
+
+    This endpoint is useful when an agent gets into a state where every message fails with:
+    "tool_use ids were found without tool_result blocks immediately after"
+
+    An orphaned tool_use occurs when an assistant message contains a tool_call but
+    there's no corresponding tool_result in the following message. This can happen when:
+    - Server crashes during tool execution
+    - Client disconnects before tool result is saved
+    - Timeout during tool execution
+
+    The repair process scans all in-context messages and removes any assistant messages
+    that have tool_calls without corresponding tool_results.
+    """
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+    result = await server.agent_manager.repair_message_history_async(agent_id=agent_id, actor=actor)
+    return RepairMessageHistoryResponse(**result)
+
+
 @router.get("/{agent_id}/groups", response_model=list[Group], operation_id="list_groups_for_agent")
 async def list_groups_for_agent(
     agent_id: AgentId,

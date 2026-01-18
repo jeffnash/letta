@@ -1588,46 +1588,61 @@ class SyncServer(object):
         provider_name: Optional[str] = None,
         provider_type: Optional[ProviderType] = None,
     ) -> List[Provider]:
+        include_base = provider_category is None or ProviderCategory.base in provider_category
+        include_byok = provider_category is None or ProviderCategory.byok in provider_category
+
         providers: list[Provider] = []
 
         # Base providers (in-memory, configured at runtime)
-        for p in self._enabled_providers:
-            if provider_name is not None and getattr(p, "name", None) != provider_name:
-                continue
-            if provider_type is not None and getattr(p, "provider_type", None) != provider_type:
-                continue
-            providers.append(p)
+        if include_base:
+            for p in self._enabled_providers:
+                if provider_name is not None and getattr(p, "name", None) != provider_name:
+                    continue
+                if provider_type is not None and getattr(p, "provider_type", None) != provider_type:
+                    continue
+                providers.append(p)
 
-        # Persisted providers (BYOK and/or other provider categories stored in DB)
-        persisted_providers = await self.provider_manager.list_providers_async(
-            name=provider_name,
-            provider_type=provider_type,
-            actor=actor,
-        )
-        providers.extend([p.cast_to_subtype() for p in persisted_providers])
+            # Also include database-backed base providers
+            persisted_base_providers = await self.provider_manager.list_providers_async(
+                name=provider_name,
+                provider_type=provider_type,
+                provider_category=[ProviderCategory.base],
+                actor=actor,
+            )
+            providers.extend([p.cast_to_subtype() for p in persisted_base_providers])
+
+        # Persisted providers (BYOK providers stored in DB)
+        if include_byok:
+            persisted_providers = await self.provider_manager.list_providers_async(
+                name=provider_name,
+                provider_type=provider_type,
+                provider_category=[ProviderCategory.byok],
+                actor=actor,
+            )
+            providers.extend([p.cast_to_subtype() for p in persisted_providers])
 
         # Filter out providers that aren't configured (best-effort; not all providers expose these fields)
         filtered: list[Provider] = []
         seen: set[str] = set()
         for p in providers:
-            pid = str(getattr(p, "id", None) or f"{getattr(p, 'provider_type', None)}:{getattr(p, 'name', None)}")
-            if pid in seen:
+            key = f"{getattr(p, 'provider_category', None)}:{getattr(p, 'provider_type', None)}:{getattr(p, 'name', None)}"
+            if key in seen:
                 continue
-            seen.add(pid)
+            seen.add(key)
+
             if hasattr(p, "is_configured") and not getattr(p, "is_configured"):
                 logger.debug(f"Skipping provider {p.name}: not configured (is_configured=False)")
                 continue
-            if hasattr(p, "base_url") and getattr(p, "base_url") is None:
-                logger.debug(f"Skipping provider {p.name}: no base_url configured")
-                continue
+
+            # For BYOK providers, require base_url to be set (unless the provider subtype explicitly allows null)
+            if getattr(p, "provider_category", None) == ProviderCategory.byok:
+                if hasattr(p, "base_url") and getattr(p, "base_url") is None:
+                    logger.debug(f"Skipping BYOK provider {p.name}: no base_url configured")
+                    continue
+
             filtered.append(p)
-        providers = filtered
 
-        # Filter by category if specified
-        if provider_category:
-            providers = [p for p in providers if p.provider_category in provider_category]
-
-        return providers
+        return filtered
 
     @trace_method
     async def get_llm_config_from_handle_async(

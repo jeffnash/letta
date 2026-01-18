@@ -66,7 +66,7 @@ from letta.schemas.group import Group as PydanticGroup, ManagerType
 from letta.schemas.letta_stop_reason import StopReasonType
 from letta.schemas.llm_config import LLMConfig
 from letta.schemas.memory import ContextWindowOverview, Memory
-from letta.schemas.message import Message, Message as PydanticMessage, MessageCreate, MessageUpdate
+from letta.schemas.message import Message, Message as PydanticMessage, MessageCreate, MessageRole, MessageUpdate
 from letta.schemas.passage import Passage as PydanticPassage
 from letta.schemas.secret import Secret
 from letta.schemas.source import Source as PydanticSource
@@ -1586,6 +1586,170 @@ class AgentManager:
             return await self.append_to_in_context_messages_async(non_system_messages, agent_id=agent_state.id, actor=actor)
         else:
             return agent_state
+
+    @enforce_types
+    @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
+    @trace_method
+    async def repair_message_history_async(
+        self, agent_id: str, actor: PydanticUser
+    ) -> Dict[str, Any]:
+        """
+        Repair corrupted message history by detecting and fixing orphaned tool_use blocks.
+
+        An orphaned tool_use occurs when an assistant message contains a tool_call but
+        there's no corresponding tool_result in the following message. This can happen when:
+        - Server crashes during tool execution
+        - Client disconnects before tool result is saved
+        - Timeout during tool execution
+
+        The repair process:
+        1. Scans all in-context messages for orphaned tool_use blocks
+        2. For each orphaned tool_use, either:
+           a. Injects a synthetic tool_result message, or
+           b. Removes the orphaned assistant message (current implementation)
+
+        Args:
+            agent_id: The ID of the agent to repair
+            actor: The user performing this action
+
+        Returns:
+            Dict containing:
+                - status: "ok" (no issues), "repaired" (fixed issues), or "error"
+                - message: Human-readable description
+                - orphaned_tool_calls: List of detected orphaned tool calls
+                - removed_message_ids: List of message IDs that were removed
+        """
+        # Get current in-context messages
+        messages = await self.get_in_context_messages(agent_id=agent_id, actor=actor)
+
+        if not messages or len(messages) < 2:
+            return {
+                "status": "ok",
+                "message": "Agent has no message history to repair",
+                "orphaned_tool_calls": [],
+                "removed_message_ids": [],
+            }
+
+        # Find orphaned tool_use blocks
+        orphaned_tool_calls: List[Dict[str, Any]] = []
+        message_ids_to_remove: Set[str] = set()
+
+        for i, msg in enumerate(messages):
+            # Only check assistant messages with tool_calls
+            if msg.role != MessageRole.assistant or not msg.tool_calls:
+                continue
+
+            # Check if next message has corresponding tool_returns
+            next_msg = messages[i + 1] if i + 1 < len(messages) else None
+
+            # Collect tool_call_ids from this assistant message
+            tool_call_ids = {tc.id for tc in msg.tool_calls if tc.id}
+
+            if not next_msg:
+                # No next message - all tool_calls are orphaned
+                for tc in msg.tool_calls:
+                    orphaned_tool_calls.append(
+                        {
+                            "message_id": msg.id,
+                            "message_index": i,
+                            "tool_call_id": tc.id,
+                            "tool_name": tc.function.name if tc.function else "unknown",
+                            "reason": "no_following_message",
+                        }
+                    )
+                message_ids_to_remove.add(msg.id)
+                continue
+
+            # Check if next message is a tool response
+            if next_msg.role != MessageRole.tool:
+                # Next message is not a tool response - all tool_calls are orphaned
+                for tc in msg.tool_calls:
+                    orphaned_tool_calls.append(
+                        {
+                            "message_id": msg.id,
+                            "message_index": i,
+                            "tool_call_id": tc.id,
+                            "tool_name": tc.function.name if tc.function else "unknown",
+                            "reason": "next_message_not_tool_response",
+                        }
+                    )
+                message_ids_to_remove.add(msg.id)
+                continue
+
+            # Check which tool_call_ids have results
+            found_results = set()
+            if next_msg.tool_returns:
+                for tr in next_msg.tool_returns:
+                    if tr.tool_call_id in tool_call_ids:
+                        found_results.add(tr.tool_call_id)
+            # Also check legacy tool_call_id field
+            if next_msg.tool_call_id in tool_call_ids:
+                found_results.add(next_msg.tool_call_id)
+
+            missing_ids = tool_call_ids - found_results
+            if missing_ids:
+                for tc in msg.tool_calls:
+                    if tc.id in missing_ids:
+                        orphaned_tool_calls.append(
+                            {
+                                "message_id": msg.id,
+                                "message_index": i,
+                                "tool_call_id": tc.id,
+                                "tool_name": tc.function.name if tc.function else "unknown",
+                                "reason": "missing_tool_result",
+                            }
+                        )
+                # Always remove the assistant message if ANY tool_calls are orphaned
+                # (partial missing results still cause API failures)
+                message_ids_to_remove.add(msg.id)
+                # Also remove the following tool message if it only contains unmatched tool returns
+                if next_msg and next_msg.role == MessageRole.tool:
+                    # Check if all tool_returns in next_msg are for orphaned tool_call_ids
+                    next_msg_tool_return_ids = set()
+                    if next_msg.tool_returns:
+                        next_msg_tool_return_ids = {tr.tool_call_id for tr in next_msg.tool_returns}
+                    if next_msg.tool_call_id:
+                        next_msg_tool_return_ids.add(next_msg.tool_call_id)
+                    # If all returns in next_msg are for tool_calls in this assistant message, remove it too
+                    if next_msg_tool_return_ids and next_msg_tool_return_ids.issubset(tool_call_ids):
+                        message_ids_to_remove.add(next_msg.id)
+
+        if not orphaned_tool_calls:
+            return {
+                "status": "ok",
+                "message": "No orphaned tool_use blocks found",
+                "orphaned_tool_calls": [],
+                "removed_message_ids": [],
+            }
+
+        # Remove the orphaned messages from in-context
+        agent = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+        new_message_ids = [mid for mid in agent.message_ids if mid not in message_ids_to_remove]
+
+        # Check if any messages were actually removed
+        if len(new_message_ids) == len(agent.message_ids):
+            # No messages changed - this shouldn't happen if orphaned_tool_calls is non-empty,
+            # but guard against it to ensure status reflects actual changes
+            return {
+                "status": "ok",
+                "message": "Orphaned tool_use blocks detected but no messages needed removal",
+                "orphaned_tool_calls": orphaned_tool_calls,
+                "removed_message_ids": [],
+            }
+
+        await self.set_in_context_messages_async(agent_id=agent_id, message_ids=new_message_ids, actor=actor)
+
+        logger.warning(
+            f"Repaired agent {agent_id} message history: removed {len(message_ids_to_remove)} messages "
+            f"with {len(orphaned_tool_calls)} orphaned tool_use blocks"
+        )
+
+        return {
+            "status": "repaired",
+            "message": f"Removed {len(message_ids_to_remove)} message(s) with {len(orphaned_tool_calls)} orphaned tool_use block(s)",
+            "orphaned_tool_calls": orphaned_tool_calls,
+            "removed_message_ids": list(message_ids_to_remove),
+        }
 
     @enforce_types
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)

@@ -499,6 +499,11 @@ class AnthropicClient(LLMClientBase):
         # produce multiple tool_result blocks with the same id; consolidate them here.
         data["messages"] = dedupe_tool_results_in_user_messages(data["messages"])
 
+        # Validate and repair orphaned tool_use blocks that don't have corresponding tool_result blocks.
+        # This can happen when agent state is saved after tool_use but before tool_result (e.g., crash, timeout).
+        # Anthropic requires every tool_use to have a tool_result in the immediately following user message.
+        data["messages"] = validate_and_repair_tool_use_pairing(data["messages"])
+
         # Add cache control to final message for incremental conversation caching
         # Per Anthropic docs: "During each turn, we mark the final block of the final message with
         # cache_control so the conversation can be incrementally cached."
@@ -1477,6 +1482,133 @@ def dedupe_tool_results_in_user_messages(messages: List[dict]) -> List[dict]:
         logger.error("[Anthropic] Deduped tool_result blocks in user messages: %s", dedup_counts)
 
     return messages
+
+
+def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
+    """Validate that every tool_use block has a matching tool_result in the next user message.
+
+    If orphaned tool_use blocks are found (tool_use without corresponding tool_result),
+    inject synthetic tool_result blocks to satisfy Anthropic's API requirements.
+
+    This handles edge cases where agent state was saved after a tool_use but before
+    the tool_result was recorded (e.g., server crash, timeout, client disconnect).
+
+    The Anthropic API requires:
+    - Every tool_use block in an assistant message MUST have a corresponding tool_result
+      in the immediately following user message
+    - Missing tool_results cause 400 errors: "tool_use ids were found without tool_result blocks"
+    """
+    if not messages or len(messages) < 1:
+        return messages
+
+    repaired_messages = []
+    orphaned_count = 0
+    repaired_tool_ids: list[str] = []
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        repaired_messages.append(msg)
+
+        # Only check assistant messages with content
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            i += 1
+            continue
+
+        # Extract tool_use ids from this assistant message
+        tool_use_ids = set()
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_use_id = block.get("id")
+                if tool_use_id:
+                    tool_use_ids.add(tool_use_id)
+
+        if not tool_use_ids:
+            i += 1
+            continue
+
+        # Look for corresponding tool_results in the next message
+        next_idx = i + 1
+        if next_idx >= len(messages):
+            # Last message is an assistant with tool_use - definitely orphaned
+            # Need to inject a synthetic user message with tool_results
+            synthetic_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "is_error": True,
+                }
+                for tid in sorted(tool_use_ids)
+            ]
+            repaired_messages.append({"role": "user", "content": synthetic_results})
+            orphaned_count += len(tool_use_ids)
+            repaired_tool_ids.extend(sorted(tool_use_ids))
+            i += 1
+            continue
+
+        next_msg = messages[next_idx]
+        if next_msg.get("role") != "user":
+            # Next message is not user - structural issue, inject synthetic user message
+            synthetic_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "is_error": True,
+                }
+                for tid in sorted(tool_use_ids)
+            ]
+            repaired_messages.append({"role": "user", "content": synthetic_results})
+            orphaned_count += len(tool_use_ids)
+            repaired_tool_ids.extend(sorted(tool_use_ids))
+            i += 1
+            continue
+
+        # Check which tool_use_ids have results in the next user message
+        next_content = next_msg.get("content", [])
+        if not isinstance(next_content, list):
+            next_content = [{"type": "text", "text": str(next_content)}] if next_content else []
+
+        found_results = set()
+        for block in next_content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                tid = block.get("tool_use_id")
+                if tid in tool_use_ids:
+                    found_results.add(tid)
+
+        missing_ids = tool_use_ids - found_results
+        if missing_ids:
+            # Inject synthetic results for missing tool_use_ids into the next message
+            synthetic_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "is_error": True,
+                }
+                for tid in sorted(missing_ids)
+            ]
+            # Prepend synthetic results to the next message's content
+            messages[next_idx]["content"] = synthetic_results + list(next_content)
+            orphaned_count += len(missing_ids)
+            repaired_tool_ids.extend(sorted(missing_ids))
+
+        i += 1
+
+    if orphaned_count > 0:
+        logger.error(
+            "[Anthropic] Repaired %d orphaned tool_use block(s) by injecting synthetic tool_result(s): %s",
+            orphaned_count,
+            repaired_tool_ids,
+        )
+
+    return repaired_messages
 
 
 def remap_finish_reason(stop_reason: str) -> str:
