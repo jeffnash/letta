@@ -1630,50 +1630,68 @@ class AgentManager:
                 "removed_message_ids": [],
             }
 
-        # Find orphaned tool_use blocks
+        # IMPORTANT: Apply the same filtering that happens before sending to the LLM API
+        # This ensures we detect orphans the same way the API would see them
+        from letta.schemas.message import Message as PydanticMessageClass
+        filtered_messages = PydanticMessageClass.filter_messages_for_llm_api(list(messages))
+
+        # Build a mapping from filtered message to original message(s) for removal
+        # Since filtering can collapse messages, we need to track which originals correspond
+        original_msg_ids_by_tool_call_id: Dict[str, str] = {}
+        for msg in messages:
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.id:
+                        original_msg_ids_by_tool_call_id[tc.id] = msg.id
+
+        # Find orphaned tool_use blocks in the FILTERED view (same as what API sees)
         orphaned_tool_calls: List[Dict[str, Any]] = []
         message_ids_to_remove: Set[str] = set()
 
-        for i, msg in enumerate(messages):
-            # Only check assistant messages with tool_calls
-            if msg.role != MessageRole.assistant or not msg.tool_calls:
+        for i, msg in enumerate(filtered_messages):
+            # Check assistant and approval messages with tool_calls
+            # (approval messages can have tool_calls that get collapsed with assistant messages)
+            if msg.role not in (MessageRole.assistant, MessageRole.approval) or not msg.tool_calls:
                 continue
 
             # Check if next message has corresponding tool_returns
-            next_msg = messages[i + 1] if i + 1 < len(messages) else None
+            next_msg = filtered_messages[i + 1] if i + 1 < len(filtered_messages) else None
 
-            # Collect tool_call_ids from this assistant message
+            # Collect tool_call_ids from this assistant/approval message
             tool_call_ids = {tc.id for tc in msg.tool_calls if tc.id}
 
             if not next_msg:
                 # No next message - all tool_calls are orphaned
                 for tc in msg.tool_calls:
+                    # Map back to original message ID
+                    original_msg_id = original_msg_ids_by_tool_call_id.get(tc.id, msg.id)
                     orphaned_tool_calls.append(
                         {
-                            "message_id": msg.id,
+                            "message_id": original_msg_id,
                             "message_index": i,
                             "tool_call_id": tc.id,
                             "tool_name": tc.function.name if tc.function else "unknown",
                             "reason": "no_following_message",
                         }
                     )
-                message_ids_to_remove.add(msg.id)
+                    message_ids_to_remove.add(original_msg_id)
                 continue
 
             # Check if next message is a tool response
             if next_msg.role != MessageRole.tool:
                 # Next message is not a tool response - all tool_calls are orphaned
                 for tc in msg.tool_calls:
+                    original_msg_id = original_msg_ids_by_tool_call_id.get(tc.id, msg.id)
                     orphaned_tool_calls.append(
                         {
-                            "message_id": msg.id,
+                            "message_id": original_msg_id,
                             "message_index": i,
                             "tool_call_id": tc.id,
                             "tool_name": tc.function.name if tc.function else "unknown",
                             "reason": "next_message_not_tool_response",
                         }
                     )
-                message_ids_to_remove.add(msg.id)
+                    message_ids_to_remove.add(original_msg_id)
                 continue
 
             # Check which tool_call_ids have results
@@ -1690,18 +1708,17 @@ class AgentManager:
             if missing_ids:
                 for tc in msg.tool_calls:
                     if tc.id in missing_ids:
+                        original_msg_id = original_msg_ids_by_tool_call_id.get(tc.id, msg.id)
                         orphaned_tool_calls.append(
                             {
-                                "message_id": msg.id,
+                                "message_id": original_msg_id,
                                 "message_index": i,
                                 "tool_call_id": tc.id,
                                 "tool_name": tc.function.name if tc.function else "unknown",
                                 "reason": "missing_tool_result",
                             }
                         )
-                # Always remove the assistant message if ANY tool_calls are orphaned
-                # (partial missing results still cause API failures)
-                message_ids_to_remove.add(msg.id)
+                        message_ids_to_remove.add(original_msg_id)
                 # Also remove the following tool message if it only contains unmatched tool returns
                 if next_msg and next_msg.role == MessageRole.tool:
                     # Check if all tool_returns in next_msg are for orphaned tool_call_ids
