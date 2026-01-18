@@ -58,6 +58,30 @@ class AnthropicStreamingInterface:
     Encapsulates the logic for streaming responses from Anthropic.
     This class handles parsing of partial tokens, pre-execution messages,
     and detection of tool call events.
+    
+    ID Management Strategy:
+    ----------------------
+    This class manages two distinct types of IDs:
+    
+    1. **letta_message_id** (Message ID):
+       - Pre-generated UUID for the Message object that will be persisted
+       - Format: "message-{uuid}"
+       - For approval messages, this is DECREMENTED by 1 to create a distinct ID
+       - The `otid` uses index -1 for approval messages
+    
+    2. **tool_call_id** (Anthropic Tool Use ID):
+       - Assigned by Anthropic in the BetaToolUseBlock
+       - Format: "toolu_{random_string}" (e.g., "toolu_01H7...")
+       - CRITICAL: Must be preserved EXACTLY as received from Anthropic
+       - Stored in `self.tool_call_id` when processing content_block_start
+       - Must match between:
+         a) Streamed ApprovalRequestMessage/ToolCallMessage chunks
+         b) Final ToolCall object from get_tool_call_object()
+         c) Persisted approval Message in database
+         d) Client's approval response
+    
+    Unlike OpenAI, Anthropic sends the complete tool_call_id in a single event
+    (content_block_start), so there's no need for buffering partial IDs.
     """
 
     def __init__(

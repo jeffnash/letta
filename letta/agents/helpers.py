@@ -104,6 +104,13 @@ def validate_approval_tool_call_ids(approval_request_message: Message, approval_
         raise ValueError("Invalid approval response. Approval response message does not contain any approvals.")
     approval_response_tool_call_ids = [approval_response.tool_call_id for approval_response in approval_responses]
 
+    # Log validation attempt for debugging
+    logger.debug(
+        f"Validating approval tool call IDs for message {approval_request_message.id}: "
+        f"request has {len(approval_request_message.tool_calls or [])} tool_calls, "
+        f"response has {len(approval_response_tool_call_ids)} approval(s)"
+    )
+
     # Get expected tool call IDs from the approval request
     approval_requests = approval_request_message.tool_calls
     if approval_requests:
@@ -111,16 +118,51 @@ def validate_approval_tool_call_ids(approval_request_message: Message, approval_
         # Validate that the response IDs match the request IDs
         request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
         if request_response_diff:
-            raise ValueError(
-                f"Invalid tool call IDs. Expected '{approval_request_tool_call_ids}', but received '{approval_response_tool_call_ids}'."
+            # Build detailed diagnostic message
+            tool_call_details = []
+            for tc in approval_request_message.tool_calls or []:
+                tool_name = tc.function.name if hasattr(tc, 'function') and hasattr(tc.function, 'name') else 'unknown'
+                tool_call_details.append(f"{tc.id}: {tool_name}")
+
+            error_msg = (
+                f"Invalid tool call IDs. "
+                f"Expected {len(approval_request_tool_call_ids)} ID(s): {approval_request_tool_call_ids}, "
+                f"but received {len(approval_response_tool_call_ids)} ID(s): {approval_response_tool_call_ids}. "
+                f"\nApproval request message: {approval_request_message.id} "
+                f"(created: {approval_request_message.created_at}, step: {approval_request_message.step_id}). "
+                f"\nTool calls: {tool_call_details}. "
+                f"\nMismatch: {request_response_diff}"
             )
+            logger.warning(error_msg)
+            raise ValueError(error_msg)
     else:
-        # No tool_calls in the approval request
+        # No tool_calls in the approval request - this indicates a bug in approval message creation
         # Check for legacy case: old clients used message id instead of tool call id
-        if len(approval_response_tool_call_ids) == 1 and approval_response_tool_call_ids[0] == approval_request_message.id:
-            # legacy case where we used to use message id instead of tool call id
-            return
-        # Otherwise, accept the client's approval response IDs (client knows what it's approving)
+        # Legacy compatibility for pre-January 2026 messages
+        if approval_request_message.created_at and hasattr(approval_request_message.created_at, 'year'):
+            from datetime import datetime, timezone
+            legacy_cutoff = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            if approval_request_message.created_at < legacy_cutoff:
+                if len(approval_response_tool_call_ids) == 1 and approval_response_tool_call_ids[0] == approval_request_message.id:
+                    logger.warning(
+                        f"Using legacy message ID fallback for approval {approval_request_message.id}. "
+                        f"This is deprecated and will be removed in a future version."
+                    )
+                    return
+
+        # Log error before raising - important for debugging
+        logger.error(
+            f"Approval request message {approval_request_message.id} has no tool_calls. "
+            f"This indicates a bug in approval message creation. "
+            f"Response tool_call_ids: {approval_response_tool_call_ids}, "
+            f"Message step_id: {approval_request_message.step_id}, "
+            f"Message run_id: {approval_request_message.run_id}"
+        )
+        raise ValueError(
+            f"Invalid approval request: message {approval_request_message.id} has no tool_calls. "
+            f"Cannot validate approval response. Response contained IDs: {approval_response_tool_call_ids}. "
+            f"This indicates a bug in approval message creation - tool_calls should be populated."
+        )
 
 
 @trace_method

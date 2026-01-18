@@ -70,6 +70,37 @@ class OpenAIStreamingInterface:
     Encapsulates the logic for streaming responses from OpenAI.
     This class handles parsing of partial tokens, pre-execution messages,
     and detection of tool call events.
+    
+    ID Management Strategy:
+    ----------------------
+    This class manages two distinct types of IDs that flow through the streaming pipeline:
+    
+    1. **letta_message_id** (Message ID):
+       - Pre-generated UUID for the Message object that will be persisted
+       - Format: "message-{uuid}"
+       - For approval messages, this is DECREMENTED by 1 to create a distinct ID
+       - The `otid` (ordered transaction ID) uses this ID with an index suffix
+       - Index -1 is reserved for approval messages to ensure ordering
+    
+    2. **tool_call_id** (Provider Tool Call ID):
+       - Assigned by the LLM provider (OpenAI, Anthropic, etc.)
+       - Format: "call_{random}" for OpenAI, "toolu_{random}" for Anthropic
+       - CRITICAL: Must be preserved EXACTLY as streamed, not regenerated
+       - Stored in `_function_id_parts` buffer during streaming
+       - Flushed to `last_flushed_function_id` when tool name is complete
+       - Must match between:
+         a) Streamed ApprovalRequestMessage/ToolCallMessage chunks
+         b) Final ToolCall object from get_tool_call_object()
+         c) Persisted approval Message in database
+         d) Client's approval response
+    
+    Buffer Management:
+    -----------------
+    - `_function_id_parts`: Accumulates tool_call_id characters as they stream
+    - `last_flushed_function_id`: Stores the complete ID after flushing
+    - The ID buffer is NOT cleared after flushing arguments - it's preserved
+      for subsequent argument deltas of the same tool call
+    - Only cleared when a NEW tool call starts (new tool_call.id arrives)
     """
 
     def __init__(
@@ -158,11 +189,38 @@ class OpenAIStreamingInterface:
         return "".join(self._function_id_parts) if self._function_id_parts else None
 
     def _get_current_function_id(self) -> str | None:
-        """Prefer the last flushed ID when the live buffer is empty.
-        Ensures tool_call_id is present on subsequent argument deltas after name/id flush."""
-        return self.last_flushed_function_id if self.last_flushed_function_id else self._get_function_id_buffer()
+        """Get the current tool_call_id for streaming.
+        
+        Priority:
+        1. Current buffer (_function_id_parts) - for fresh/in-progress tool calls
+        2. Last flushed ID (last_flushed_function_id) - for subsequent argument deltas
+        
+        This ensures tool_call_id is present on all chunks for a single tool call.
+        The ID is set when a new tool call starts and preserved until a NEW tool call begins.
+        """
+        buffer_id = self._get_function_id_buffer()
+        if buffer_id:
+            return buffer_id
+        if self.last_flushed_function_id:
+            return self.last_flushed_function_id
+        # Defensive: log warning if both are None - this should not happen during tool call streaming
+        logger.warning(
+            "_get_current_function_id: Both buffer and last_flushed_function_id are None. "
+            f"This may cause tool_call_id to be missing in streamed chunks. "
+            f"last_flushed_function_name={self.last_flushed_function_name}"
+        )
+        return None
+
+    def _clear_function_name_buffer(self) -> None:
+        """Clear only the function name buffer, preserving the ID buffer.
+        
+        The ID buffer should only be cleared when starting a NEW tool call,
+        not after flushing arguments for the current tool call.
+        """
+        self._function_name_parts = []
 
     def _clear_function_buffers(self) -> None:
+        """Clear both name and ID buffers. Only call when starting a NEW tool call."""
         self._function_name_parts = []
         self._function_id_parts = []
 
@@ -422,8 +480,9 @@ class OpenAIStreamingInterface:
                             self.last_flushed_function_name = self._get_function_name_buffer()
                             # Always refresh flushed id to current buffer for this tool call
                             self.last_flushed_function_id = self._get_function_id_buffer()
-                            # Clear the buffer
-                            self._clear_function_buffers()
+                            # Clear only the name buffer - keep ID buffer intact for subsequent chunks
+                            # The ID buffer will be cleared when a NEW tool call starts (new tool_call.id arrives)
+                            self._clear_function_name_buffer()
                             # Since we're clearing the name buffer, we should store
                             # any updates to the arguments inside a separate buffer
 
@@ -506,9 +565,9 @@ class OpenAIStreamingInterface:
                                         )
                                     prev_message_type = tool_call_msg.message_type
                                     yield tool_call_msg
-                                    # clear buffer
+                                    # clear args buffer only - keep ID buffer for subsequent chunks
                                     self._function_args_buffer_parts = None
-                                    self._function_id_parts = []
+                                    # Note: _function_id_parts is NOT cleared here to preserve ID for subsequent deltas
                                 else:
                                     # If there's no buffer to clear, just output a new chunk with new data
                                     if prev_message_type and prev_message_type != "tool_call_message":
@@ -545,7 +604,9 @@ class OpenAIStreamingInterface:
                                         )
                                     prev_message_type = tool_call_msg.message_type
                                     yield tool_call_msg
-                                    self._function_id_parts = []
+                                    # Note: _function_id_parts is NOT cleared here - ID is preserved
+                                    # for subsequent argument deltas of the same tool call.
+                                    # It will be cleared when a NEW tool call starts (new tool_call.id arrives).
 
 
 class SimpleOpenAIStreamingInterface:

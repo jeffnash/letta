@@ -108,60 +108,87 @@ class TestValidateApprovalToolCallIds:
     # These are the bug scenarios that the fix addresses
     # =========================================================================
 
-    def test_valid_approval_with_empty_tool_calls_and_correct_id(self):
+    def test_valid_approval_with_empty_tool_calls_pre_cutoff(self):
         """
-        Test that approval with empty tool_calls and correct tool_call_id passes.
-        This is the bug scenario - previously this would fail validation.
+        Test that approval with empty tool_calls passes for old messages (pre-Jan 2026).
+        Legacy compatibility: empty tool_calls was allowed before stricter validation.
         """
+        from datetime import datetime, timezone
         approval_request = Message(
             role=MessageRole.approval,
-            tool_calls=[],  # Empty!
-            tool_call_id='call_server_set',  # Server sets this
+            tool_calls=[],  # Empty - allowed for legacy messages
+            tool_call_id='call_server_set',
+            created_at=datetime(2025, 6, 15, tzinfo=timezone.utc),  # Before cutoff
         )
-        # Client sends the correct tool_call_id that it got from the SDK
+        # Client sends the correct tool_call_id that matches message ID (legacy behavior)
         approval_response = ApprovalCreate(
-            approvals=[ApprovalReturn(tool_call_id='call_correct', approve=True)]
+            approvals=[ApprovalReturn(tool_call_id=approval_request.id, approve=True)]
         )
 
-        # Should not raise - client knows what it's approving
+        # Should not raise for legacy messages using message ID as tool_call_id
         validate_approval_tool_call_ids(approval_request, approval_response)
 
-    def test_valid_approval_with_none_tool_calls_and_correct_id(self):
-        """Test that approval with None tool_calls and correct tool_call_id passes."""
+    def test_valid_approval_with_none_tool_calls_pre_cutoff(self):
+        """Test that approval with None tool_calls passes for old messages using message ID."""
+        from datetime import datetime, timezone
         approval_request = Message(
             role=MessageRole.approval,
-            tool_calls=None,  # None!
+            tool_calls=None,  # None - allowed for legacy messages
             tool_call_id='call_server_set',
+            created_at=datetime(2025, 6, 15, tzinfo=timezone.utc),  # Before cutoff
         )
         approval_response = ApprovalCreate(
-            approvals=[ApprovalReturn(tool_call_id='call_correct', approve=True)]
+            approvals=[ApprovalReturn(tool_call_id=approval_request.id, approve=True)]
         )
 
-        # Should not raise
+        # Should not raise for legacy messages
         validate_approval_tool_call_ids(approval_request, approval_response)
 
     # =========================================================================
     # Legacy case - client uses message ID instead of tool call ID
     # =========================================================================
 
-    def test_legacy_approval_with_message_id_instead_of_tool_call_id(self):
+    def test_legacy_approval_with_message_id_instead_of_tool_call_id_pre_cutoff(self):
         """
         Test legacy case where client uses message ID instead of tool call ID.
-        This should still work for backward compatibility.
+        This should still work for backward compatibility with old messages (pre-Jan 2026).
         """
+        from datetime import datetime, timezone
         approval_request = Message(
             role=MessageRole.approval,
             tool_calls=[],
             tool_call_id='call_server_set',
             id='message-12345678-1234-1234-1234-123456789012',  # Message ID
+            created_at=datetime(2025, 6, 15, tzinfo=timezone.utc),  # Before cutoff
         )
         # Legacy client sends message ID as tool_call_id
         approval_response = ApprovalCreate(
             approvals=[ApprovalReturn(tool_call_id='message-12345678-1234-1234-1234-123456789012', approve=True)]
         )
 
-        # Should not raise - legacy case
+        # Should not raise - legacy case for old messages
         validate_approval_tool_call_ids(approval_request, approval_response)
+
+    def test_legacy_approval_with_message_id_post_cutoff_fails(self):
+        """
+        Test that legacy message ID fallback doesn't work for new messages (post-Jan 2026).
+        """
+        from datetime import datetime, timezone
+        approval_request = Message(
+            role=MessageRole.approval,
+            tool_calls=[],
+            tool_call_id='call_server_set',
+            id='message-12345678-1234-1234-1234-123456789012',
+            created_at=datetime(2026, 2, 15, tzinfo=timezone.utc),  # After cutoff
+        )
+        # Legacy client sends message ID as tool_call_id
+        approval_response = ApprovalCreate(
+            approvals=[ApprovalReturn(tool_call_id='message-12345678-1234-1234-1234-123456789012', approve=True)]
+        )
+
+        # Should raise - legacy fallback not allowed for new messages
+        with pytest.raises(ValueError, match="has no tool_calls"):
+            validate_approval_tool_call_ids(approval_request, approval_response)
 
     # =========================================================================
     # Error cases
@@ -193,21 +220,39 @@ class TestValidateApprovalToolCallIds:
         with pytest.raises(ValueError, match="Invalid approval response"):
             validate_approval_tool_call_ids(approval_request, approval_response)
 
-    def test_invalid_approval_with_empty_tool_calls_and_mismatched_id(self):
+    def test_invalid_approval_with_empty_tool_calls_raises_error(self):
         """
-        Test that approval with empty tool_calls and mismatched ID is accepted.
-        When tool_calls is empty, we accept the client's IDs (the client knows what it's approving).
-        This is the correct behavior after the fix.
+        Test that approval request with empty tool_calls raises an error.
+        After the fix, empty tool_calls indicates a bug in approval message creation,
+        not a valid legacy case. The validation should fail explicitly.
         """
         approval_request = Message(
             role=MessageRole.approval,
-            tool_calls=[],  # Empty!
-            tool_call_id='call_server_set',  # Server sets this
+            tool_calls=[],  # Empty - this is now considered a bug
+            tool_call_id='call_server_set',
         )
-        # Client sends ANY tool_call_id - it's accepted when tool_calls is empty
         approval_response = ApprovalCreate(
             approvals=[ApprovalReturn(tool_call_id='call_any_id', approve=True)]
         )
 
-        # Should NOT raise - when tool_calls is empty, we trust the client
-        validate_approval_tool_call_ids(approval_request, approval_response)
+        # Should raise ValueError - empty tool_calls is now an error
+        with pytest.raises(ValueError, match="has no tool_calls"):
+            validate_approval_tool_call_ids(approval_request, approval_response)
+
+    def test_invalid_approval_with_none_tool_calls_raises_error(self):
+        """
+        Test that approval request with None tool_calls raises an error.
+        After the fix, None tool_calls indicates a bug in approval message creation.
+        """
+        approval_request = Message(
+            role=MessageRole.approval,
+            tool_calls=None,  # None - this is now considered a bug
+            tool_call_id='call_server_set',
+        )
+        approval_response = ApprovalCreate(
+            approvals=[ApprovalReturn(tool_call_id='call_any_id', approve=True)]
+        )
+
+        # Should raise ValueError - None tool_calls is now an error
+        with pytest.raises(ValueError, match="has no tool_calls"):
+            validate_approval_tool_call_ids(approval_request, approval_response)

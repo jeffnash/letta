@@ -297,6 +297,66 @@ def create_approval_request_message_from_llm_response(
     step_id: str | None = None,
     run_id: str = None,
 ) -> Message:
+    """
+    Create approval request message(s) from LLM response tool calls.
+    
+    ID Generation Strategy:
+    -----------------------
+    This function handles two types of IDs that are often confused:
+    
+    1. **Message ID (letta_message_id / pre_computed_assistant_message_id)**:
+       - Identifies the Message object in the database
+       - Format: "message-{uuid}"
+       - For approval messages, we DECREMENT this UUID by 1 to create a unique message ID
+         that's related to but distinct from the assistant message ID
+       - The decrement ensures ordering: approval message ID < assistant message ID
+    
+    2. **Tool Call ID (tool_call_id)**:
+       - Identifies a specific tool invocation within an LLM response
+       - Format varies by provider:
+         - OpenAI: "call_{random_string}" (e.g., "call_abc123")
+         - Anthropic: "toolu_{random_string}" (e.g., "toolu_01XYZ")
+         - Gemini: custom format from get_tool_call_id()
+       - CRITICAL: This ID must be preserved EXACTLY as received from the provider
+       - The same tool_call_id must appear in:
+         a) Streamed ApprovalRequestMessage chunks
+         b) Persisted approval Message in database
+         c) Client's ApprovalCreate response
+    
+    For parallel tool calls, each tool gets its own tool_call_id but shares the same
+    decremented message ID base.
+    
+    Args:
+        agent_id: The agent's ID
+        model: The model name
+        requested_tool_calls: Tool calls that require approval (with their provider-assigned IDs)
+        allowed_tool_calls: Tool calls that are auto-approved
+        reasoning_content: Optional reasoning content from the LLM
+        pre_computed_assistant_message_id: Optional pre-computed message ID from streaming
+        step_id: Current step ID
+        run_id: Current run ID
+    
+    Returns:
+        List of Message objects (allowed tool message + approval request message)
+    """
+    from letta.log import get_logger
+    _logger = get_logger(__name__)
+    
+    # Validate that all requested tool calls have non-None IDs - critical for approval flow
+    for tc in requested_tool_calls:
+        if tc.id is None:
+            _logger.error(
+                f"Tool call missing ID! name={tc.function.name}, "
+                f"step_id={step_id}, run_id={run_id}. "
+                f"This will cause approval validation failures."
+            )
+            raise ValueError(f"Tool call '{tc.function.name}' has None ID - cannot create approval request")
+        # Log the tool_call_id for debugging
+        _logger.debug(
+            f"Creating approval request for tool_call_id={tc.id}, "
+            f"name={tc.function.name}, step_id={step_id}"
+        )
+    
     messages = []
     if allowed_tool_calls:
         oai_tool_calls = [
@@ -351,6 +411,15 @@ def create_approval_request_message_from_llm_response(
     )
     if pre_computed_assistant_message_id:
         approval_message.id = decrement_message_uuid(pre_computed_assistant_message_id)
+    
+    # Log the created approval message for debugging tool_call_id consistency
+    _logger.debug(
+        f"Created approval message id={approval_message.id}, "
+        f"tool_call_ids={[tc.id for tc in oai_tool_calls]}, "
+        f"tool_names={[tc.function.name for tc in oai_tool_calls]}, "
+        f"step_id={step_id}, run_id={run_id}"
+    )
+    
     messages.append(approval_message)
     return messages
 

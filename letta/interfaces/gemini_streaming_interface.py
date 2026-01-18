@@ -36,6 +36,29 @@ class SimpleGeminiStreamingInterface:
     """
     Encapsulates the logic for streaming responses from Gemini API:
     https://ai.google.dev/gemini-api/docs/text-generation#streaming-responses
+    
+    ID Management Strategy:
+    ----------------------
+    This class manages two distinct types of IDs:
+    
+    1. **letta_message_id** (Message ID):
+       - Pre-generated UUID for the Message object that will be persisted
+       - Format: "message-{uuid}"
+       - For approval messages, this is DECREMENTED by 1 to create a distinct ID
+       - The `otid` uses index -1 for approval messages
+    
+    2. **tool_call_id** (Gemini Tool Call ID):
+       - Generated via `get_tool_call_id()` utility function
+       - Unlike OpenAI/Anthropic, Gemini may not provide native tool call IDs
+       - The ID is stored in `self.tool_call_id` and `self.collected_tool_calls`
+       - CRITICAL: Must be preserved EXACTLY and used consistently across:
+         a) Streamed ApprovalRequestMessage/ToolCallMessage chunks
+         b) Final ToolCall objects from get_tool_call_object(s)()
+         c) Persisted approval Message in database
+         d) Client's approval response
+    
+    Gemini sends complete tool calls in a single chunk (not streamed incrementally),
+    so the tool_call_id is available immediately when processing the function_call.
     """
 
     def __init__(
