@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from letta.schemas.enums import ProviderCategory, ProviderType
+from letta.schemas.enums import ProviderCategory
 from letta.schemas.model import EmbeddingModel, Model
 from letta.schemas.model_policy import ModelPolicy, ModelSelectorRequest, ModelSelectorResponse
 from letta.server.rest_api.dependencies import HeaderParams, get_headers, get_letta_server

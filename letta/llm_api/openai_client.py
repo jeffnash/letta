@@ -2,9 +2,10 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any, Generic, List, Optional, TypeVar
 
 import openai
+import httpx
 from openai import AsyncOpenAI, AsyncStream, OpenAI
 from openai.types import Reasoning
 from openai.types.chat.chat_completion import ChatCompletion
@@ -65,6 +66,8 @@ from letta.schemas.response_format import JsonSchemaResponseFormat
 from letta.settings import model_settings
 
 logger = get_logger(__name__)
+
+TStreamEvent = TypeVar("TStreamEvent")
 
 
 def is_openai_reasoning_model(model: str) -> bool:
@@ -166,6 +169,46 @@ def supports_content_none(llm_config: LLMConfig) -> bool:
     if "gpt-oss" in llm_config.model:
         return False
     return True
+
+
+class _AsyncStreamWithClientClose(Generic[TStreamEvent]):
+    """Wrap an OpenAI `AsyncStream` and ensure the underlying client is closed.
+
+    The OpenAI Python SDK requires closing the client to release the underlying httpx
+    connection pool. In a long-running server process, creating per-request clients
+    without closing them can leak connections/tasks and eventually make the server
+    unresponsive.
+    """
+
+    def __init__(self, stream: AsyncStream[TStreamEvent], client: AsyncOpenAI):
+        self._stream = stream
+        self._client = client
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> TStreamEvent:
+        return await self._stream.__anext__()
+
+    async def __aenter__(self):
+        try:
+            await self._stream.__aenter__()
+        except Exception:
+            try:
+                await self._client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close async client after stream enter error")
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            return await self._stream.__aexit__(exc_type, exc, tb)
+        finally:
+            try:
+                await self._client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close async client after stream exit")
 
 
 class OpenAIClient(LLMClientBase):
@@ -600,13 +643,19 @@ class OpenAIClient(LLMClientBase):
         Performs underlying synchronous request to OpenAI API and returns raw response dict.
         """
         client = OpenAI(**self._prepare_client_kwargs(llm_config))
-        # Route based on payload shape: Responses uses 'input', Chat Completions uses 'messages'
-        if "input" in request_data and "messages" not in request_data:
-            resp = client.responses.create(**request_data)
-            return resp.model_dump()
-        else:
-            response: ChatCompletion = client.chat.completions.create(**request_data)
-            return response.model_dump()
+        try:
+            # Route based on payload shape: Responses uses 'input', Chat Completions uses 'messages'
+            if "input" in request_data and "messages" not in request_data:
+                resp = client.responses.create(**request_data)
+                return resp.model_dump()
+            else:
+                response: ChatCompletion = client.chat.completions.create(**request_data)
+                return response.model_dump()
+        finally:
+            try:
+                client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close sync client")
 
     @trace_method
     async def request_async(self, request_data: dict, llm_config: LLMConfig) -> dict:
@@ -615,13 +664,19 @@ class OpenAIClient(LLMClientBase):
         """
         kwargs = await self._prepare_client_kwargs_async(llm_config)
         client = AsyncOpenAI(**kwargs)
-        # Route based on payload shape: Responses uses 'input', Chat Completions uses 'messages'
-        if "input" in request_data and "messages" not in request_data:
-            resp = await client.responses.create(**request_data)
-            return resp.model_dump()
-        else:
-            response: ChatCompletion = await client.chat.completions.create(**request_data)
-            return response.model_dump()
+        try:
+            # Route based on payload shape: Responses uses 'input', Chat Completions uses 'messages'
+            if "input" in request_data and "messages" not in request_data:
+                resp = await client.responses.create(**request_data)
+                return resp.model_dump()
+            else:
+                response: ChatCompletion = await client.chat.completions.create(**request_data)
+                return response.model_dump()
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close async client")
 
     def is_reasoning_model(self, llm_config: LLMConfig) -> bool:
         return is_openai_reasoning_model(llm_config.model)
@@ -825,6 +880,10 @@ class OpenAIClient(LLMClientBase):
                 logger.error(f"Error streaming OpenAI Responses request: {e} with request data: {json.dumps(request_data)}")
                 # Convert provider-specific errors (e.g., context overflow) to Letta error types
                 # This enables the agent loop to trigger auto-compaction for ContextWindowExceededError
+                try:
+                    await client.close()
+                except Exception:
+                    logger.exception("[OpenAI] Failed to close async client after stream setup error")
                 raise self.handle_llm_error(e)
         else:
             try:
@@ -837,8 +896,13 @@ class OpenAIClient(LLMClientBase):
                 logger.error(f"Error streaming OpenAI Chat Completions request: {e} with request data: {json.dumps(request_data)}")
                 # Convert provider-specific errors (e.g., context overflow) to Letta error types
                 # This enables the agent loop to trigger auto-compaction for ContextWindowExceededError
+                try:
+                    await client.close()
+                except Exception:
+                    logger.exception("[OpenAI] Failed to close async client after stream setup error")
                 raise self.handle_llm_error(e)
-        return response_stream
+        # Ensure the per-request client is closed when the stream finishes (success, error, or cancellation).
+        return _AsyncStreamWithClientClose(response_stream, client)
 
     @trace_method
     async def stream_async_responses(self, request_data: dict, llm_config: LLMConfig) -> AsyncStream[ResponseStreamEvent]:
@@ -847,8 +911,15 @@ class OpenAIClient(LLMClientBase):
         """
         kwargs = await self._prepare_client_kwargs_async(llm_config)
         client = AsyncOpenAI(**kwargs)
-        response_stream: AsyncStream[ResponseStreamEvent] = await client.responses.create(**request_data, stream=True)
-        return response_stream
+        try:
+            response_stream: AsyncStream[ResponseStreamEvent] = await client.responses.create(**request_data, stream=True)
+        except Exception as e:
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close async client after stream setup error")
+            raise self.handle_llm_error(e)
+        return _AsyncStreamWithClientClose(response_stream, client)
 
     @trace_method
     async def request_embeddings(self, inputs: List[str], embedding_config: EmbeddingConfig) -> List[List[float]]:
@@ -899,78 +970,86 @@ class OpenAIClient(LLMClientBase):
         chunks_to_process = [(i, inputs[i : i + initial_batch_size], initial_batch_size) for i in range(0, len(inputs), initial_batch_size)]
         min_chunk_size = 128
 
-        while chunks_to_process:
-            tasks = []
-            task_metadata = []
+        try:
+            while chunks_to_process:
+                tasks = []
+                task_metadata = []
 
-            for start_idx, chunk_inputs, current_batch_size in chunks_to_process:
-                if not chunk_inputs:
-                    logger.warning(f"Skipping empty chunk at start_idx={start_idx}")
-                    continue
+                for start_idx, chunk_inputs, current_batch_size in chunks_to_process:
+                    if not chunk_inputs:
+                        logger.warning(f"Skipping empty chunk at start_idx={start_idx}")
+                        continue
 
-                logger.info(
-                    f"DIAGNOSTIC: Creating embedding task: start_idx={start_idx}, batch_size={len(chunk_inputs)}, "
-                    f"first_input_len={len(chunk_inputs[0]) if chunk_inputs else 0}, "
-                    f"model={embedding_config.embedding_model}"
-                )
-                task = client.embeddings.create(model=embedding_config.embedding_model, input=chunk_inputs)
-                tasks.append(task)
-                task_metadata.append((start_idx, chunk_inputs, current_batch_size))
+                    logger.info(
+                        f"DIAGNOSTIC: Creating embedding task: start_idx={start_idx}, batch_size={len(chunk_inputs)}, "
+                        f"first_input_len={len(chunk_inputs[0]) if chunk_inputs else 0}, "
+                        f"model={embedding_config.embedding_model}"
+                    )
+                    task = client.embeddings.create(model=embedding_config.embedding_model, input=chunk_inputs)
+                    tasks.append(task)
+                    task_metadata.append((start_idx, chunk_inputs, current_batch_size))
 
-            if not tasks:
-                logger.warning("All chunks were empty, skipping embedding request")
-                break
+                if not tasks:
+                    logger.warning("All chunks were empty, skipping embedding request")
+                    break
 
-            gather_start = time.time()
-            logger.info(f"DIAGNOSTIC: Awaiting {len(tasks)} embedding API calls...")
-            task_results = await asyncio.gather(*tasks, return_exceptions=True)
-            gather_duration = time.time() - gather_start
+                gather_start = time.time()
+                logger.info(f"DIAGNOSTIC: Awaiting {len(tasks)} embedding API calls...")
+                task_results = await asyncio.gather(*tasks, return_exceptions=True)
+                gather_duration = time.time() - gather_start
 
-            if gather_duration > 1.0:
-                logger.warning(f"DIAGNOSTIC: SLOW embedding API gather took {gather_duration:.2f}s for {len(tasks)} tasks")
-            else:
-                logger.info(f"DIAGNOSTIC: Embedding API gather completed in {gather_duration:.2f}s")
-
-            failed_chunks = []
-            for (start_idx, chunk_inputs, current_batch_size), result in zip(task_metadata, task_results):
-                if isinstance(result, Exception):
-                    current_size = len(chunk_inputs)
-
-                    if current_batch_size > 1:
-                        new_batch_size = max(1, current_batch_size // 2)
-                        logger.warning(
-                            f"Embeddings request failed for batch starting at {start_idx} with size {current_size}. "
-                            f"Reducing batch size from {current_batch_size} to {new_batch_size} and retrying."
-                        )
-                        mid = max(1, len(chunk_inputs) // 2)
-                        if chunk_inputs[:mid]:
-                            failed_chunks.append((start_idx, chunk_inputs[:mid], new_batch_size))
-                        if chunk_inputs[mid:]:
-                            failed_chunks.append((start_idx + mid, chunk_inputs[mid:], new_batch_size))
-                    elif current_size > min_chunk_size:
-                        logger.warning(
-                            f"Embeddings request failed for single item at {start_idx} with size {current_size}. "
-                            f"Splitting individual text content and retrying."
-                        )
-                        mid = max(1, len(chunk_inputs) // 2)
-                        if chunk_inputs[:mid]:
-                            failed_chunks.append((start_idx, chunk_inputs[:mid], 1))
-                        if chunk_inputs[mid:]:
-                            failed_chunks.append((start_idx + mid, chunk_inputs[mid:], 1))
-                    else:
-                        chunk_preview = str(chunk_inputs)[:500] if chunk_inputs else "None"
-                        logger.error(
-                            f"Failed to get embeddings for chunk starting at {start_idx} even with batch_size=1 "
-                            f"and minimum chunk size {min_chunk_size}. Error: {result}. "
-                            f"Chunk preview (first 500 chars): {chunk_preview}"
-                        )
-                        raise result
+                if gather_duration > 1.0:
+                    logger.warning(
+                        f"DIAGNOSTIC: SLOW embedding API gather took {gather_duration:.2f}s for {len(tasks)} tasks"
+                    )
                 else:
-                    embeddings = [r.embedding for r in result.data]
-                    for i, embedding in enumerate(embeddings):
-                        results[start_idx + i] = embedding
+                    logger.info(f"DIAGNOSTIC: Embedding API gather completed in {gather_duration:.2f}s")
 
-            chunks_to_process = failed_chunks
+                failed_chunks = []
+                for (start_idx, chunk_inputs, current_batch_size), result in zip(task_metadata, task_results):
+                    if isinstance(result, Exception):
+                        current_size = len(chunk_inputs)
+
+                        if current_batch_size > 1:
+                            new_batch_size = max(1, current_batch_size // 2)
+                            logger.warning(
+                                f"Embeddings request failed for batch starting at {start_idx} with size {current_size}. "
+                                f"Reducing batch size from {current_batch_size} to {new_batch_size} and retrying."
+                            )
+                            mid = max(1, len(chunk_inputs) // 2)
+                            if chunk_inputs[:mid]:
+                                failed_chunks.append((start_idx, chunk_inputs[:mid], new_batch_size))
+                            if chunk_inputs[mid:]:
+                                failed_chunks.append((start_idx + mid, chunk_inputs[mid:], new_batch_size))
+                        elif current_size > min_chunk_size:
+                            logger.warning(
+                                f"Embeddings request failed for single item at {start_idx} with size {current_size}. "
+                                f"Splitting individual text content and retrying."
+                            )
+                            mid = max(1, len(chunk_inputs) // 2)
+                            if chunk_inputs[:mid]:
+                                failed_chunks.append((start_idx, chunk_inputs[:mid], 1))
+                            if chunk_inputs[mid:]:
+                                failed_chunks.append((start_idx + mid, chunk_inputs[mid:], 1))
+                        else:
+                            chunk_preview = str(chunk_inputs)[:500] if chunk_inputs else "None"
+                            logger.error(
+                                f"Failed to get embeddings for chunk starting at {start_idx} even with batch_size=1 "
+                                f"and minimum chunk size {min_chunk_size}. Error: {result}. "
+                                f"Chunk preview (first 500 chars): {chunk_preview}"
+                            )
+                            raise result
+                    else:
+                        embeddings = [r.embedding for r in result.data]
+                        for i, embedding in enumerate(embeddings):
+                            results[start_idx + i] = embedding
+
+                chunks_to_process = failed_chunks
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("[OpenAI] Failed to close async client after embeddings request")
 
         total_duration = time.time() - request_start
         if total_duration > 2.0:
@@ -1002,6 +1081,28 @@ class OpenAIClient(LLMClientBase):
                 details={
                     "timeout_duration": timeout_duration,
                     "cause": str(e.__cause__) if e.__cause__ else None,
+                },
+            )
+
+        # NOTE: In some streaming cases the OpenAI SDK surfaces raw httpx exceptions
+        # rather than OpenAI-specific APIConnectionError/APITimeoutError.
+        if isinstance(e, (httpx.TimeoutException, asyncio.TimeoutError)):
+            logger.warning(f"[OpenAI] HTTP timeout: {e}")
+            return LLMTimeoutError(
+                message=f"Request to OpenAI timed out: {str(e)}",
+                code=ErrorCode.TIMEOUT,
+                details={"cause": str(e.__cause__) if getattr(e, "__cause__", None) else None},
+            )
+
+        if isinstance(e, httpx.HTTPError):
+            # Covers RemoteProtocolError / ReadError / ConnectError, etc.
+            logger.warning(f"[OpenAI] HTTP transport error ({type(e).__name__}): {e}")
+            return LLMConnectionError(
+                message=f"Failed to connect to OpenAI: {str(e)}",
+                code=ErrorCode.INTERNAL_SERVER_ERROR,
+                details={
+                    "provider_exception_type": type(e).__name__,
+                    "cause": str(e.__cause__) if getattr(e, "__cause__", None) else None,
                 },
             )
 

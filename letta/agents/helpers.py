@@ -98,30 +98,28 @@ async def _prepare_in_context_messages_async(
 
 @trace_method
 def validate_approval_tool_call_ids(approval_request_message: Message, approval_response_message: ApprovalCreate):
-    approval_requests = approval_request_message.tool_calls
-    if approval_requests:
-        approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
-    elif approval_request_message.tool_call_id:
-        approval_request_tool_call_ids = [approval_request_message.tool_call_id]
-    else:
-        raise ValueError(
-            f"Invalid tool call IDs. Approval request message '{approval_request_message.id}' does not contain any tool calls."
-        )
-
     approval_responses = approval_response_message.approvals
     if not approval_responses:
         raise ValueError("Invalid approval response. Approval response message does not contain any approvals.")
     approval_response_tool_call_ids = [approval_response.tool_call_id for approval_response in approval_responses]
 
-    request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
-    if request_response_diff:
-        if len(approval_request_tool_call_ids) == 1 and approval_response_tool_call_ids[0] == approval_request_message.id:
+    # Get expected tool call IDs from the approval request
+    approval_requests = approval_request_message.tool_calls
+    if approval_requests:
+        approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
+        # Validate that the response IDs match the request IDs
+        request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
+        if request_response_diff:
+            raise ValueError(
+                f"Invalid tool call IDs. Expected '{approval_request_tool_call_ids}', but received '{approval_response_tool_call_ids}'."
+            )
+    else:
+        # No tool_calls in the approval request
+        # Check for legacy case: old clients used message id instead of tool call id
+        if len(approval_response_tool_call_ids) == 1 and approval_response_tool_call_ids[0] == approval_request_message.id:
             # legacy case where we used to use message id instead of tool call id
             return
-
-        raise ValueError(
-            f"Invalid tool call IDs. Expected '{approval_request_tool_call_ids}', but received '{approval_response_tool_call_ids}'."
-        )
+        # Otherwise, accept the client's approval response IDs (client knows what it's approving)
 
 
 @trace_method
