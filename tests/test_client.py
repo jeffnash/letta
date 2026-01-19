@@ -585,6 +585,47 @@ def test_messages(client: Letta, agent: AgentState):
     #    assert result.created_at
 
 
+def test_retrieve_message(client: Letta, agent: AgentState):
+    """Test retrieving a message by ID via GET /v1/messages/{message_id}."""
+    import httpx
+
+    # First, send a message to create some messages
+    send_message_response = client.agents.messages.create(
+        agent_id=agent.id, messages=[MessageCreateParam(role="user", content="Test retrieve message")]
+    )
+    assert send_message_response, "Sending message failed"
+
+    # Get the list of messages to find a message ID
+    messages_response = client.agents.messages.list(agent_id=agent.id, limit=5).items
+    assert len(messages_response) > 0, "No messages found"
+
+    # Get a message ID to retrieve
+    message_id = messages_response[0].id
+
+    # Retrieve the message by ID using raw HTTP (SDK doesn't have retrieve yet)
+    base_url = client._client.base_url
+    response = httpx.get(f"{base_url}/v1/messages/{message_id}")
+    assert response.status_code == 200, f"Retrieving message failed: {response.status_code} {response.text}"
+
+    retrieved_messages = response.json()
+    assert retrieved_messages is not None, "Retrieving message by ID failed"
+    assert len(retrieved_messages) > 0, "Retrieved message list is empty"
+
+    # Verify the retrieved message has the expected ID
+    # Note: retrieve returns a list of LettaMessageUnion variants for the message
+    assert any(msg["id"] == message_id for msg in retrieved_messages), "Retrieved message ID doesn't match"
+
+
+def test_retrieve_message_not_found(client: Letta):
+    """Test that retrieving a non-existent message returns 404."""
+    import httpx
+
+    fake_message_id = f"message-{uuid.uuid4()}"
+    base_url = client._client.base_url
+    response = httpx.get(f"{base_url}/v1/messages/{fake_message_id}")
+    assert response.status_code == 404, f"Expected 404, got {response.status_code}"
+
+
 # TODO: Add back when new agent loop hits
 # @pytest.mark.asyncio
 # async def test_send_message_parallel(client: Letta, agent: AgentState, request):

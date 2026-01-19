@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -1591,7 +1592,7 @@ class AgentManager:
     @raise_on_invalid_id(param_name="agent_id", expected_prefix=PrimitiveType.AGENT)
     @trace_method
     async def repair_message_history_async(
-        self, agent_id: str, actor: PydanticUser
+        self, agent_id: str, actor: PydanticUser, conversation_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Repair corrupted message history by detecting and fixing orphaned tool_use blocks.
@@ -1610,6 +1611,7 @@ class AgentManager:
 
         Args:
             agent_id: The ID of the agent to repair
+            conversation_id: Optional conversation ID to repair. When provided, repairs the conversation's in-context list.
             actor: The user performing this action
 
         Returns:
@@ -1619,13 +1621,35 @@ class AgentManager:
                 - orphaned_tool_calls: List of detected orphaned tool calls
                 - removed_message_ids: List of message IDs that were removed
         """
-        # Get current in-context messages
-        messages = await self.get_in_context_messages(agent_id=agent_id, actor=actor)
+        repair_conversation = conversation_id not in (None, "", "default")
+        conversation_in_context_message_ids: Optional[List[str]] = None
+
+        if repair_conversation:
+            from letta.services.conversation_manager import ConversationManager
+
+            conversation_manager = ConversationManager()
+            conversation = await conversation_manager.get_conversation_by_id(conversation_id=conversation_id, actor=actor)
+            if conversation.agent_id != agent_id:
+                raise LettaInvalidArgumentError(
+                    message=f"Conversation {conversation_id} does not belong to agent {agent_id}",
+                    argument_name="conversation_id",
+                )
+
+            # Get current in-context messages for this conversation
+            messages = await conversation_manager.get_messages_for_conversation(conversation_id=conversation_id, actor=actor)
+            conversation_in_context_message_ids = conversation.in_context_message_ids
+            repair_target = f"Conversation {conversation_id} (agent {agent_id})"
+        else:
+            # Get current in-context messages from the agent's message_ids list
+            messages = await self.get_in_context_messages(agent_id=agent_id, actor=actor)
+            repair_target = f"Agent {agent_id}"
+
+        logger.info(f"[REPAIR] {repair_target}: Starting repair, found {len(messages)} messages")
 
         if not messages or len(messages) < 2:
             return {
                 "status": "ok",
-                "message": "Agent has no message history to repair",
+                "message": "Conversation has no message history to repair" if repair_conversation else "Agent has no message history to repair",
                 "orphaned_tool_calls": [],
                 "removed_message_ids": [],
             }
@@ -1634,6 +1658,14 @@ class AgentManager:
         # This ensures we detect orphans the same way the API would see them
         from letta.schemas.message import Message as PydanticMessageClass
         filtered_messages = PydanticMessageClass.filter_messages_for_llm_api(list(messages))
+        
+        logger.info(f"[REPAIR] {repair_target}: After filtering, {len(filtered_messages)} messages")
+        # Log each message's role and tool_calls for debugging (only at debug level to avoid flooding logs)
+        if logger.isEnabledFor(logging.DEBUG):
+            for idx, msg in enumerate(filtered_messages):
+                tool_call_ids = [tc.id for tc in (msg.tool_calls or [])]
+                tool_return_ids = [tr.tool_call_id for tr in (msg.tool_returns or [])]
+                logger.debug(f"[REPAIR]   [{idx}] role={msg.role}, tool_calls={tool_call_ids}, tool_returns={tool_return_ids}, tool_call_id={msg.tool_call_id}")
 
         # Build a mapping from filtered message to original message(s) for removal
         # Since filtering can collapse messages, we need to track which originals correspond
@@ -1740,11 +1772,32 @@ class AgentManager:
             }
 
         # Remove the orphaned messages from in-context
-        agent = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
-        new_message_ids = [mid for mid in agent.message_ids if mid not in message_ids_to_remove]
+        if repair_conversation:
+            from letta.services.conversation_manager import ConversationManager
+
+            conversation_manager = ConversationManager()
+            if conversation_in_context_message_ids is None:
+                conversation_in_context_message_ids = await conversation_manager.get_message_ids_for_conversation(
+                    conversation_id=conversation_id,
+                    actor=actor,
+                )
+            new_message_ids = [mid for mid in conversation_in_context_message_ids if mid not in message_ids_to_remove]
+        else:
+            agent = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+            new_message_ids = [mid for mid in agent.message_ids if mid not in message_ids_to_remove]
 
         # Check if any messages were actually removed
-        if len(new_message_ids) == len(agent.message_ids):
+        if repair_conversation:
+            if conversation_in_context_message_ids is not None and len(new_message_ids) == len(conversation_in_context_message_ids):
+                # No messages changed - this shouldn't happen if orphaned_tool_calls is non-empty,
+                # but guard against it to ensure status reflects actual changes
+                return {
+                    "status": "ok",
+                    "message": "Orphaned tool_use blocks detected but no messages needed removal",
+                    "orphaned_tool_calls": orphaned_tool_calls,
+                    "removed_message_ids": [],
+                }
+        elif len(new_message_ids) == len(agent.message_ids):
             # No messages changed - this shouldn't happen if orphaned_tool_calls is non-empty,
             # but guard against it to ensure status reflects actual changes
             return {
@@ -1754,10 +1807,20 @@ class AgentManager:
                 "removed_message_ids": [],
             }
 
-        await self.set_in_context_messages_async(agent_id=agent_id, message_ids=new_message_ids, actor=actor)
+        if repair_conversation:
+            from letta.services.conversation_manager import ConversationManager
+
+            conversation_manager = ConversationManager()
+            await conversation_manager.update_in_context_messages(
+                conversation_id=conversation_id,
+                in_context_message_ids=new_message_ids,
+                actor=actor,
+            )
+        else:
+            await self.set_in_context_messages_async(agent_id=agent_id, message_ids=new_message_ids, actor=actor)
 
         logger.warning(
-            f"Repaired agent {agent_id} message history: removed {len(message_ids_to_remove)} messages "
+            f"Repaired {repair_target} message history: removed {len(message_ids_to_remove)} messages "
             f"with {len(orphaned_tool_calls)} orphaned tool_use blocks"
         )
 

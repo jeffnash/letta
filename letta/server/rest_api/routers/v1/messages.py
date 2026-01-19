@@ -4,9 +4,11 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import Field
 from starlette.requests import Request
 
+from letta import constants
 from letta.agents.letta_agent_batch import LettaAgentBatch
 from letta.errors import LettaInvalidArgumentError
 from letta.log import get_logger
+from letta.schemas.enums import AgentType
 from letta.schemas.job import BatchJob, JobStatus, JobType, JobUpdate
 from letta.schemas.letta_message import LettaMessageSearchResult, LettaMessageUnion
 from letta.schemas.letta_request import CreateBatch
@@ -264,3 +266,38 @@ async def cancel_batch(
 
             # Update all the batch_job statuses
             await server.batch_manager.update_llm_batch_status_async(llm_batch_id=llm_batch_job.id, status=JobStatus.cancelled, actor=actor)
+
+
+@router.get("/{message_id}", response_model=MessagesResponse, operation_id="retrieve_message")
+async def retrieve_message(
+    message_id: str,
+    server: SyncServer = Depends(get_letta_server),
+    headers: HeaderParams = Depends(get_headers),
+):
+    """
+    Retrieve a message by ID.
+
+    Returns a list of LettaMessageUnion variants for the message (a single DB message
+    can have multiple content types, e.g., tool_call + reasoning).
+    """
+    actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
+    message = await server.message_manager.get_message_by_id_async(message_id=message_id, actor=actor)
+    if not message:
+        raise HTTPException(status_code=404, detail=f"Message {message_id} not found")
+
+    # Align with list endpoints: derive text_is_assistant_message from agent type
+    text_is_assistant_message = True  # Default to True like get_all_messages_recall_async
+    if message.agent_id:
+        try:
+            agent_state = await server.agent_manager.get_agent_by_id_async(agent_id=message.agent_id, actor=actor)
+            text_is_assistant_message = agent_state.agent_type == AgentType.letta_v1_agent
+        except Exception:
+            # If agent lookup fails, default to True (same as list endpoint behavior)
+            pass
+
+    return message.to_letta_messages(
+        use_assistant_message=True,
+        assistant_message_tool_name=constants.DEFAULT_MESSAGE_TOOL,
+        assistant_message_tool_kwarg=constants.DEFAULT_MESSAGE_TOOL_KWARG,
+        text_is_assistant_message=text_is_assistant_message,
+    )

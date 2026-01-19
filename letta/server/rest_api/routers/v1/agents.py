@@ -2244,6 +2244,7 @@ class RepairMessageHistoryResponse(BaseModel):
 @router.post("/{agent_id}/repair-message-history", response_model=RepairMessageHistoryResponse, operation_id="repair_message_history")
 async def repair_message_history(
     agent_id: AgentId,
+    conversation_id: str | None = Query(None, description="Optional conversation ID to repair message history for."),
     server: "SyncServer" = Depends(get_letta_server),
     headers: HeaderParams = Depends(get_headers),
 ):
@@ -2263,7 +2264,7 @@ async def repair_message_history(
     that have tool_calls without corresponding tool_results.
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
-    result = await server.agent_manager.repair_message_history_async(agent_id=agent_id, actor=actor)
+    result = await server.agent_manager.repair_message_history_async(agent_id=agent_id, actor=actor, conversation_id=conversation_id)
     return RepairMessageHistoryResponse(**result)
 
 
