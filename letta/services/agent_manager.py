@@ -1654,10 +1654,78 @@ class AgentManager:
                 "removed_message_ids": [],
             }
 
+        # Get agent state to access llm_config for provider-specific formatting
+        agent_state = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
+        llm_config = agent_state.llm_config
+
         # IMPORTANT: Apply the same filtering that happens before sending to the LLM API
         # This ensures we detect orphans the same way the API would see them
         from letta.schemas.message import Message as PydanticMessageClass
         filtered_messages = PydanticMessageClass.filter_messages_for_llm_api(list(messages))
+
+        # Build a mapping from tool_call_id to original message ID early so we can use it
+        # for both internal and provider-specific orphan detection
+        original_msg_ids_by_tool_call_id: Dict[str, str] = {}
+        for msg in messages:
+            if msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.id:
+                        original_msg_ids_by_tool_call_id[tc.id] = msg.id
+
+        # ============================================================================
+        # PROVIDER-SPECIFIC ORPHAN DETECTION
+        # ============================================================================
+        # Build provider-specific message payloads and run the corresponding repair
+        # helpers to detect orphaned tool calls as the provider would see them.
+        # This catches issues that the internal Letta format detection might miss.
+        # The detected orphans are added to the final results.
+        # ============================================================================
+        provider_detected_orphan_ids: Set[str] = set()  # tool_call_ids detected by provider-specific repair
+
+        if llm_config.model_endpoint_type == "anthropic" or llm_config.model_endpoint_type == "bedrock":
+            # Build Anthropic-format messages and detect orphans
+            try:
+                anthropic_messages = PydanticMessageClass.to_anthropic_dicts_from_list(list(filtered_messages))
+                from letta.llm_api.anthropic_client import validate_and_repair_tool_use_pairing
+                # Run repair to detect orphans
+                repaired = validate_and_repair_tool_use_pairing(anthropic_messages)
+                # Extract tool_use_ids that got synthetic tool_results (these are the orphans)
+                # Original tool_results have actual content; synthetic ones have "[Error:" prefix
+                for m in repaired:
+                    if m.get("role") == "user":
+                        for b in (m.get("content") or []):
+                            if isinstance(b, dict) and b.get("type") == "tool_result":
+                                content = b.get("content", "")
+                                if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                                    tool_use_id = b.get("tool_use_id")
+                                    if tool_use_id:
+                                        provider_detected_orphan_ids.add(tool_use_id)
+                if provider_detected_orphan_ids:
+                    logger.warning(f"[REPAIR] Anthropic format detected {len(provider_detected_orphan_ids)} orphaned tool_use blocks: {provider_detected_orphan_ids}")
+            except Exception as e:
+                logger.debug(f"[REPAIR] Could not build Anthropic-format messages for orphan detection: {e}")
+
+        elif llm_config.model_endpoint_type == "openai":
+            # Build OpenAI-format messages and detect orphans
+            # This is especially important for proxies that convert to Anthropic (like CLIProxy)
+            try:
+                openai_messages = PydanticMessageClass.to_openai_dicts_from_list(list(filtered_messages))
+                from letta.llm_api.openai_client import validate_and_repair_openai_tool_call_pairing
+                # Run repair to detect orphans
+                repaired = validate_and_repair_openai_tool_call_pairing(openai_messages)
+                # Extract tool_call_ids that got synthetic responses (these are the orphans)
+                # Synthetic responses have "[Error: Tool execution" in content
+                for m in repaired:
+                    if m.get("role") == "tool":
+                        content = m.get("content", "")
+                        if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                            tool_call_id = m.get("tool_call_id")
+                            if tool_call_id:
+                                provider_detected_orphan_ids.add(tool_call_id)
+                if provider_detected_orphan_ids:
+                    logger.warning(f"[REPAIR] OpenAI format detected {len(provider_detected_orphan_ids)} orphaned tool_calls: {provider_detected_orphan_ids}")
+            except Exception as e:
+                logger.debug(f"[REPAIR] Could not build OpenAI-format messages for orphan detection: {e}")
         
         logger.info(f"[REPAIR] {repair_target}: After filtering, {len(filtered_messages)} messages")
         # Log each message's role and tool_calls for debugging (only at debug level to avoid flooding logs)
@@ -1666,15 +1734,6 @@ class AgentManager:
                 tool_call_ids = [tc.id for tc in (msg.tool_calls or [])]
                 tool_return_ids = [tr.tool_call_id for tr in (msg.tool_returns or [])]
                 logger.debug(f"[REPAIR]   [{idx}] role={msg.role}, tool_calls={tool_call_ids}, tool_returns={tool_return_ids}, tool_call_id={msg.tool_call_id}")
-
-        # Build a mapping from filtered message to original message(s) for removal
-        # Since filtering can collapse messages, we need to track which originals correspond
-        original_msg_ids_by_tool_call_id: Dict[str, str] = {}
-        for msg in messages:
-            if msg.tool_calls:
-                for tc in msg.tool_calls:
-                    if tc.id:
-                        original_msg_ids_by_tool_call_id[tc.id] = msg.id
 
         # Find orphaned tool_use blocks in the FILTERED view (same as what API sees)
         orphaned_tool_calls: List[Dict[str, Any]] = []
@@ -1762,6 +1821,39 @@ class AgentManager:
                     # If all returns in next_msg are for tool_calls in this assistant message, remove it too
                     if next_msg_tool_return_ids and next_msg_tool_return_ids.issubset(tool_call_ids):
                         message_ids_to_remove.add(next_msg.id)
+
+        # ============================================================================
+        # MERGE PROVIDER-DETECTED ORPHANS INTO RESULTS
+        # ============================================================================
+        # Add any orphans detected by provider-specific repair that weren't caught by
+        # the internal Letta format detection. This ensures the /repair result reflects
+        # what the provider would see.
+        # ============================================================================
+        internal_detected_ids = {oc["tool_call_id"] for oc in orphaned_tool_calls}
+        provider_only_orphans = provider_detected_orphan_ids - internal_detected_ids
+        
+        if provider_only_orphans:
+            logger.warning(f"[REPAIR] Provider-specific detection found {len(provider_only_orphans)} additional orphans not caught by internal detection: {provider_only_orphans}")
+            for tool_call_id in provider_only_orphans:
+                original_msg_id = original_msg_ids_by_tool_call_id.get(tool_call_id)
+                if original_msg_id:
+                    # Find the tool name from the original messages
+                    tool_name = "unknown"
+                    for msg in messages:
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                if tc.id == tool_call_id:
+                                    tool_name = tc.function.name if tc.function else "unknown"
+                                    break
+                    
+                    orphaned_tool_calls.append({
+                        "message_id": original_msg_id,
+                        "message_index": -1,  # Provider-detected, index not applicable
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "reason": "provider_format_orphan",
+                    })
+                    message_ids_to_remove.add(original_msg_id)
 
         if not orphaned_tool_calls:
             return {

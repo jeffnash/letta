@@ -683,7 +683,12 @@ class LettaAgentV3(LettaAgentV2):
                                 # For OpenAI, we control parallel tool calling via parallel_tool_calls field
                                 # Only allow parallel tool calls when no tool rules and enabled in config
                                 if "parallel_tool_calls" in request_data:
-                                    if no_tool_rules and self.agent_state.llm_config.parallel_tool_calls:
+                                    # Anthropic-backed proxies (like CLIProxy routing to Claude) require
+                                    # immediate tool_result for each tool_use. Force parallel_tool_calls=False.
+                                    from letta.llm_api.openai_client import is_anthropic_backed_proxy
+                                    if is_anthropic_backed_proxy(self.agent_state.llm_config):
+                                        request_data["parallel_tool_calls"] = False
+                                    elif no_tool_rules and self.agent_state.llm_config.parallel_tool_calls:
                                         request_data["parallel_tool_calls"] = True
                                     else:
                                         request_data["parallel_tool_calls"] = False

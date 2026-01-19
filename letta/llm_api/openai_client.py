@@ -100,6 +100,212 @@ def is_openai_5_model(model: str) -> bool:
     return model.startswith("gpt-5")
 
 
+def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[dict]:
+    """Validate that every tool_call has a matching tool response message.
+
+    If orphaned tool_calls are found (tool_call without corresponding tool response),
+    inject synthetic tool response messages to satisfy API requirements.
+
+    This handles edge cases where agent state was saved after a tool_call but before
+    the tool response was recorded (e.g., server crash, timeout, client disconnect).
+
+    This is the OpenAI-format equivalent of validate_and_repair_tool_use_pairing
+    in anthropic_client.py. It's needed when using OpenAI-compatible proxies that
+    route to Anthropic or other providers that require tool_use/tool_result pairing.
+
+    OpenAI format:
+    - Assistant messages have 'tool_calls' array with objects containing 'id', 'function'
+    - Tool responses are separate messages with role='tool' and 'tool_call_id'
+
+    Anthropic format (what proxies may convert to):
+    - Assistant messages have content blocks with type='tool_use', 'id', 'name', 'input'
+    - Tool results are in user messages as content blocks with type='tool_result', 'tool_use_id'
+    """
+    if not messages or len(messages) < 1:
+        return messages
+
+    repaired_messages = []
+    orphaned_count = 0
+    repaired_tool_ids: list[str] = []
+
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        repaired_messages.append(msg)
+
+        # Only check assistant messages with tool_calls
+        if msg.get("role") != "assistant":
+            i += 1
+            continue
+
+        tool_calls = msg.get("tool_calls")
+        if not tool_calls or not isinstance(tool_calls, list):
+            i += 1
+            continue
+
+        # Extract tool_call ids from this assistant message
+        tool_call_ids = set()
+        tool_call_by_id = {}
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                tc_id = tc.get("id")
+                if tc_id:
+                    tool_call_ids.add(tc_id)
+                    tool_call_by_id[tc_id] = tc
+
+        if not tool_call_ids:
+            i += 1
+            continue
+
+        # Look for corresponding tool responses in the following messages
+        # In OpenAI format, each tool response is a separate message with role='tool'
+        # We stop scanning when we hit ANY non-tool role (system, developer, assistant, user, or unknown)
+        # because those represent message boundaries where tool responses should not appear after.
+        found_results = set()
+        j = i + 1
+        boundary_position = None  # Track where we should insert synthetic responses
+        while j < len(messages):
+            next_msg = messages[j]
+            next_role = next_msg.get("role")
+            if next_role == "tool":
+                tc_id = next_msg.get("tool_call_id")
+                if tc_id in tool_call_ids:
+                    found_results.add(tc_id)
+                j += 1
+            else:
+                # Stop scanning when we hit ANY non-tool message (system, developer, assistant, user, or unknown)
+                # This ensures orphaned tool calls are detected even when system/developer messages appear
+                # between the tool call and its expected tool response.
+                boundary_position = j
+                break
+
+        missing_ids = tool_call_ids - found_results
+        if missing_ids:
+            # Insert synthetic tool responses for missing tool_call_ids
+            # These need to be inserted right after the current assistant message
+            # but before any boundary message (system, developer, assistant, user)
+            insert_position = len(repaired_messages)
+            for tid in sorted(missing_ids):
+                tc = tool_call_by_id.get(tid, {})
+                func = tc.get("function", {}) if isinstance(tc, dict) else {}
+                tool_name = func.get("name", "unknown") if isinstance(func, dict) else "unknown"
+
+                synthetic_response = {
+                    "role": "tool",
+                    "tool_call_id": tid,
+                    "content": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                }
+                repaired_messages.insert(insert_position, synthetic_response)
+                insert_position += 1
+                orphaned_count += 1
+                repaired_tool_ids.append(tid)
+
+                logger.warning(
+                    f"[OpenAI] Injected synthetic tool response for orphaned tool_call_id={tid} (tool={tool_name})"
+                )
+
+        i += 1
+
+    if orphaned_count > 0:
+        logger.error(
+            f"[OpenAI] Repaired {orphaned_count} orphaned tool_calls by injecting synthetic responses: {repaired_tool_ids}"
+        )
+
+    return repaired_messages
+
+
+def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict]) -> List[dict]:
+    """Validate that every function_call has a matching function_call_output in the Responses API format.
+
+    If orphaned function_calls are found, inject synthetic function_call_output items.
+
+    OpenAI Responses API format:
+    - function_call items have 'type': 'function_call', 'call_id', 'name', 'arguments'
+    - function_call_output items have 'type': 'function_call_output', 'call_id', 'output'
+    """
+    if not input_items or len(input_items) < 1:
+        return input_items
+
+    repaired_items = []
+    orphaned_count = 0
+    repaired_call_ids: list[str] = []
+
+    # First, collect all function_call_output call_ids in the input
+    existing_outputs = set()
+    for item in input_items:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            call_id = item.get("call_id")
+            if call_id:
+                existing_outputs.add(call_id)
+
+    # Process items and inject synthetic outputs for orphaned function_calls
+    for item in input_items:
+        repaired_items.append(item)
+
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+
+        call_id = item.get("call_id")
+        if not call_id:
+            continue
+
+        # Check if there's a corresponding function_call_output
+        if call_id not in existing_outputs:
+            tool_name = item.get("name", "unknown")
+            synthetic_output = {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+            }
+            repaired_items.append(synthetic_output)
+            orphaned_count += 1
+            repaired_call_ids.append(call_id)
+            # Add to existing_outputs to avoid duplicate injections
+            existing_outputs.add(call_id)
+
+            logger.warning(
+                f"[OpenAI Responses] Injected synthetic function_call_output for orphaned call_id={call_id} (tool={tool_name})"
+            )
+
+    if orphaned_count > 0:
+        logger.error(
+            f"[OpenAI Responses] Repaired {orphaned_count} orphaned function_calls by injecting synthetic outputs: {repaired_call_ids}"
+        )
+
+    return repaired_items
+
+
+def is_anthropic_backed_proxy(llm_config: LLMConfig) -> bool:
+    """Check if the LLM config points to an Anthropic-backed proxy like CLIProxy.
+
+    Anthropic-backed proxies (e.g., CLIProxy routing to Claude models) require
+    immediate tool_result for each tool_use and don't support parallel tool calls.
+    This helper inspects the LLMConfig to detect such proxies.
+
+    Detection criteria:
+    - provider_name is 'cliproxy'
+    - model handle contains anthropic model identifiers (claude, opus, sonnet, haiku)
+
+    Args:
+        llm_config: The LLM configuration to inspect.
+
+    Returns:
+        True if the config points to an Anthropic-backed proxy, False otherwise.
+    """
+    if llm_config.provider_name == "cliproxy":
+        # CLIProxy can route to multiple backends, check if it's routing to Anthropic
+        model_lower = (llm_config.model or "").lower()
+        handle_lower = (llm_config.handle or "").lower()
+
+        # Check for Anthropic model identifiers in model name or handle
+        anthropic_identifiers = ["claude", "opus", "sonnet", "haiku"]
+        for identifier in anthropic_identifiers:
+            if identifier in model_lower or identifier in handle_lower:
+                return True
+
+    return False
+
+
 def supports_verbosity_control(model: str) -> bool:
     """Check if the model supports verbosity control, currently only GPT-5 models support this"""
     return is_openai_5_model(model)
@@ -457,6 +663,14 @@ class OpenAIClient(LLMClientBase):
             data.model = "memgpt-openai"
 
         request_data = data.model_dump(exclude_unset=True)
+
+        # Validate and repair orphaned function_calls that don't have corresponding function_call_output items.
+        # This can happen when agent state is saved after tool_call but before tool response (e.g., crash, timeout).
+        # This is especially important for OpenAI-compatible proxies (like CLIProxy) that route to Anthropic,
+        # which requires every tool_use to have a tool_result in the immediately following user message.
+        if "input" in request_data and isinstance(request_data["input"], list):
+            request_data["input"] = validate_and_repair_responses_api_tool_call_pairing(request_data["input"])
+
         # print("responses request data", request_data)
         return request_data
 
@@ -628,6 +842,14 @@ class OpenAIClient(LLMClientBase):
                     except ValueError as e:
                         logger.warning(f"Failed to convert tool function to structured output, tool={tool}, error={e}")
         request_data = data.model_dump(exclude_unset=True)
+
+        # Validate and repair orphaned tool_calls that don't have corresponding tool responses.
+        # This can happen when agent state is saved after tool_call but before tool response
+        # (e.g., server crash, timeout, client disconnect). This is especially important for
+        # OpenAI-compatible proxies (like CLIProxy) that route to Anthropic, which requires
+        # every tool_use to have a tool_result in the immediately following user message.
+        if "messages" in request_data and isinstance(request_data["messages"], list):
+            request_data["messages"] = validate_and_repair_openai_tool_call_pairing(request_data["messages"])
 
         # If Ollama
         # if llm_config.handle.startswith("ollama/") and llm_config.enable_reasoner:

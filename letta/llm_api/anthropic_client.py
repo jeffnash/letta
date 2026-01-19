@@ -499,9 +499,10 @@ class AnthropicClient(LLMClientBase):
         # produce multiple tool_result blocks with the same id; consolidate them here.
         data["messages"] = dedupe_tool_results_in_user_messages(data["messages"])
 
-        # Validate and repair orphaned tool_use blocks that don't have corresponding tool_result blocks.
-        # This can happen when agent state is saved after tool_use but before tool_result (e.g., crash, timeout).
-        # Anthropic requires every tool_use to have a tool_result in the immediately following user message.
+        # Validate and repair orphaned tool_use blocks that don't have corresponding tool_result.
+        # This can happen when agent state is saved after tool_use but before tool_result
+        # (e.g., server crash, timeout, client disconnect). Anthropic requires every tool_use
+        # to have a tool_result in the immediately following user message, or 400 errors occur.
         data["messages"] = validate_and_repair_tool_use_pairing(data["messages"])
 
         # Add cache control to final message for incremental conversation caching
