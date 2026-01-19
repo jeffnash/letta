@@ -555,6 +555,7 @@ class TestIsAnthropicBackedProxy:
             model="claude-sonnet-4-20250514",
             model_endpoint_type="openai",
             provider_name="cliproxy",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
@@ -567,6 +568,7 @@ class TestIsAnthropicBackedProxy:
             model="opus-4.5",
             model_endpoint_type="openai",
             provider_name="cliproxy",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
@@ -579,6 +581,7 @@ class TestIsAnthropicBackedProxy:
             model="sonnet-4-20250514",
             model_endpoint_type="openai",
             provider_name="cliproxy",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
@@ -591,6 +594,7 @@ class TestIsAnthropicBackedProxy:
             model="haiku-3.5",
             model_endpoint_type="openai",
             provider_name="cliproxy",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
@@ -604,6 +608,7 @@ class TestIsAnthropicBackedProxy:
             model_endpoint_type="openai",
             provider_name="cliproxy",
             handle="cliproxy/claude-sonnet-4",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
@@ -616,6 +621,7 @@ class TestIsAnthropicBackedProxy:
             model="gpt-5.2-medium",
             model_endpoint_type="openai",
             provider_name="cliproxy",
+            context_window=272000,
         )
         assert is_anthropic_backed_proxy(llm_config) is False
 
@@ -628,6 +634,7 @@ class TestIsAnthropicBackedProxy:
             model="gpt-4o",
             model_endpoint_type="openai",
             provider_name="openai",
+            context_window=128000,
         )
         assert is_anthropic_backed_proxy(llm_config) is False
 
@@ -640,6 +647,7 @@ class TestIsAnthropicBackedProxy:
             model="claude-sonnet-4",
             model_endpoint_type="anthropic",
             provider_name="anthropic",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is False
 
@@ -651,6 +659,7 @@ class TestIsAnthropicBackedProxy:
         llm_config = LLMConfig(
             model="gpt-4o",
             model_endpoint_type="openai",
+            context_window=128000,
         )
         # provider_name defaults to None
         assert is_anthropic_backed_proxy(llm_config) is False
@@ -665,6 +674,7 @@ class TestIsAnthropicBackedProxy:
             model_endpoint_type="openai",
             provider_name="cliproxy",
             handle="cliproxy/claude-haiku-3",
+            context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
 
