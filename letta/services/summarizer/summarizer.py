@@ -199,6 +199,8 @@ class Summarizer:
             llm_config=agent_state.llm_config,
             actor=self.actor,
             include_ack=True,
+            agent_id=self.agent_id,
+            agent_tags=agent_state.tags,
         )
 
         # TODO add counts back
@@ -291,6 +293,17 @@ class Summarizer:
         while target_trim_index < len(all_in_context_messages) and all_in_context_messages[target_trim_index].role != MessageRole.user:
             target_trim_index += 1
 
+        # If the first retained message is an approval request, also keep the assistant message before it
+        # (they're part of the same LLM response - assistant has reasoning/tool_calls, approval has approval-required subset)
+        if target_trim_index < len(all_in_context_messages):
+            first_retained = all_in_context_messages[target_trim_index]
+            if first_retained.role == MessageRole.approval and target_trim_index > 1:
+                # Check if the message before it is an assistant from the same step
+                prev_message = all_in_context_messages[target_trim_index - 1]
+                if prev_message.role == MessageRole.assistant and prev_message.step_id == first_retained.step_id:
+                    # Back up to include the assistant message with reasoning
+                    target_trim_index -= 1
+
         evicted_messages = all_in_context_messages[1:target_trim_index]  # everything except sys msg
         updated_in_context_messages = all_in_context_messages[target_trim_index:]  # may be empty
 
@@ -345,7 +358,7 @@ def simple_formatter(
         [message for message in messages if message.role != MessageRole.system or include_system],
         tool_return_truncation_chars=tool_return_truncation_chars,
     )
-    return "\n".join(json.dumps(msg) for msg in parsed_messages)
+    return "<start_transcript>\n" + "\n".join(json.dumps(msg) for msg in parsed_messages) + "\n<end_transcript>\n. Generate the summary."
 
 
 def middle_truncate_text(
@@ -558,11 +571,16 @@ async def simple_summary(
     actor: User,
     include_ack: bool = True,
     prompt: str | None = None,
+    telemetry_manager: "TelemetryManager | None" = None,
+    agent_id: str | None = None,
+    agent_tags: List[str] | None = None,
+    run_id: str | None = None,
 ) -> str:
     """Generate a simple summary from a list of messages.
 
     Intentionally kept functional due to the simplicity of the prompt.
     """
+    from letta.services.telemetry_manager import TelemetryManager
 
     # Create an LLMClient from the config
     llm_client = LLMClient.create(
@@ -571,6 +589,16 @@ async def simple_summary(
         actor=actor,
     )
     assert llm_client is not None
+
+    # Always set telemetry context - create TelemetryManager if not provided
+    tm = telemetry_manager or TelemetryManager()
+    llm_client.set_telemetry_context(
+        telemetry_manager=tm,
+        agent_id=agent_id,
+        agent_tags=agent_tags,
+        run_id=run_id,
+        call_type="summarization",
+    )
 
     # Prepare the messages payload to send to the LLM
     system_prompt = prompt or gpt_summarize.SYSTEM
@@ -611,7 +639,81 @@ async def simple_summary(
             {"role": "user", "content": summary_transcript},
         ]
     input_messages_obj = [simple_message_wrapper(msg) for msg in input_messages]
-    summarizer_llm_config = _summarizer_llm_config(llm_config)
+    # Build a local LLMConfig for v1-style summarization which uses native content and must not
+    # include inner thoughts in kwargs to avoid conflicts in Anthropic formatting.
+    # We also disable enable_reasoner to avoid extended thinking requirements (Anthropic requires
+    # assistant messages to start with thinking blocks when extended thinking is enabled).
+    summarizer_llm_config = LLMConfig(**llm_config.model_dump())
+    summarizer_llm_config.put_inner_thoughts_in_kwargs = False
+    summarizer_llm_config.enable_reasoner = False
+
+    async def _run_summarizer_request(req_data: dict, req_messages_obj: list[Message]) -> str:
+        """Run summarization request and return assistant text.
+
+        For Anthropic, use provider-side streaming to avoid long-request failures
+        (Anthropic requires streaming for requests that may exceed ~10 minutes).
+        """
+
+        if summarizer_llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
+            logger.info(
+                "Summarizer: using provider streaming (%s/%s) to avoid long-request failures",
+                summarizer_llm_config.model_endpoint_type,
+                summarizer_llm_config.model,
+            )
+            # Stream from provider and accumulate the final assistant text.
+            from letta.interfaces.anthropic_parallel_tool_call_streaming_interface import (
+                SimpleAnthropicStreamingInterface,
+            )
+
+            interface = SimpleAnthropicStreamingInterface(
+                requires_approval_tools=[],
+                run_id=None,
+                step_id=None,
+            )
+
+            # AnthropicClient.stream_async sets request_data["stream"] = True internally.
+            stream = await llm_client.stream_async_with_telemetry(req_data, summarizer_llm_config)
+            async for _chunk in interface.process(stream):
+                # We don't emit anything; we just want the fully-accumulated content.
+                pass
+
+            content_parts = interface.get_content()
+            text = "".join(part.text for part in content_parts if isinstance(part, TextContent)).strip()
+
+            # Log telemetry after stream processing
+            await llm_client.log_provider_trace_async(
+                request_data=req_data,
+                response_json={
+                    "content": text,
+                    "model": summarizer_llm_config.model,
+                    "usage": {
+                        "input_tokens": getattr(interface, "input_tokens", None),
+                        "output_tokens": getattr(interface, "output_tokens", None),
+                    },
+                },
+            )
+
+            if not text:
+                logger.warning("No content returned from summarizer (streaming path)")
+                raise Exception("Summary failed to generate")
+            return text
+
+        # Default: non-streaming provider request, then normalize via chat-completions conversion.
+        logger.debug(
+            "Summarizer: using non-streaming request (%s/%s)",
+            summarizer_llm_config.model_endpoint_type,
+            summarizer_llm_config.model,
+        )
+        response_data = await llm_client.request_async_with_telemetry(req_data, summarizer_llm_config)
+        response = await llm_client.convert_response_to_chat_completion(
+            response_data,
+            req_messages_obj,
+            summarizer_llm_config,
+        )
+        if response.choices[0].message.content is None:
+            logger.warning("No content returned from summarizer")
+            raise Exception("Summary failed to generate")
+        return response.choices[0].message.content.strip()
 
     request_data = llm_client.build_request_data(AgentType.letta_v1_agent, input_messages_obj, summarizer_llm_config, tools=[])
 
@@ -759,6 +861,7 @@ async def simple_summary(
                         raise llm_client.handle_llm_error(fallback_error_b)
 
     logger.info(f"Summarized {len(messages)}: {summary}")
+
     return summary
 
 

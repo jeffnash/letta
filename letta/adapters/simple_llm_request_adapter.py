@@ -38,9 +38,17 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
         # Store request data
         self.request_data = request_data
 
-        # Make the blocking LLM request
+        # Set telemetry context and make the blocking LLM request
+        self.llm_client.set_telemetry_context(
+            telemetry_manager=self.telemetry_manager,
+            step_id=step_id,
+            agent_id=self.agent_id,
+            agent_tags=self.agent_tags,
+            run_id=self.run_id,
+            call_type="agent_step",
+        )
         try:
-            self.response_data = await self.llm_client.request_async(request_data, self.llm_config)
+            self.response_data = await self.llm_client.request_async_with_telemetry(request_data, self.llm_config)
         except Exception as e:
             raise self.llm_client.handle_llm_error(e)
 
@@ -93,7 +101,7 @@ class SimpleLLMRequestAdapter(LettaLLMRequestAdapter):
         self.usage.cached_input_tokens, self.usage.cache_write_tokens = normalize_cache_tokens(usage.prompt_tokens_details)
         self.usage.reasoning_tokens = normalize_reasoning_tokens(usage.completion_tokens_details)
 
-        self.log_provider_trace(step_id=step_id, actor=actor)
+        # Note: telemetry is already logged by request_async_with_telemetry(), so no need to call log_provider_trace() here
 
         yield None
         return

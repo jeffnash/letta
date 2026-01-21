@@ -5,6 +5,7 @@ from .azure import AzureProvider
 from .base import Provider, ProviderBase, ProviderCheck, ProviderCreate, ProviderUpdate
 from .bedrock import BedrockProvider
 from .cerebras import CerebrasProvider
+from .chatgpt_oauth import ChatGPTOAuthProvider
 from .cliproxy import CLIProxyProvider
 from .deepseek import DeepSeekProvider
 from .google_gemini import GoogleAIProvider
@@ -33,7 +34,8 @@ __all__ = [
     "AzureProvider",
     "BedrockProvider",
     "CerebrasProvider",
-    "CLIProxyProvider",  # NEW
+    "ChatGPTOAuthProvider",
+    "CLIProxyProvider",
     "DeepSeekProvider",
     "GoogleAIProvider",
     "GoogleVertexProvider",

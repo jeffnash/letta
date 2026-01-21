@@ -184,6 +184,7 @@ class Provider(ProviderBase):
             AzureProvider,
             BedrockProvider,
             CerebrasProvider,
+            ChatGPTOAuthProvider,
             CLIProxyProvider,
             DeepSeekProvider,
             GoogleAIProvider,
@@ -230,6 +231,8 @@ class Provider(ProviderBase):
                 return DeepSeekProvider(**self.model_dump(exclude_none=True))
             case ProviderType.cerebras:
                 return CerebrasProvider(**self.model_dump(exclude_none=True))
+            case ProviderType.chatgpt_oauth:
+                return ChatGPTOAuthProvider(**self.model_dump(exclude_none=True))
             case ProviderType.xai:
                 return XAIProvider(**self.model_dump(exclude_none=True))
             case ProviderType.zai:
