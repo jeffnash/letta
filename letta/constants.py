@@ -454,7 +454,7 @@ REDIS_RUN_ID_PREFIX = "agent:send_message:run_id"
 
 # Conversation lock constants
 CONVERSATION_LOCK_PREFIX = "conversation:lock:"
-CONVERSATION_LOCK_TTL_SECONDS = 300  # 5 minutes
+CONVERSATION_LOCK_TTL_SECONDS = 30  # 30 seconds (reduced from 5 minutes for faster recovery from orphaned locks)
 
 # TODO: This is temporary, eventually use token-based eviction
 # File based controls

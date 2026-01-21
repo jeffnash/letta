@@ -1486,25 +1486,54 @@ def dedupe_tool_results_in_user_messages(messages: List[dict]) -> List[dict]:
 
 
 def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
-    """Validate that every tool_use block has a matching tool_result in the next user message.
+    """Validate and repair tool_use/tool_result pairing issues in Anthropic-format messages.
 
-    If orphaned tool_use blocks are found (tool_use without corresponding tool_result),
-    inject synthetic tool_result blocks to satisfy Anthropic's API requirements.
+    This function handles TWO types of orphaned tool messages:
 
-    This handles edge cases where agent state was saved after a tool_use but before
-    the tool_result was recorded (e.g., server crash, timeout, client disconnect).
+    1. Orphaned tool_use (FIRST PASS): Assistant messages with tool_use blocks that have no
+       corresponding tool_result in the following user message. These are repaired by
+       injecting synthetic tool_result blocks. This can happen when agent state was saved
+       after a tool_use but before the tool_result was recorded (e.g., server crash, timeout).
+
+    2. Orphaned tool_results (SECOND PASS): tool_result blocks in user messages that
+       reference tool_use_ids which don't exist in any assistant message. These blocks
+       are removed from the user message content. This can happen when summarization
+       deletes assistant messages containing tool_use but leaves the corresponding
+       tool_result blocks behind.
 
     The Anthropic API requires:
     - Every tool_use block in an assistant message MUST have a corresponding tool_result
       in the immediately following user message
     - Missing tool_results cause 400 errors: "tool_use ids were found without tool_result blocks"
+    - Extra tool_results (orphaned) cause 400 errors:
+      "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx.
+       Each `tool_result` block must have a corresponding `tool_use` block in the previous message."
     """
     if not messages or len(messages) < 1:
         return messages
 
+    # ==========================================================================
+    # FIRST PASS: Collect all valid tool_use_ids from assistant messages
+    # ==========================================================================
+    # We need this set to identify orphaned tool_results in the second pass.
+    # A tool_use_id is "valid" if it appears in an assistant message's content blocks.
+    all_valid_tool_use_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_use_id = block.get("id")
+                        if tool_use_id:
+                            all_valid_tool_use_ids.add(tool_use_id)
+
+    # ==========================================================================
+    # SECOND PASS: Inject synthetic tool_results for orphaned tool_use blocks
+    # ==========================================================================
     repaired_messages = []
-    orphaned_count = 0
-    repaired_tool_ids: list[str] = []
+    orphaned_tool_use_count = 0
+    repaired_tool_use_ids: list[str] = []
 
     i = 0
     while i < len(messages):
@@ -1548,8 +1577,10 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
                 for tid in sorted(tool_use_ids)
             ]
             repaired_messages.append({"role": "user", "content": synthetic_results})
-            orphaned_count += len(tool_use_ids)
-            repaired_tool_ids.extend(sorted(tool_use_ids))
+            orphaned_tool_use_count += len(tool_use_ids)
+            repaired_tool_use_ids.extend(sorted(tool_use_ids))
+            # Add synthetic tool_use_ids to valid set so third pass doesn't remove them
+            all_valid_tool_use_ids.update(tool_use_ids)
             i += 1
             continue
 
@@ -1566,8 +1597,10 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
                 for tid in sorted(tool_use_ids)
             ]
             repaired_messages.append({"role": "user", "content": synthetic_results})
-            orphaned_count += len(tool_use_ids)
-            repaired_tool_ids.extend(sorted(tool_use_ids))
+            orphaned_tool_use_count += len(tool_use_ids)
+            repaired_tool_use_ids.extend(sorted(tool_use_ids))
+            # Add synthetic tool_use_ids to valid set so third pass doesn't remove them
+            all_valid_tool_use_ids.update(tool_use_ids)
             i += 1
             continue
 
@@ -1597,19 +1630,72 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
             ]
             # Prepend synthetic results to the next message's content
             messages[next_idx]["content"] = synthetic_results + list(next_content)
-            orphaned_count += len(missing_ids)
-            repaired_tool_ids.extend(sorted(missing_ids))
+            orphaned_tool_use_count += len(missing_ids)
+            repaired_tool_use_ids.extend(sorted(missing_ids))
+            # Add synthetic tool_use_ids to valid set so third pass doesn't remove them
+            all_valid_tool_use_ids.update(missing_ids)
 
         i += 1
 
-    if orphaned_count > 0:
+    if orphaned_tool_use_count > 0:
         logger.error(
             "[Anthropic] Repaired %d orphaned tool_use block(s) by injecting synthetic tool_result(s): %s",
-            orphaned_count,
-            repaired_tool_ids,
+            orphaned_tool_use_count,
+            repaired_tool_use_ids,
         )
 
-    return repaired_messages
+    # ==========================================================================
+    # THIRD PASS: Remove orphaned tool_results from user messages
+    # ==========================================================================
+    # This handles the case where summarization deleted assistant messages containing
+    # tool_use blocks but left behind the corresponding tool_result blocks in user messages.
+    # These cause Anthropic API errors like:
+    #   "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx"
+    orphaned_tool_result_count = 0
+    removed_tool_result_ids: list[str] = []
+    final_messages = []
+
+    for msg in repaired_messages:
+        if msg.get("role") == "user":
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                # Filter out orphaned tool_result blocks
+                filtered_content = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_use_id = block.get("tool_use_id")
+                        if tool_use_id and tool_use_id not in all_valid_tool_use_ids:
+                            # This tool_result references a tool_use_id that doesn't exist
+                            # in any assistant message - it's orphaned and must be removed
+                            orphaned_tool_result_count += 1
+                            removed_tool_result_ids.append(tool_use_id)
+                            logger.warning(
+                                f"[Anthropic] Removing orphaned tool_result with tool_use_id={tool_use_id} "
+                                "(no matching tool_use in any assistant message)"
+                            )
+                            continue  # Skip adding this block to filtered_content
+                    filtered_content.append(block)
+
+                # Update message content if we removed any blocks
+                if len(filtered_content) != len(content):
+                    msg = dict(msg)  # Create a copy to avoid mutating the original
+                    if filtered_content:
+                        msg["content"] = filtered_content
+                    else:
+                        # If all content was removed, add a placeholder text block
+                        # (Anthropic requires non-empty content for user messages)
+                        msg["content"] = [{"type": "text", "text": "[Previous tool results removed - tool calls no longer in context]"}]
+
+        final_messages.append(msg)
+
+    if orphaned_tool_result_count > 0:
+        logger.error(
+            "[Anthropic] Removed %d orphaned tool_result block(s) (tool results without matching tool_use): %s",
+            orphaned_tool_result_count,
+            removed_tool_result_ids,
+        )
+
+    return final_messages
 
 
 def remap_finish_reason(stop_reason: str) -> str:

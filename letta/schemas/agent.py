@@ -198,6 +198,66 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
 
         return self
 
+    def get_block(self, label: str) -> Block:
+        """Get a block by label from this agent's blocks.
+
+        This is the preferred method to access blocks - avoids the deprecated `memory` field.
+
+        Args:
+            label: The label of the block to retrieve.
+
+        Returns:
+            The Block with the matching label.
+
+        Raises:
+            KeyError: If no block with the given label exists.
+        """
+        for block in self.blocks:
+            if block.label == label:
+                return block
+        available_labels = [b.label for b in self.blocks]
+        raise KeyError(f"Block field {label} does not exist (available sections = {', '.join(available_labels)})")
+
+    def update_block_value(self, label: str, value: str) -> None:
+        """Update the value of a block by label.
+
+        This is the preferred method to update blocks - avoids the deprecated `memory` field.
+        Note: This updates the in-memory representation only. To persist changes, use
+        agent_manager.update_memory_if_changed_async() or block_manager.update_block_async().
+
+        This method updates both `self.blocks` and `self.memory.blocks` to keep them in sync,
+        ensuring that code passing `agent_state.memory` to persistence functions gets the
+        updated values.
+
+        Args:
+            label: The label of the block to update.
+            value: The new value for the block.
+
+        Raises:
+            ValueError: If value is not a string or no block with the given label exists.
+        """
+        if not isinstance(value, str):
+            raise ValueError("Provided value must be a string")
+
+        # Update in self.blocks
+        block_found = False
+        for block in self.blocks:
+            if block.label == label:
+                block.value = value
+                block_found = True
+                break
+
+        if not block_found:
+            raise ValueError(f"Block with label {label} does not exist")
+
+        # Also update in self.memory.blocks to keep them in sync
+        # This ensures code that passes agent_state.memory to persistence functions
+        # gets the updated values
+        for block in self.memory.blocks:
+            if block.label == label:
+                block.value = value
+                break
+
 
 class CreateAgent(BaseModel, validate_assignment=True):  #
     # all optional as server can generate defaults

@@ -101,13 +101,19 @@ def is_openai_5_model(model: str) -> bool:
 
 
 def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[dict]:
-    """Validate that every tool_call has a matching tool response message.
+    """Validate and repair tool_call/tool_result pairing issues in OpenAI-format messages.
 
-    If orphaned tool_calls are found (tool_call without corresponding tool response),
-    inject synthetic tool response messages to satisfy API requirements.
+    This function handles TWO types of orphaned tool messages:
 
-    This handles edge cases where agent state was saved after a tool_call but before
-    the tool response was recorded (e.g., server crash, timeout, client disconnect).
+    1. Orphaned tool_calls (FIRST PASS): Assistant messages with tool_calls that have no
+       corresponding tool response. These are repaired by injecting synthetic tool responses.
+       This can happen when agent state was saved after a tool_call but before the tool
+       response was recorded (e.g., server crash, timeout, client disconnect).
+
+    2. Orphaned tool_results (SECOND PASS): Tool response messages (role='tool') that
+       reference tool_call_ids which don't exist in any assistant message. These are
+       removed entirely. This can happen when summarization deletes assistant messages
+       containing tool_calls but leaves the corresponding tool response messages behind.
 
     This is the OpenAI-format equivalent of validate_and_repair_tool_use_pairing
     in anthropic_client.py. It's needed when using OpenAI-compatible proxies that
@@ -120,13 +126,37 @@ def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[d
     Anthropic format (what proxies may convert to):
     - Assistant messages have content blocks with type='tool_use', 'id', 'name', 'input'
     - Tool results are in user messages as content blocks with type='tool_result', 'tool_use_id'
+
+    The Anthropic API error for orphaned tool_results:
+        "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx.
+         Each `tool_result` block must have a corresponding `tool_use` block
+         in the previous message."
     """
     if not messages or len(messages) < 1:
         return messages
 
+    # ==========================================================================
+    # FIRST PASS: Collect all valid tool_call_ids from assistant messages
+    # ==========================================================================
+    # We need this set to identify orphaned tool_results in the second pass.
+    # A tool_call_id is "valid" if it appears in an assistant message's tool_calls.
+    all_valid_tool_call_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_id = tc.get("id")
+                        if tc_id:
+                            all_valid_tool_call_ids.add(tc_id)
+
+    # ==========================================================================
+    # SECOND PASS: Inject synthetic tool responses for orphaned tool_calls
+    # ==========================================================================
     repaired_messages = []
-    orphaned_count = 0
-    repaired_tool_ids: list[str] = []
+    orphaned_tool_call_count = 0
+    repaired_tool_call_ids: list[str] = []
 
     i = 0
     while i < len(messages):
@@ -197,8 +227,11 @@ def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[d
                 }
                 repaired_messages.insert(insert_position, synthetic_response)
                 insert_position += 1
-                orphaned_count += 1
-                repaired_tool_ids.append(tid)
+                orphaned_tool_call_count += 1
+                repaired_tool_call_ids.append(tid)
+
+                # Also add this synthetic tool_call_id to valid set so third pass doesn't remove it
+                all_valid_tool_call_ids.add(tid)
 
                 logger.warning(
                     f"[OpenAI] Injected synthetic tool response for orphaned tool_call_id={tid} (tool={tool_name})"
@@ -206,12 +239,42 @@ def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[d
 
         i += 1
 
-    if orphaned_count > 0:
+    if orphaned_tool_call_count > 0:
         logger.error(
-            f"[OpenAI] Repaired {orphaned_count} orphaned tool_calls by injecting synthetic responses: {repaired_tool_ids}"
+            f"[OpenAI] Repaired {orphaned_tool_call_count} orphaned tool_calls by injecting synthetic responses: {repaired_tool_call_ids}"
         )
 
-    return repaired_messages
+    # ==========================================================================
+    # THIRD PASS: Remove orphaned tool_results (tool responses without matching tool_calls)
+    # ==========================================================================
+    # This handles the case where summarization deleted assistant messages containing
+    # tool_calls but left behind the corresponding tool response messages.
+    # These cause Anthropic API errors like:
+    #   "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx"
+    orphaned_tool_result_count = 0
+    removed_tool_result_ids: list[str] = []
+    final_messages = []
+
+    for msg in repaired_messages:
+        if msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id")
+            if tc_id and tc_id not in all_valid_tool_call_ids:
+                # This tool response references a tool_call_id that doesn't exist
+                # in any assistant message - it's orphaned and must be removed
+                orphaned_tool_result_count += 1
+                removed_tool_result_ids.append(tc_id)
+                logger.warning(
+                    f"[OpenAI] Removing orphaned tool_result with tool_call_id={tc_id} (no matching tool_call in any assistant message)"
+                )
+                continue  # Skip adding this message to final_messages
+        final_messages.append(msg)
+
+    if orphaned_tool_result_count > 0:
+        logger.error(
+            f"[OpenAI] Removed {orphaned_tool_result_count} orphaned tool_results (tool responses without matching tool_calls): {removed_tool_result_ids}"
+        )
+
+    return final_messages
 
 
 def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict]) -> List[dict]:

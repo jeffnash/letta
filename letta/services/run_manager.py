@@ -654,7 +654,7 @@ class RunManager:
         # NOTE: this should update the agent's last stop reason to cancelled
         run = await self.update_run_by_id_async(
             run_id=run_id,
-            update=RunUpdate(status=RunStatus.cancelled, stop_reason=StopReasonType.cancelled),
+            update=RunUpdate(status=RunStatus.cancelled, stop_reason=StopReasonType.cancelled, completed_at=get_utc_time().replace(tzinfo=None)),
             actor=actor,
             conversation_id=run.conversation_id,
         )

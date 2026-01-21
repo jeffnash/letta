@@ -59,8 +59,9 @@ async def test_letta_agent_v3_step_recovers_from_context_window_exceeded():
     agent._update_global_usage_stats = MagicMock()
     
     # Mock compact() to return a dummy summary message and updated message list
+    # compact() returns (summary_message_obj, final_messages, summary_str)
     summary_msg = Message(role=MessageRole.user, content=[TextContent(text="Summary")])
-    agent.compact = AsyncMock(return_value=(summary_msg, [summary_msg]))
+    agent.compact = AsyncMock(return_value=(summary_msg, [summary_msg], "Summary text"))
     
     # Mock _handle_ai_response
     agent._handle_ai_response = AsyncMock(return_value=([], False, LettaStopReason(stop_reason="end_turn")))

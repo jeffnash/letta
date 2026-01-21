@@ -318,11 +318,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         return None
 
     async def core_memory_append(self, agent_state: AgentState, actor: User, label: str, content: str) -> Optional[str]:
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
-        current_value = str(agent_state.memory.get_block(label).value)
+        current_value = str(agent_state.get_block(label).value)
         new_value = current_value + "\n" + str(content)
-        agent_state.memory.update_block_value(label=label, value=new_value)
+        agent_state.update_block_value(label=label, value=new_value)
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
         return None
 
@@ -334,18 +334,18 @@ class LettaCoreToolExecutor(ToolExecutor):
         old_content: str,
         new_content: str,
     ) -> Optional[str]:
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
-        current_value = str(agent_state.memory.get_block(label).value)
+        current_value = str(agent_state.get_block(label).value)
         if old_content not in current_value:
             raise ValueError(f"Old content '{old_content}' not found in memory block '{label}'")
         new_value = current_value.replace(str(old_content), str(new_content))
-        agent_state.memory.update_block_value(label=label, value=new_value)
+        agent_state.update_block_value(label=label, value=new_value)
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
         return None
 
     async def memory_replace(self, agent_state: AgentState, actor: User, label: str, old_str: str, new_str: str) -> str:
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
 
         if bool(MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX.search(old_str)):
@@ -369,7 +369,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         old_str = str(old_str).expandtabs()
         new_str = str(new_str).expandtabs()
-        current_value = str(agent_state.memory.get_block(label).value).expandtabs()
+        current_value = str(agent_state.get_block(label).value).expandtabs()
 
         # Check if old_str is unique in the block
         occurences = current_value.count(old_str)
@@ -388,7 +388,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         new_value = current_value.replace(str(old_str), str(new_str))
 
         # Write the new content to the block
-        agent_state.memory.update_block_value(label=label, value=new_value)
+        agent_state.update_block_value(label=label, value=new_value)
 
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
@@ -423,7 +423,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         Returns:
             Success message on clean application; raises ValueError on mismatch/ambiguity.
         """
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
 
         # Guardrails: forbid visual line numbers and warning banners
@@ -434,7 +434,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         if CORE_MEMORY_LINE_NUMBER_WARNING in (patch or ""):
             raise ValueError("Patch contains the line number warning banner, which is not allowed. Provide only the text to edit.")
 
-        current_value = str(agent_state.memory.get_block(label).value).expandtabs()
+        current_value = str(agent_state.get_block(label).value).expandtabs()
         patch = str(patch).expandtabs()
 
         current_lines = current_value.split("\n")
@@ -514,7 +514,7 @@ class LettaCoreToolExecutor(ToolExecutor):
             current_lines = current_lines[:idx] + replacement + current_lines[end:]
 
         new_value = "\n".join(current_lines)
-        agent_state.memory.update_block_value(label=label, value=new_value)
+        agent_state.update_block_value(label=label, value=new_value)
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
         return (
@@ -531,7 +531,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         new_str: str,
         insert_line: int = -1,
     ) -> str:
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
 
         if bool(MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX.search(new_str)):
@@ -547,7 +547,7 @@ class LettaCoreToolExecutor(ToolExecutor):
                 "are for display purposes only)."
             )
 
-        current_value = str(agent_state.memory.get_block(label).value).expandtabs()
+        current_value = str(agent_state.get_block(label).value).expandtabs()
         new_str = str(new_str).expandtabs()
         current_value_lines = current_value.split("\n")
         n_lines = len(current_value_lines)
@@ -577,7 +577,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         snippet = "\n".join(snippet_lines)
 
         # Write into the block
-        agent_state.memory.update_block_value(label=label, value=new_value)
+        agent_state.update_block_value(label=label, value=new_value)
 
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
@@ -597,7 +597,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         return success_msg
 
     async def memory_rethink(self, agent_state: AgentState, actor: User, label: str, new_memory: str) -> str:
-        if agent_state.memory.get_block(label).read_only:
+        if agent_state.get_block(label).read_only:
             raise ValueError(f"{READ_ONLY_BLOCK_EDIT_ERROR}")
 
         if bool(MEMORY_TOOLS_LINE_NUMBER_PREFIX_REGEX.search(new_memory)):
@@ -614,7 +614,7 @@ class LettaCoreToolExecutor(ToolExecutor):
             )
 
         try:
-            agent_state.memory.get_block(label)
+            agent_state.get_block(label)
         except KeyError:
             # Block doesn't exist, create it
             from letta.schemas.block import Block
@@ -622,7 +622,7 @@ class LettaCoreToolExecutor(ToolExecutor):
             new_block = Block(label=label, value=new_memory)
             agent_state.memory.set_block(new_block)
 
-        agent_state.memory.update_block_value(label=label, value=new_memory)
+        agent_state.update_block_value(label=label, value=new_memory)
 
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
@@ -650,7 +650,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         try:
             # Check if memory block exists
-            memory_block = agent_state.memory.get_block(label)
+            memory_block = agent_state.get_block(label)
             if memory_block is None:
                 raise ValueError(f"Error: Memory block '{label}' does not exist")
 
@@ -673,7 +673,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         try:
             # Check if old memory block exists
-            memory_block = agent_state.memory.get_block(label)
+            memory_block = agent_state.get_block(label)
             if memory_block is None:
                 raise ValueError(f"Error: Memory block '{label}' does not exist")
 
@@ -695,7 +695,7 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         try:
             # Check if old memory block exists
-            memory_block = agent_state.memory.get_block(old_label)
+            memory_block = agent_state.get_block(old_label)
             if memory_block is None:
                 raise ValueError(f"Error: Memory block '{old_label}' does not exist")
 
@@ -732,7 +732,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         """Replace text in a memory block."""
         label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
-        memory_block = agent_state.memory.get_block(label)
+        memory_block = agent_state.get_block(label)
         if memory_block is None:
             raise ValueError(f"Error: Memory block '{label}' does not exist")
 
@@ -795,7 +795,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         """Insert text into a memory block at a specific line."""
         label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
 
-        memory_block = agent_state.memory.get_block(label)
+        memory_block = agent_state.get_block(label)
         if memory_block is None:
             raise ValueError(f"Error: Memory block '{label}' does not exist")
 

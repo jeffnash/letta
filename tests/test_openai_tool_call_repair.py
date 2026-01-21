@@ -1,15 +1,20 @@
 """
-Tests for OpenAI tool call repair functions in openai_client.py
+Tests for OpenAI and Anthropic tool call repair functions.
 
-This module tests the auto-repair functionality that detects and fixes orphaned
-tool_calls (tool_call without corresponding tool response) before sending
-requests to the OpenAI API or OpenAI-compatible proxies.
+This module tests the auto-repair functionality that detects and fixes:
+1. Orphaned tool_calls (tool_call without corresponding tool response) - repaired by injecting synthetic responses
+2. Orphaned tool_results (tool response without matching tool_call) - repaired by removing the orphaned response
 
-The error being fixed:
-    For proxies that convert to Anthropic format:
+The errors being fixed:
+    For orphaned tool_calls:
     "tool_use ids were found without tool_result blocks immediately after: 
      toolu_xxx. Each tool_use block must have a corresponding tool_result 
      block in the next message."
+
+    For orphaned tool_results:
+    "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx.
+     Each `tool_result` block must have a corresponding `tool_use` block
+     in the previous message."
 """
 
 import pytest
@@ -18,6 +23,7 @@ from letta.llm_api.openai_client import (
     validate_and_repair_openai_tool_call_pairing,
     validate_and_repair_responses_api_tool_call_pairing,
 )
+from letta.llm_api.anthropic_client import validate_and_repair_tool_use_pairing
 
 
 class TestValidateAndRepairOpenAIToolCallPairing:
@@ -342,6 +348,157 @@ class TestValidateAndRepairOpenAIToolCallPairing:
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_unk"
         assert result[2]["role"] == "custom_role"
+
+
+class TestOrphanedToolResultRemoval:
+    """Test suite for orphaned tool_result removal in validate_and_repair_openai_tool_call_pairing.
+
+    These tests verify the SECOND PASS of the repair function that removes tool response
+    messages (role='tool') that reference tool_call_ids which don't exist in any
+    assistant message. This can happen when summarization deletes assistant messages
+    but leaves behind their corresponding tool responses.
+
+    The Anthropic API error for orphaned tool_results:
+        "unexpected `tool_use_id` found in `tool_result` blocks: toolu_xxx.
+         Each `tool_result` block must have a corresponding `tool_use` block
+         in the previous message."
+    """
+
+    def test_orphaned_tool_result_removed(self):
+        """Tool response without matching tool_call should be removed."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "tool", "tool_call_id": "call_nonexistent", "content": "Some result"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # The orphaned tool response should be removed
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+
+    def test_valid_tool_result_kept_orphaned_removed(self):
+        """Valid tool results should be kept while orphaned ones are removed."""
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_valid", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_valid", "content": "Valid result"},
+            {"role": "tool", "tool_call_id": "call_orphan", "content": "Orphaned result"},  # No matching tool_call
+            {"role": "user", "content": "Thanks!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # Should have 3 messages: assistant, valid tool response, user
+        assert len(result) == 3
+        assert result[0]["role"] == "assistant"
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_valid"
+        assert result[2]["role"] == "user"
+
+    def test_multiple_orphaned_tool_results_removed(self):
+        """Multiple orphaned tool results should all be removed."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "tool", "tool_call_id": "call_orphan_1", "content": "Result 1"},
+            {"role": "tool", "tool_call_id": "call_orphan_2", "content": "Result 2"},
+            {"role": "tool", "tool_call_id": "call_orphan_3", "content": "Result 3"},
+            {"role": "assistant", "content": "Processing..."},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # All orphaned tool responses should be removed
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+
+    def test_orphaned_tool_results_after_summarization(self):
+        """Simulate summarization removing assistant with tool_calls but leaving tool response."""
+        # This is the exact scenario from the bug report: summarization deleted the assistant
+        # message containing tool_calls but left the tool response message behind
+        messages = [
+            {"role": "user", "content": "What's the weather?"},
+            # Assistant with tool_call was deleted by summarization
+            {"role": "tool", "tool_call_id": "toolu_01BiPnYwiQjfTjKWnyYUCfZ", "content": "Sunny, 72°F"},
+            {"role": "assistant", "content": "The weather is sunny and 72°F."},
+            {"role": "user", "content": "Thanks!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # Orphaned tool response should be removed
+        assert len(result) == 3
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+        assert result[2]["role"] == "user"
+
+    def test_tool_result_without_tool_call_id_kept(self):
+        """Tool response without tool_call_id field should not be removed (malformed but not orphaned)."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "tool", "content": "Some result"},  # No tool_call_id field
+            {"role": "assistant", "content": "Hi!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # The malformed tool message should be kept (we only remove orphaned ones with invalid IDs)
+        assert len(result) == 3
+
+    def test_mixed_valid_and_orphaned_in_sequence(self):
+        """Test a complex sequence with interleaved valid and orphaned tool results."""
+        messages = [
+            {"role": "user", "content": "Do two things"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_A", "type": "function", "function": {"name": "task_a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_A", "content": "Result A"},
+            {"role": "tool", "tool_call_id": "call_deleted", "content": "Orphaned from deleted assistant"},  # Orphaned
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_B", "type": "function", "function": {"name": "task_b", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_B", "content": "Result B"},
+            {"role": "assistant", "content": "Done!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # Should have 6 messages (orphaned one removed)
+        assert len(result) == 6
+        tool_responses = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_responses) == 2
+        tool_call_ids = {tr["tool_call_id"] for tr in tool_responses}
+        assert tool_call_ids == {"call_A", "call_B"}
+
+    def test_synthetic_response_not_removed(self):
+        """Synthetic tool responses injected by first pass should not be removed by second pass."""
+        # This tests that synthetic responses added for orphaned tool_calls are not
+        # then removed as orphaned tool_results
+        messages = [
+            {"role": "user", "content": "Search for something"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_orphan_call", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                ],
+            },
+            # Missing tool response - will be synthesized in first pass
+            {"role": "user", "content": "What happened?"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # Should have 4 messages: user, assistant, synthetic tool response, user
+        assert len(result) == 4
+        assert result[2]["role"] == "tool"
+        assert result[2]["tool_call_id"] == "call_orphan_call"
+        assert "Error" in result[2]["content"]
 
 
 class TestValidateAndRepairResponsesAPIToolCallPairing:
@@ -677,4 +834,186 @@ class TestIsAnthropicBackedProxy:
             context_window=200000,
         )
         assert is_anthropic_backed_proxy(llm_config) is True
+
+
+class TestAnthropicValidateAndRepairToolUsePairing:
+    """Test suite for validate_and_repair_tool_use_pairing function in anthropic_client.py.
+
+    This tests the Anthropic-format equivalent of the OpenAI repair function.
+    Anthropic format uses content blocks with type='tool_use' and type='tool_result'
+    rather than separate messages.
+    """
+
+    def test_empty_messages_returns_empty(self):
+        """Empty message list should return empty list."""
+        result = validate_and_repair_tool_use_pairing([])
+        assert result == []
+
+    def test_none_messages_returns_none(self):
+        """None should be handled gracefully."""
+        result = validate_and_repair_tool_use_pairing(None)
+        assert result is None
+
+    def test_valid_tool_use_with_result_unchanged(self):
+        """Valid tool_use followed by tool_result in next user message should pass through."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me check that."},
+                    {"type": "tool_use", "id": "toolu_123", "name": "get_weather", "input": {"location": "NYC"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_123", "content": "Sunny, 72°F"},
+                ],
+            },
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+        assert len(result) == 2
+        assert result[0]["role"] == "assistant"
+        assert result[1]["role"] == "user"
+
+    def test_orphaned_tool_use_at_end_gets_synthetic_result(self):
+        """Tool_use at end of messages should get synthetic user message with tool_result."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "What's the weather?"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_orphan", "name": "get_weather", "input": {"location": "NYC"}},
+                ],
+            },
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # Should have 3 messages (synthetic user message with tool_result added)
+        assert len(result) == 3
+        assert result[2]["role"] == "user"
+        assert result[2]["content"][0]["type"] == "tool_result"
+        assert result[2]["content"][0]["tool_use_id"] == "toolu_orphan"
+        assert "Error" in result[2]["content"][0]["content"]
+
+
+class TestAnthropicOrphanedToolResultRemoval:
+    """Test suite for orphaned tool_result removal in validate_and_repair_tool_use_pairing.
+
+    These tests verify the SECOND PASS of the Anthropic repair function that removes
+    tool_result blocks that reference tool_use_ids which don't exist in any assistant message.
+    """
+
+    def test_orphaned_tool_result_removed_from_user_message(self):
+        """Tool_result without matching tool_use should be removed from user message content."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_nonexistent", "content": "Some result"},
+                    {"type": "text", "text": "What happened?"},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "Hi there!"}]},
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # The orphaned tool_result should be removed, but the text should remain
+        assert len(result) == 3
+        user_msg = result[1]
+        assert len(user_msg["content"]) == 1
+        assert user_msg["content"][0]["type"] == "text"
+        assert user_msg["content"][0]["text"] == "What happened?"
+
+    def test_valid_tool_result_kept_orphaned_removed(self):
+        """Valid tool_results should be kept while orphaned ones are removed."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_valid", "name": "search", "input": {}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_valid", "content": "Valid result"},
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan", "content": "Orphaned result"},
+                ],
+            },
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # Should have 2 messages, but user message should only have valid tool_result
+        assert len(result) == 2
+        user_content = result[1]["content"]
+        assert len(user_content) == 1
+        assert user_content[0]["tool_use_id"] == "toolu_valid"
+
+    def test_all_tool_results_orphaned_gets_placeholder(self):
+        """If all tool_results in a user message are orphaned, add placeholder text."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan1", "content": "Result 1"},
+                    {"type": "tool_result", "tool_use_id": "toolu_orphan2", "content": "Result 2"},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "Processing..."}]},
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # The user message should have a placeholder since all content was removed
+        assert len(result) == 3
+        user_content = result[1]["content"]
+        assert len(user_content) == 1
+        assert user_content[0]["type"] == "text"
+        assert "removed" in user_content[0]["text"].lower()
+
+    def test_orphaned_tool_results_after_summarization(self):
+        """Simulate summarization removing assistant with tool_use but leaving tool_result."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "What's the weather?"}]},
+            # Assistant with tool_use was deleted by summarization
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01BiPnYwiQjfTjKWnyYUCfZ", "content": "Sunny, 72°F"},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": "The weather is sunny."}]},
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # Orphaned tool_result should be replaced with placeholder
+        assert len(result) == 3
+        user_content = result[1]["content"]
+        assert len(user_content) == 1
+        assert user_content[0]["type"] == "text"
+
+    def test_synthetic_result_not_removed(self):
+        """Synthetic tool_results injected by first pass should not be removed by second pass."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Search for something"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_orphan_use", "name": "search", "input": {}},
+                ],
+            },
+            # Missing tool_result - will be synthesized
+            {"role": "assistant", "content": [{"type": "text", "text": "Results..."}]},
+        ]
+        result = validate_and_repair_tool_use_pairing(messages)
+
+        # Should have 4 messages: user, assistant with tool_use, synthetic user with tool_result, assistant
+        assert len(result) == 4
+        synthetic_user = result[2]
+        assert synthetic_user["role"] == "user"
+        assert synthetic_user["content"][0]["type"] == "tool_result"
+        assert synthetic_user["content"][0]["tool_use_id"] == "toolu_orphan_use"
+        assert "Error" in synthetic_user["content"][0]["content"]
 

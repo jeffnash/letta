@@ -21,7 +21,7 @@ from letta.errors import (
     LLMTimeoutError,
     PendingApprovalError,
 )
-from letta.helpers.datetime_helpers import get_utc_timestamp_ns
+from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns
 from letta.log import get_logger
 from letta.otel.context import get_ctx_attributes
 from letta.otel.metric_registry import MetricRegistry
@@ -217,6 +217,13 @@ class StreamingService:
             return run, result
 
         except PendingApprovalError as e:
+            # Release conversation lock before re-raising since approval flow requires new request
+            if conversation_id:
+                try:
+                    if not isinstance(redis_client, NoopAsyncRedisClient):
+                        await redis_client.release_conversation_lock(conversation_id)
+                except Exception as lock_err:
+                    logger.warning(f"Failed to release conversation lock on PendingApprovalError: {lock_err}")
             if settings.track_agent_run:
                 run_update_metadata = {"error": str(e)}
                 run_status = RunStatus.failed
@@ -228,10 +235,12 @@ class StreamingService:
             raise
         finally:
             if settings.track_agent_run and run:
+                # Set completed_at for terminal statuses
+                completed_at = get_utc_time().replace(tzinfo=None) if run_status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled} else None
                 await self.server.run_manager.update_run_by_id_async(
                     run_id=run.id,
                     conversation_id=conversation_id,
-                    update=RunUpdate(status=run_status, metadata=run_update_metadata),
+                    update=RunUpdate(status=run_status, metadata=run_update_metadata, completed_at=completed_at),
                     actor=actor,
                 )
 
@@ -453,6 +462,15 @@ class StreamingService:
                 # Send [DONE] marker to properly close the stream
                 yield "data: [DONE]\n\n"
             except PendingApprovalError:
+                # Release conversation lock before re-raising since this won't complete the run normally.
+                # The approval flow requires the client to send a new request, and the lock would block that.
+                if conversation_id:
+                    try:
+                        redis_client = await get_redis_client()
+                        if not isinstance(redis_client, NoopAsyncRedisClient):
+                            await redis_client.release_conversation_lock(conversation_id)
+                    except Exception as lock_err:
+                        logger.warning(f"Failed to release conversation lock on PendingApprovalError: {lock_err}")
                 # Re-raise PendingApprovalError so it can be handled by the HTTP layer as 409
                 raise
             except Exception as e:
@@ -477,10 +495,12 @@ class StreamingService:
                 if run_id and self.runs_manager and run_status:
                     # Extract stop_reason enum value from LettaStopReason object
                     stop_reason_value = stop_reason.stop_reason if stop_reason else StopReasonType.error.value
+                    # Set completed_at for terminal statuses
+                    completed_at = get_utc_time().replace(tzinfo=None) if run_status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled} else None
                     await self.runs_manager.update_run_by_id_async(
                         run_id=run_id,
                         conversation_id=conversation_id,
-                        update=RunUpdate(status=run_status, stop_reason=stop_reason_value, metadata=error_data),
+                        update=RunUpdate(status=run_status, stop_reason=stop_reason_value, metadata=error_data, completed_at=completed_at),
                         actor=actor,
                     )
 
@@ -552,6 +572,9 @@ class StreamingService:
             update.metadata = {"error": error}
         if stop_reason:
             update.stop_reason = stop_reason
+        # Set completed_at for terminal statuses
+        if status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled}:
+            update.completed_at = get_utc_time().replace(tzinfo=None)
 
         await self.runs_manager.update_run_by_id_async(
             run_id=run_id,

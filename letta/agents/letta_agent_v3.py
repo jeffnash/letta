@@ -148,6 +148,13 @@ class LettaAgentV3(LettaAgentV2):
             input_messages_to_persist = [input_messages_to_persist[0]]
 
         self.in_context_messages = curr_in_context_messages
+
+        # Initialize context_token_estimate before the first step to avoid warnings
+        # and enable accurate context window tracking from the start
+        self.context_token_estimate = await count_tokens(
+            actor=self.actor, llm_config=self.agent_state.llm_config, messages=curr_in_context_messages
+        )
+
         for i in range(max_steps):
             if i == 1 and follow_up_messages:
                 input_messages_to_persist = follow_up_messages
@@ -314,6 +321,13 @@ class LettaAgentV3(LettaAgentV2):
                 input_messages_to_persist = [input_messages_to_persist[0]]
 
             self.in_context_messages = in_context_messages
+
+            # Initialize context_token_estimate before the first step to avoid warnings
+            # and enable accurate context window tracking from the start
+            self.context_token_estimate = await count_tokens(
+                actor=self.actor, llm_config=self.agent_state.llm_config, messages=in_context_messages
+            )
+
             for i in range(max_steps):
                 if i == 1 and follow_up_messages:
                     input_messages_to_persist = follow_up_messages
@@ -865,7 +879,15 @@ class LettaAgentV3(LettaAgentV2):
                         yield message
 
             # check compaction
-            if self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
+            # Skip compaction if the last message is a pending approval request - compaction would
+            # insert a summary message after the approval request, breaking the approval validation
+            # which expects the approval request to be the last message in context.
+            has_pending_approval = messages and messages[-1].is_approval_request()
+            if has_pending_approval:
+                self.logger.info(
+                    "Skipping compaction: pending approval request must remain as last message in context"
+                )
+            elif self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
                 self.logger.info(
                     f"Context window exceeded (current: {self.context_token_estimate}, threshold: {self.agent_state.llm_config.context_window}), trying to compact messages"
                 )
@@ -1514,9 +1536,14 @@ class LettaAgentV3(LettaAgentV2):
             )
             # Keep system prompt and last few messages to preserve some context
             system_prompt = messages[0]
+            # Check for pending approval request - must preserve it to avoid approval state desync
+            has_pending_approval = messages[-1].is_approval_request() if messages else False
             # Try to keep last 3 messages if possible, otherwise just system prompt
             if len(messages) > 4:
                 compacted_messages = [system_prompt] + messages[-3:]
+            elif has_pending_approval:
+                # Edge case: even if few messages, preserve the approval request
+                compacted_messages = [system_prompt] + [messages[-1]]
             else:
                 compacted_messages = [system_prompt]
             summary = "[Summarization failed - context was hard-evicted to prevent run failure]"

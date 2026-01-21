@@ -1601,12 +1601,15 @@ async def send_message(
             else:
                 # NOTE: we could also consider this an error?
                 stop_reason = None
+            # Set completed_at for terminal statuses
+            completed_at = get_utc_time().replace(tzinfo=None) if run_status in {RunStatus.completed, RunStatus.failed, RunStatus.cancelled} else None
             await server.run_manager.update_run_by_id_async(
                 run_id=run.id,
                 update=RunUpdate(
                     status=run_status,
                     metadata=run_update_metadata,
                     stop_reason=stop_reason,
+                    completed_at=completed_at,
                 ),
                 actor=actor,
             )
@@ -2019,7 +2022,7 @@ async def _process_message_background(
 
         await runs_manager.update_run_by_id_async(
             run_id=run_id,
-            update=RunUpdate(status=run_status, stop_reason=result.stop_reason.stop_reason),
+            update=RunUpdate(status=run_status, stop_reason=result.stop_reason.stop_reason, completed_at=get_utc_time().replace(tzinfo=None)),
             actor=actor,
         )
 
@@ -2030,7 +2033,7 @@ async def _process_message_background(
 
         await runs_manager.update_run_by_id_async(
             run_id=run_id,
-            update=RunUpdate(status=RunStatus.failed, metadata={"error": str(e)}),
+            update=RunUpdate(status=RunStatus.failed, metadata={"error": str(e)}, completed_at=get_utc_time().replace(tzinfo=None)),
             actor=actor,
         )
     except Exception as e:
@@ -2040,7 +2043,7 @@ async def _process_message_background(
 
         await runs_manager.update_run_by_id_async(
             run_id=run_id,
-            update=RunUpdate(status=RunStatus.failed, metadata={"error": str(e)}),
+            update=RunUpdate(status=RunStatus.failed, metadata={"error": str(e)}, completed_at=get_utc_time().replace(tzinfo=None)),
             actor=actor,
         )
     finally:
@@ -2183,7 +2186,7 @@ async def send_message_async(
 
                 await runs_manager.update_run_by_id_async(
                     run_id=run.id,
-                    update=RunUpdate(status=RunStatus.failed, metadata={"error": error_str}),
+                    update=RunUpdate(status=RunStatus.failed, metadata={"error": error_str}, completed_at=get_utc_time().replace(tzinfo=None)),
                     actor=actor,
                 )
 

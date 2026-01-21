@@ -2152,6 +2152,13 @@ class Message(BaseMessage):
     def collapse_tool_call_messages_for_llm_api(
         messages: List[Message],
     ) -> List[Message]:
+        """Collapse adjacent assistant + approval messages into a single assistant message.
+
+        When an assistant message with tool_calls is immediately followed by an approval
+        message with tool_calls, we merge them into one assistant message for the LLM API.
+        This function also dedupes tool_calls during the merge to avoid duplicate IDs
+        (which can occur if both messages reference the same tool call).
+        """
         adjacent_tool_call_approval_messages = []
         for i in range(len(messages) - 1):
             if (
@@ -2163,7 +2170,17 @@ class Message(BaseMessage):
                 adjacent_tool_call_approval_messages.append(i)
         for i in reversed(adjacent_tool_call_approval_messages):
             messages[i].content = messages[i].content + messages[i + 1].content
-            messages[i].tool_calls = messages[i].tool_calls + messages[i + 1].tool_calls
+            # Merge tool_calls, deduping by ID to avoid duplicates
+            seen_ids: set[str] = set()
+            merged_tool_calls = []
+            for tc in messages[i].tool_calls + messages[i + 1].tool_calls:
+                tc_id = getattr(tc, "id", None)
+                if tc_id and tc_id in seen_ids:
+                    continue  # Skip duplicate
+                if tc_id:
+                    seen_ids.add(tc_id)
+                merged_tool_calls.append(tc)
+            messages[i].tool_calls = merged_tool_calls
             messages.remove(messages[i + 1])
         return messages
 
@@ -2277,7 +2294,7 @@ class Message(BaseMessage):
                 m.tool_calls = unique_tool_calls
                 removed_counts_total += removed
         if removed_counts_total:
-            logger.error("[Message] Deduped duplicate tool_calls in assistant messages: removed=%d", removed_counts_total)
+            logger.debug("[Message] Deduped duplicate tool_calls in assistant messages: removed=%d", removed_counts_total)
         return messages
 
     @staticmethod

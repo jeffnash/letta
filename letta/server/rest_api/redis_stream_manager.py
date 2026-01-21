@@ -9,6 +9,7 @@ from contextlib import aclosing
 from typing import Dict, List, Optional
 
 from letta.data_sources.redis_client import AsyncRedisClient
+from letta.helpers.datetime_helpers import get_utc_time
 from letta.log import get_logger
 from letta.schemas.enums import RunStatus
 from letta.schemas.letta_message import LettaErrorMessage
@@ -342,7 +343,7 @@ async def create_background_stream_processor(
         if run_manager and actor:
             await run_manager.update_run_by_id_async(
                 run_id=run_id,
-                update=RunUpdate(status=RunStatus.failed, stop_reason=StopReasonType.error.value, metadata={"error": str(e)}),
+                update=RunUpdate(status=RunStatus.failed, stop_reason=StopReasonType.error.value, metadata={"error": str(e)}, completed_at=get_utc_time().replace(tzinfo=None)),
                 actor=actor,
                 conversation_id=conversation_id,
             )
@@ -383,7 +384,7 @@ async def create_background_stream_processor(
                 logger.warning(f"Unknown stop_reason '{final_stop_reason}' for run {run_id}, defaulting to completed")
                 run_status = RunStatus.completed
 
-            update_kwargs = {"status": run_status, "stop_reason": final_stop_reason}
+            update_kwargs = {"status": run_status, "stop_reason": final_stop_reason, "completed_at": get_utc_time().replace(tzinfo=None)}
             if run_status == RunStatus.failed and error_metadata is not None:
                 update_kwargs["metadata"] = error_metadata
 
