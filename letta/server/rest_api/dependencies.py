@@ -18,6 +18,15 @@ class ExperimentalParams(BaseModel):
     modal_sandbox: Optional[bool] = None
 
 
+# Constants for cancellation polling intervals (in seconds)
+# Interactive clients (like letta-code CLI) get faster polling for better responsiveness
+CANCELLATION_CHECK_INTERVAL_INTERACTIVE = 0.1
+CANCELLATION_CHECK_INTERVAL_DEFAULT = 0.5
+
+# Client identifier for interactive mode
+LETTA_SOURCE_INTERACTIVE = "letta-code"
+
+
 class HeaderParams(BaseModel):
     """Common header parameters used across REST API endpoints."""
 
@@ -27,6 +36,20 @@ class HeaderParams(BaseModel):
     letta_source: Optional[str] = None
     sdk_version: Optional[str] = None
     experimental_params: Optional[ExperimentalParams] = None
+
+    def get_cancellation_check_interval(self) -> float:
+        """
+        Get the appropriate cancellation check interval based on the client source.
+
+        Interactive clients (like letta-code CLI) get a faster polling interval
+        for better responsiveness during streaming operations.
+
+        Returns:
+            float: The cancellation check interval in seconds
+        """
+        if self.letta_source == LETTA_SOURCE_INTERACTIVE:
+            return CANCELLATION_CHECK_INTERVAL_INTERACTIVE
+        return CANCELLATION_CHECK_INTERVAL_DEFAULT
 
 
 def get_headers(

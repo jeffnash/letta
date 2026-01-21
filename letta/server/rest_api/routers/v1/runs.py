@@ -1,7 +1,7 @@
 from datetime import timedelta
 from typing import Annotated, Any, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import Field
 
 from letta.data_sources.redis_client import NoopAsyncRedisClient, get_redis_client
@@ -343,6 +343,7 @@ async def delete_run(
     },
 )
 async def retrieve_stream_for_run(
+    request_obj: Request,  # FastAPI Request
     run_id: str,
     request: RetrieveStreamRequest = Body(None),
     headers: HeaderParams = Depends(get_headers),
@@ -385,6 +386,7 @@ async def retrieve_stream_for_run(
             run_manager=server.run_manager,
             run_id=run_id,
             actor=actor,
+            cancellation_check_interval=headers.get_cancellation_check_interval(),
         )
 
     if request.include_pings and settings.enable_keepalive:

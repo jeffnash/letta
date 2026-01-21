@@ -1,7 +1,7 @@
 from datetime import timedelta
 from typing import Annotated, List, Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
@@ -166,6 +166,7 @@ async def list_conversation_messages(
     },
 )
 async def send_conversation_message(
+    request_obj: Request,  # FastAPI Request
     conversation_id: ConversationId,
     request: LettaStreamingRequest = Body(...),
     server: SyncServer = Depends(get_letta_server),
@@ -196,6 +197,7 @@ async def send_conversation_message(
         request=request,
         run_type="send_conversation_message",
         conversation_id=conversation_id,
+        cancellation_check_interval=headers.get_cancellation_check_interval(),
     )
 
     return result
@@ -234,6 +236,7 @@ async def send_conversation_message(
     },
 )
 async def retrieve_conversation_stream(
+    request_obj: Request,  # FastAPI Request
     conversation_id: ConversationId,
     request: RetrieveStreamRequest = Body(None),
     headers: HeaderParams = Depends(get_headers),
@@ -294,6 +297,7 @@ async def retrieve_conversation_stream(
             run_manager=server.run_manager,
             run_id=run.id,
             actor=actor,
+            cancellation_check_interval=headers.get_cancellation_check_interval(),
         )
 
     if request and request.include_pings and settings.enable_keepalive:

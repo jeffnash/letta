@@ -1516,6 +1516,7 @@ async def send_message(
             actor=actor,
             request=request,
             run_type="send_message",
+            cancellation_check_interval=headers.get_cancellation_check_interval(),
         )
         return result
 
@@ -1679,6 +1680,7 @@ async def send_message_streaming(
         actor=actor,
         request=request,
         run_type="send_message_streaming",
+        cancellation_check_interval=headers.get_cancellation_check_interval(),
     )
 
     return result

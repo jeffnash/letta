@@ -74,6 +74,7 @@ class StreamingService:
         request: LettaStreamingRequest,
         run_type: str = "streaming",
         conversation_id: Optional[str] = None,
+        cancellation_check_interval: float = 0.5,
     ) -> tuple[Optional[PydanticRun], Union[StreamingResponse, LettaResponse]]:
         """
         Create a streaming response for an agent.
@@ -167,6 +168,7 @@ class StreamingService:
                             run_manager=self.runs_manager,
                             run_id=run.id,
                             actor=actor,
+                            cancellation_check_interval=cancellation_check_interval,
                         )
 
                     safe_create_task(
@@ -194,6 +196,7 @@ class StreamingService:
                         run_manager=self.runs_manager,
                         run_id=run.id,
                         actor=actor,
+                        cancellation_check_interval=cancellation_check_interval,
                     )
 
                 # conditionally wrap with keepalive based on request parameter

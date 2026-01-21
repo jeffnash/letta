@@ -124,7 +124,7 @@ async def cancellation_aware_stream_wrapper(
     run_manager: RunManager,
     run_id: str,
     actor: User,
-    cancellation_check_interval: float = 0.5,
+    cancellation_check_interval: float = 0.1,
 ) -> AsyncIterator[str | bytes]:
     """
     Wraps a stream generator to provide real-time run cancellation checking.
@@ -198,34 +198,36 @@ class StreamingResponseWithStatusCode(StreamingResponse):
     _client_connected: bool = True
 
     async def stream_response(self, send: Send) -> None:
-        if settings.use_asyncio_shield:
-            try:
-                await asyncio.shield(self._protected_stream_response(send))
-            except asyncio.CancelledError:
-                logger.info("Stream response was cancelled, but shielded task should continue")
-            except anyio.ClosedResourceError:
-                logger.info("Client disconnected, but shielded task should continue")
-                self._client_connected = False
-            except PendingApprovalError as e:
-                # This is an expected error, don't log as error
-                logger.info(f"Pending approval conflict in stream response: {e}")
-                # Re-raise as HTTPException for proper client handling with all available identifiers
-                detail = {
-                    "code": "PENDING_APPROVAL",
-                    "error_code": "PENDING_APPROVAL",
-                    "message": str(e),
-                    "pending_request_id": e.pending_request_id,
-                }
-                if hasattr(e, "agent_id") and e.agent_id:
-                    detail["agent_id"] = e.agent_id
-                if hasattr(e, "run_id") and e.run_id:
-                    detail["run_id"] = e.run_id
-                raise HTTPException(status_code=409, detail=detail)
-            except Exception as e:
-                logger.error(f"Error in protected stream response: {e}")
-                raise
-        else:
-            await self._protected_stream_response(send)
+        try:
+            if settings.use_asyncio_shield:
+                try:
+                    await asyncio.shield(self._protected_stream_response(send))
+                except PendingApprovalError:
+                    raise
+                except asyncio.CancelledError:
+                    logger.info("Stream response was cancelled, but shielded task should continue")
+                except anyio.ClosedResourceError:
+                    logger.info("Client disconnected, but shielded task should continue")
+                    self._client_connected = False
+                except Exception as e:
+                    logger.error(f"Error in protected stream response: {e}")
+                    raise
+            else:
+                await self._protected_stream_response(send)
+        except PendingApprovalError as e:
+            # Handle at top level to ensure it's not caught by shield
+            logger.info(f"Pending approval conflict: {e}")
+            detail = {
+                "code": "PENDING_APPROVAL",
+                "error_code": "PENDING_APPROVAL",
+                "message": str(e),
+                "pending_request_id": e.pending_request_id,
+            }
+            if hasattr(e, "agent_id") and e.agent_id:
+                detail["agent_id"] = e.agent_id
+            if hasattr(e, "run_id") and e.run_id:
+                detail["run_id"] = e.run_id
+            raise HTTPException(status_code=409, detail=detail)
 
     async def _protected_stream_response(self, send: Send) -> None:
         more_body = True
@@ -327,22 +329,9 @@ class StreamingResponseWithStatusCode(StreamingResponse):
             capture_sentry_exception(exc)
             raise LettaUnexpectedStreamCancellationError("Stream was terminated due to unexpected cancellation from server")
 
-        # Handle pending approval conflicts - re-raise as HTTPException for proper client handling
-        except PendingApprovalError as e:
-            logger.info(f"Pending approval conflict in protected stream response: {e}")
-            detail = {
-                "code": "PENDING_APPROVAL",
-                "error_code": "PENDING_APPROVAL",
-                "message": str(e),
-                "pending_request_id": e.pending_request_id,
-            }
-            if hasattr(e, "agent_id") and e.agent_id:
-                detail["agent_id"] = e.agent_id
-            if hasattr(e, "run_id") and e.run_id:
-                detail["run_id"] = e.run_id
-            raise HTTPException(status_code=409, detail=detail)
-
         except Exception as exc:
+            if isinstance(exc, PendingApprovalError):
+                raise
             logger.exception(f"Unhandled Streaming Error: {str(exc)}")
             more_body = False
             # error_resp = {"error": {"message": str(exc)}}
