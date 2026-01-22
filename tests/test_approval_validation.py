@@ -66,8 +66,15 @@ class TestValidateApprovalToolCallIds:
         # Should not raise
         validate_approval_tool_call_ids(approval_request, approval_response)
 
-    def test_invalid_approval_with_partial_tool_call_match(self):
-        """Test that approval with only partial tool call ID match fails validation."""
+    def test_partial_approval_auto_fills_missing_ids(self):
+        """
+        Test that approval with only partial tool call IDs is accepted and auto-fills missing ones.
+
+        This is the fix for the tool_call_id mismatch bug: when clients are interrupted during
+        parallel tool execution, they may not be able to send responses for all tool calls.
+        Instead of rejecting the partial response, we now accept it and auto-fill the missing
+        tool_call_ids with error responses.
+        """
         tc1 = OpenAIToolCall(id='call_1', function=OpenAIFunction(name='Read', arguments='{}'), type='function')
         tc2 = OpenAIToolCall(id='call_2', function=OpenAIFunction(name='Write', arguments='{}'), type='function')
         approval_request = Message(
@@ -82,11 +89,22 @@ class TestValidateApprovalToolCallIds:
             ]
         )
 
-        with pytest.raises(ValueError, match="Invalid tool call IDs"):
-            validate_approval_tool_call_ids(approval_request, approval_response)
+        # Should NOT raise - partial responses are now accepted with auto-fill
+        validate_approval_tool_call_ids(approval_request, approval_response)
+
+        # Verify that the missing tool_call_id was auto-filled
+        approval_ids = [a.tool_call_id for a in approval_response.approvals]
+        assert 'call_1' in approval_ids
+        assert 'call_2' in approval_ids  # Auto-filled
+        assert len(approval_response.approvals) == 2
+
+        # The auto-filled entry should be an error response
+        auto_filled = next(a for a in approval_response.approvals if a.tool_call_id == 'call_2')
+        assert auto_filled.status == 'error'
+        assert 'interrupted' in auto_filled.tool_return.lower() or 'error' in auto_filled.tool_return.lower()
 
     def test_invalid_approval_with_extra_tool_call_id(self):
-        """Test that approval with extra tool call ID fails validation."""
+        """Test that approval with extra tool call ID fails validation (unexpected IDs are still errors)."""
         tc1 = OpenAIToolCall(id='call_1', function=OpenAIFunction(name='Read', arguments='{}'), type='function')
         approval_request = Message(
             role=MessageRole.approval,
@@ -100,7 +118,8 @@ class TestValidateApprovalToolCallIds:
             ]
         )
 
-        with pytest.raises(ValueError, match="Invalid tool call IDs"):
+        # Unexpected IDs are still a hard error (only missing IDs are auto-filled)
+        with pytest.raises(ValueError, match="unexpected tool_call_ids"):
             validate_approval_tool_call_ids(approval_request, approval_response)
 
     # =========================================================================

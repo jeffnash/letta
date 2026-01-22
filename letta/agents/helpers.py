@@ -115,26 +115,66 @@ def validate_approval_tool_call_ids(approval_request_message: Message, approval_
     approval_requests = approval_request_message.tool_calls
     if approval_requests:
         approval_request_tool_call_ids = [approval_request.id for approval_request in approval_requests]
-        # Validate that the response IDs match the request IDs
-        request_response_diff = set(approval_request_tool_call_ids).symmetric_difference(set(approval_response_tool_call_ids))
-        if request_response_diff:
+        request_set = set(approval_request_tool_call_ids)
+        response_set = set(approval_response_tool_call_ids)
+
+        # Check for IDs in the response that aren't in the request (unexpected IDs)
+        unexpected_ids = response_set - request_set
+        if unexpected_ids:
+            # This is a hard error - the client sent IDs that don't exist in the request
+            error_msg = (
+                f"Invalid approval response: received unexpected tool_call_ids that don't exist in the request. "
+                f"Unexpected IDs: {unexpected_ids}. "
+                f"Expected IDs: {approval_request_tool_call_ids}. "
+                f"Message: {approval_request_message.id}"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Check for IDs in the request that aren't in the response (missing IDs)
+        missing_ids = request_set - response_set
+        if missing_ids:
             # Build detailed diagnostic message
             tool_call_details = []
             for tc in approval_request_message.tool_calls or []:
                 tool_name = tc.function.name if hasattr(tc, 'function') and hasattr(tc.function, 'name') else 'unknown'
                 tool_call_details.append(f"{tc.id}: {tool_name}")
 
-            error_msg = (
-                f"Invalid tool call IDs. "
+            # This is now a WARNING instead of an error - accept partial responses
+            # This handles the case where the client was interrupted and couldn't complete all tool calls.
+            # The missing tool_call_ids will be auto-filled with error responses below.
+            warning_msg = (
+                f"Partial approval response received. "
                 f"Expected {len(approval_request_tool_call_ids)} ID(s): {approval_request_tool_call_ids}, "
                 f"but received {len(approval_response_tool_call_ids)} ID(s): {approval_response_tool_call_ids}. "
                 f"\nApproval request message: {approval_request_message.id} "
                 f"(created: {approval_request_message.created_at}, step: {approval_request_message.step_id}). "
                 f"\nTool calls: {tool_call_details}. "
-                f"\nMismatch: {request_response_diff}"
+                f"\nMissing IDs (will be auto-filled with error responses): {missing_ids}"
             )
-            logger.warning(error_msg)
-            raise ValueError(error_msg)
+            logger.warning(warning_msg)
+
+            # Auto-fill missing tool_call_ids with error/denial responses
+            # This ensures the agent state stays consistent
+            from letta.schemas.message import ToolReturn
+
+            for missing_id in missing_ids:
+                # Find the tool name for the missing ID
+                missing_tool_name = "unknown"
+                for tc in approval_request_message.tool_calls or []:
+                    if tc.id == missing_id:
+                        missing_tool_name = tc.function.name if hasattr(tc, 'function') and hasattr(tc.function, 'name') else 'unknown'
+                        break
+
+                # Add an auto-filled error response for the missing tool call
+                auto_response = ToolReturn(
+                    tool_call_id=missing_id,
+                    tool_return=f"[Error: Tool execution for '{missing_tool_name}' was interrupted or failed before completion. "
+                                f"The client did not provide a response for this tool call.]",
+                    status="error",
+                )
+                approval_responses.append(auto_response)
+                logger.info(f"Auto-filled missing tool_call_id {missing_id} with error response")
     else:
         # No tool_calls in the approval request - this indicates a bug in approval message creation
         # Check for legacy case: old clients used message id instead of tool call id

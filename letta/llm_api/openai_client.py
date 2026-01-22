@@ -517,6 +517,10 @@ class OpenAIClient(LLMClientBase):
         # The OpenAI client requires some API key value
         kwargs["api_key"] = kwargs.get("api_key") or "DUMMY_API_KEY"
 
+        # Add retry logic and extended timeout to handle transient network errors
+        kwargs["max_retries"] = 3
+        kwargs["timeout"] = 600.0  # 10 minutes
+
         return kwargs
 
     def _prepare_client_kwargs_embedding(self, embedding_config: EmbeddingConfig) -> dict:
@@ -556,6 +560,12 @@ class OpenAIClient(LLMClientBase):
                 kwargs["default_headers"] = headers
 
         kwargs["api_key"] = kwargs.get("api_key") or "DUMMY_API_KEY"
+
+        # Add retry logic and extended timeout to handle transient network errors
+        # max_retries: Retry on connection errors, rate limits, and 5xx errors
+        # timeout: Extended read timeout for long streaming responses (10 minutes)
+        kwargs["max_retries"] = 3
+        kwargs["timeout"] = 600.0  # 10 minutes for streaming responses
 
         return kwargs
 
