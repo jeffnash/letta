@@ -327,7 +327,7 @@ def deserialize_approvals(data: Optional[List[Dict]]) -> List[Union[ApprovalRetu
             # Check for ToolReturn (has status field)
             elif "status" in item:
                 # Handle field name variations (tool_return vs func_response)
-                if "tool_return" in item and "func_response" not in item:
+                if "tool_return" in item and "func_response" not in item and isinstance(item.get("tool_return"), str):
                     # Client SDK uses "tool_return", internal uses "func_response"
                     item = {**item, "func_response": item["tool_return"]}
                 tool_return = ToolReturn(**item)

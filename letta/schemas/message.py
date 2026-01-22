@@ -446,11 +446,31 @@ class Message(BaseMessage):
 
                     def maybe_convert_tool_return_message(maybe_tool_return):
                         if isinstance(maybe_tool_return, ToolReturn):
-                            parsed_data = self._parse_tool_response(maybe_tool_return.func_response)
+                            # Prefer tool_return if it exists (supports multimodal payloads)
+                            raw_tool_return = getattr(maybe_tool_return, "tool_return", None)
+                            if raw_tool_return is not None:
+                                return LettaToolReturn(
+                                    tool_call_id=maybe_tool_return.tool_call_id,
+                                    status=maybe_tool_return.status,
+                                    tool_return=raw_tool_return,
+                                    stdout=maybe_tool_return.stdout,
+                                    stderr=maybe_tool_return.stderr,
+                                )
+                            # Fall back to parsing func_response when tool_return is missing
+                            if maybe_tool_return.func_response is not None:
+                                parsed_data = self._parse_tool_response(maybe_tool_return.func_response)
+                                return LettaToolReturn(
+                                    tool_call_id=maybe_tool_return.tool_call_id,
+                                    status=parsed_data["status"],
+                                    tool_return=parsed_data["message"],
+                                    stdout=maybe_tool_return.stdout,
+                                    stderr=maybe_tool_return.stderr,
+                                )
+                            # Neither tool_return nor func_response available, use empty string
                             return LettaToolReturn(
                                 tool_call_id=maybe_tool_return.tool_call_id,
                                 status=maybe_tool_return.status,
-                                tool_return=parsed_data["message"],
+                                tool_return="",
                                 stdout=maybe_tool_return.stdout,
                                 stderr=maybe_tool_return.stderr,
                             )
@@ -781,14 +801,38 @@ class Message(BaseMessage):
 
     def _convert_explicit_tool_returns(self) -> ToolReturnMessage:
         """Convert explicit tool returns to a single ToolReturnMessage."""
+        def _displayable_tool_return(tool_return_value: object) -> str:
+            if tool_return_value is None:
+                return ""
+            if isinstance(tool_return_value, str):
+                return tool_return_value
+            if isinstance(tool_return_value, list):
+                text_parts: List[str] = []
+                image_parts = 0
+                for part in tool_return_value:
+                    if isinstance(part, TextContent):
+                        text_parts.append(part.text)
+                    elif isinstance(part, ImageContent):
+                        image_parts += 1
+                text = "\n".join([t for t in text_parts if t])
+                if image_parts:
+                    suffix = f"\n[image x{image_parts}]" if text else f"[image x{image_parts}]"
+                    return f"{text}{suffix}"
+                return text
+            return str(tool_return_value)
+
         # build list of all tool return objects
         all_tool_returns = []
         for tool_return in self.tool_returns:
-            parsed_data = self._parse_tool_response(tool_return.func_response)
-
+            status = tool_return.status
+            raw_tool_return = getattr(tool_return, "tool_return", None)
+            if raw_tool_return is None:
+                parsed_data = self._parse_tool_response(tool_return.func_response)
+                raw_tool_return = parsed_data["message"]
+                status = parsed_data["status"]
             tool_return_obj = LettaToolReturn(
-                tool_return=parsed_data["message"],
-                status=parsed_data["status"],
+                tool_return=raw_tool_return,
+                status=status,
                 tool_call_id=tool_return.tool_call_id,
                 stdout=tool_return.stdout,
                 stderr=tool_return.stderr,
@@ -800,12 +844,13 @@ class Message(BaseMessage):
             raise ValueError("No tool returns to convert")
 
         first_tool_return = all_tool_returns[0]
+        display_tool_return = _displayable_tool_return(first_tool_return.tool_return)
 
         return ToolReturnMessage(
             id=self.id,
             date=self.created_at,
             # deprecated top-level fields populated from first tool return
-            tool_return=first_tool_return.tool_return,
+            tool_return=display_tool_return,
             status=first_tool_return.status,
             tool_call_id=first_tool_return.tool_call_id,
             stdout=first_tool_return.stdout,
@@ -2344,6 +2389,12 @@ class ToolReturn(BaseModel):
     stdout: Optional[List[str]] = Field(default=None, description="Captured stdout (e.g. prints, logs) from the tool invocation")
     stderr: Optional[List[str]] = Field(default=None, description="Captured stderr from the tool invocation")
     func_response: Optional[str] = Field(None, description="The function response string")
+    # Optional raw tool return payload (e.g. client-side tool results submitted via approval responses).
+    # This is stored separately from func_response so we can preserve multimodal (image) returns without
+    # injecting large binary payloads into the LLM-visible tool message content.
+    tool_return: Optional[Union[str, List[Union[TextContent, ImageContent]]]] = Field(
+        default=None, description="Raw tool return payload (string or multimodal content parts)."
+    )
 
 
 class MessageSearchRequest(BaseModel):

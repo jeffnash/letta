@@ -899,42 +899,6 @@ class BlockManager:
             return block.to_pydantic()
 
     @enforce_types
-    async def _move_block_to_sequence(self, session: AsyncSession, block: BlockModel, target_seq: int, actor: PydanticUser) -> BlockModel:
-        """
-        Internal helper that moves the 'block' to the specified 'target_seq' within BlockHistory.
-        1) Find the BlockHistory row at sequence_number=target_seq
-        2) Copy fields into the block
-        3) Update and flush (no_commit=True) - the caller is responsible for final commit
-
-        Raises:
-            NoResultFound: if no BlockHistory row for (block_id, target_seq)
-        """
-        if not block.id:
-            raise ValueError("Block is missing an ID. Cannot move sequence.")
-
-        stmt = select(BlockHistory).filter(
-            BlockHistory.block_id == block.id,
-            BlockHistory.sequence_number == target_seq,
-        )
-        result = await session.execute(stmt)
-        target_entry = result.scalar_one_or_none()
-        if not target_entry:
-            raise NoResultFound(f"No BlockHistory row found for block_id={block.id} at sequence={target_seq}")
-
-        # Copy fields from target_entry to block
-        block.description = target_entry.description  # type: ignore
-        block.label = target_entry.label  # type: ignore
-        block.value = target_entry.value  # type: ignore
-        block.limit = target_entry.limit  # type: ignore
-        block.metadata_ = target_entry.metadata_  # type: ignore
-        block.current_history_entry_id = target_entry.id  # type: ignore
-
-        # Update in DB (optimistic locking).
-        # We'll do a flush now; the caller does final commit.
-        updated_block = await block.update_async(db_session=session, actor=actor, no_commit=True)
-        return updated_block
-
-    @enforce_types
     @raise_on_invalid_id(param_name="block_id", expected_prefix=PrimitiveType.BLOCK)
     @trace_method
     async def undo_checkpoint_block(

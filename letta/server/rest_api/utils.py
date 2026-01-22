@@ -29,6 +29,7 @@ from letta.schemas.agent import AgentState
 from letta.schemas.enums import MessageRole
 from letta.schemas.letta_message import ToolReturn as LettaToolReturn
 from letta.schemas.letta_message_content import (
+    ImageContent,
     OmittedReasoningContent,
     ReasoningContent,
     RedactedReasoningContent,
@@ -174,15 +175,40 @@ async def create_input_messages(
 def create_approval_response_message_from_input(
     agent_state: AgentState, input_message: ApprovalCreate, run_id: Optional[str] = None
 ) -> List[Message]:
+    def _displayable_tool_return(tool_return: Any) -> str:
+        if tool_return is None:
+            return ""
+        if isinstance(tool_return, str):
+            return tool_return
+        if isinstance(tool_return, list):
+            text_parts: List[str] = []
+            image_parts = 0
+            for part in tool_return:
+                if isinstance(part, TextContent):
+                    text_parts.append(part.text)
+                elif isinstance(part, ImageContent):
+                    image_parts += 1
+            text = "\n".join([t for t in text_parts if t])
+            if image_parts:
+                suffix = f"\n[image x{image_parts}]" if text else f"[image x{image_parts}]"
+                return f"{text}{suffix}"
+            return text
+        return str(tool_return)
+
     def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
         if isinstance(maybe_tool_return, LettaToolReturn):
+            raw_tool_return = maybe_tool_return.tool_return
+            display_text = _displayable_tool_return(raw_tool_return)
             packaged_function_response = package_function_response(
-                maybe_tool_return.status == "success", maybe_tool_return.tool_return, agent_state.timezone
+                maybe_tool_return.status == "success",
+                display_text,
+                agent_state.timezone,
             )
             return ToolReturn(
                 tool_call_id=maybe_tool_return.tool_call_id,
                 status=maybe_tool_return.status,
                 func_response=packaged_function_response,
+                tool_return=raw_tool_return,
                 stdout=maybe_tool_return.stdout,
                 stderr=maybe_tool_return.stderr,
             )

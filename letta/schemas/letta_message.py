@@ -6,8 +6,10 @@ from typing import Annotated, List, Literal, Optional, Union
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from letta.schemas.letta_message_content import (
+    ImageContent,
     LettaAssistantMessageContentUnion,
     LettaUserMessageContentUnion,
+    TextContent,
     get_letta_assistant_message_content_union_str_json_schema,
     get_letta_user_message_content_union_str_json_schema,
 )
@@ -35,7 +37,9 @@ class ApprovalReturn(MessageReturn):
 
 class ToolReturn(MessageReturn):
     type: Literal[MessageReturnType.tool] = Field(default=MessageReturnType.tool, description="The message type to be created.")
-    tool_return: str
+    # `tool_return` is returned to clients and accepted from clients (e.g. approval tool results).
+    # It supports multimodal content for tools that can return images.
+    tool_return: Union[str, List[Union[TextContent, ImageContent]]]
     status: Literal["success", "error"]
     tool_call_id: str
     stdout: Optional[List[str]] = None

@@ -686,7 +686,6 @@ class OpenAIChatCompletionsStreamTransformer:
                 # only process assistant messages
                 if isinstance(chunk, AssistantMessage):
                     async for sse_chunk in self._process_assistant_message(chunk):
-                        print(f"CHUNK: {sse_chunk}")
                         yield sse_chunk
 
                 # handle completion status
