@@ -159,6 +159,59 @@ class TestCLIProxyProvider:
             assert result == []
 
     @pytest.mark.asyncio
+    async def test_get_models_async_uses_stale_cache_on_empty_list(self, provider, sample_models_response):
+        """Test that _get_models_async returns stale cache when API returns empty list (race condition fix)."""
+        with patch("letta.llm_api.openai.openai_get_model_list_async") as mock_fetch:
+            # First call populates cache with real data
+            mock_fetch.return_value = {"data": sample_models_response}
+            result1 = await provider._get_models_async()
+            assert len(result1) == 3
+            assert mock_fetch.call_count == 1
+
+            # Simulate cache expiration by clearing the valid timestamp
+            cache_key = provider._get_cache_key()
+            models, _ = provider._model_cache[cache_key]
+            # Set timestamp to 0 to force cache miss (expired)
+            provider._model_cache[cache_key] = (models, 0)
+
+            # Second call returns empty list (simulating race condition during refresh)
+            mock_fetch.return_value = {"data": []}
+            result2 = await provider._get_models_async()
+            
+            # Should return stale cache, not empty list
+            assert len(result2) == 3
+            assert mock_fetch.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_get_models_async_does_not_cache_empty_list(self, provider, sample_models_response):
+        """Test that empty model lists are not cached (race condition fix)."""
+        with patch("letta.llm_api.openai.openai_get_model_list_async") as mock_fetch:
+            # First call populates cache with real data
+            mock_fetch.return_value = {"data": sample_models_response}
+            result1 = await provider._get_models_async()
+            assert len(result1) == 3
+
+            # Simulate cache expiration
+            cache_key = provider._get_cache_key()
+            models, _ = provider._model_cache[cache_key]
+            provider._model_cache[cache_key] = (models, 0)
+
+            # Second call returns empty list
+            mock_fetch.return_value = {"data": []}
+            result2 = await provider._get_models_async()
+            assert len(result2) == 3  # Uses stale cache
+
+            # Verify empty list was NOT cached - cache should still have original models
+            cached_models, _ = provider._model_cache[cache_key]
+            assert len(cached_models) == 3
+
+            # Third call with real data should work and update cache
+            mock_fetch.return_value = {"data": sample_models_response[:2]}  # Return subset
+            provider._model_cache[cache_key] = (models, 0)  # Force cache expiration again
+            result3 = await provider._get_models_async()
+            assert len(result3) == 2  # New data was returned and cached
+
+    @pytest.mark.asyncio
     async def test_get_model_context_window_async_fetches_from_api(self, provider, sample_models_response):
         """Test that get_model_context_window_async can fetch from API (with safety factor)."""
         with patch("letta.llm_api.openai.openai_get_model_list_async") as mock_fetch:

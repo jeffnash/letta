@@ -221,8 +221,22 @@ class CLIProxyProvider(Provider):
             response = await openai_get_model_list_async(self.base_url, api_key=api_key)
             data = response.get("data", response)
             if isinstance(data, list):
-                self._set_cached_models(data)
-                return data
+                # Only cache non-empty model lists to avoid race condition where
+                # CLIProxyAPI temporarily returns [] during a refresh
+                if data:
+                    self._set_cached_models(data)
+                    return data
+                else:
+                    # Empty list returned - likely a race condition during refresh
+                    # Try to use stale cache instead
+                    logger.warning("CLIProxyAPI returned empty model list, checking for stale cache")
+                    cache_key = self._get_cache_key()
+                    if cache_key in self._model_cache:
+                        models, _ = self._model_cache[cache_key]
+                        logger.info("Using stale cached models from CLIProxyAPI (empty list returned)")
+                        return models
+                    # No stale cache available, return empty list
+                    return []
         except Exception as e:
             logger.warning(f"Failed to fetch models from CLIProxyAPI: {e}")
             # Return stale cache if available
