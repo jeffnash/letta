@@ -119,17 +119,29 @@ def validate_approval_tool_call_ids(approval_request_message: Message, approval_
         response_set = set(approval_response_tool_call_ids)
 
         # Check for IDs in the response that aren't in the request (unexpected IDs)
+        # This can happen when parallel_tool_calls=false causes server-side truncation,
+        # but the client received all tool calls via streaming before truncation.
         unexpected_ids = response_set - request_set
         if unexpected_ids:
-            # This is a hard error - the client sent IDs that don't exist in the request
-            error_msg = (
-                f"Invalid approval response: received unexpected tool_call_ids that don't exist in the request. "
-                f"Unexpected IDs: {unexpected_ids}. "
+            # Log warning and filter out unexpected IDs instead of failing
+            # This handles the streaming/truncation desync gracefully
+            warning_msg = (
+                f"Approval response contains unexpected tool_call_ids not in the request. "
+                f"This may occur when parallel_tool_calls=false truncates tool calls after streaming. "
+                f"Unexpected IDs (will be ignored): {unexpected_ids}. "
                 f"Expected IDs: {approval_request_tool_call_ids}. "
                 f"Message: {approval_request_message.id}"
             )
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            logger.warning(warning_msg)
+
+            # Filter out the unexpected approvals so we only process matching ones
+            approval_responses[:] = [
+                a for a in approval_responses
+                if a.tool_call_id in request_set
+            ]
+            # Update response set after filtering
+            approval_response_tool_call_ids = [a.tool_call_id for a in approval_responses]
+            response_set = set(approval_response_tool_call_ids)
 
         # Check for IDs in the request that aren't in the response (missing IDs)
         missing_ids = request_set - response_set
