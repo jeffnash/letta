@@ -131,6 +131,8 @@ def _models_dev_fallback_limits(model_id: str, owned_by: str) -> tuple[int, int]
 
 # Cache TTL in seconds (5 minutes)
 MODEL_CACHE_TTL_SECONDS = 300
+# Max age for stale cache fallback (1 hour) - after this, don't use stale data
+STALE_CACHE_MAX_AGE_SECONDS = 3600
 
 
 class CLIProxyProvider(Provider):
@@ -193,12 +195,29 @@ class CLIProxyProvider(Provider):
         return base if base else "default"
     
     def _get_cached_models(self) -> list[dict] | None:
-        """Get cached models if still valid."""
+        """Get cached models if still valid (within TTL)."""
         cache_key = self._get_cache_key()
         if cache_key in self._model_cache:
             models, timestamp = self._model_cache[cache_key]
             if time.time() - timestamp < MODEL_CACHE_TTL_SECONDS:
                 return models
+        return None
+    
+    def _get_stale_cached_models(self) -> list[dict] | None:
+        """Get stale cached models (expired but within max age limit).
+        
+        Used as fallback when fresh fetch fails. Returns None if cache is
+        too old (older than STALE_CACHE_MAX_AGE_SECONDS).
+        """
+        cache_key = self._get_cache_key()
+        if cache_key in self._model_cache:
+            models, timestamp = self._model_cache[cache_key]
+            age = time.time() - timestamp
+            if age < STALE_CACHE_MAX_AGE_SECONDS:
+                return models
+            else:
+                # Cache is too old, delete it
+                del self._model_cache[cache_key]
         return None
     
     def _set_cached_models(self, models: list[dict]):
@@ -210,7 +229,7 @@ class CLIProxyProvider(Provider):
         """Fetch available models from CLIProxyAPI with caching."""
         from letta.llm_api.openai import openai_get_model_list_async
         
-        # Check cache first
+        # Check fresh cache first
         cached = self._get_cached_models()
         if cached is not None:
             return cached
@@ -228,23 +247,21 @@ class CLIProxyProvider(Provider):
                     return data
                 else:
                     # Empty list returned - likely a race condition during refresh
-                    # Try to use stale cache instead
+                    # Try to use stale cache instead (with max age limit)
                     logger.warning("CLIProxyAPI returned empty model list, checking for stale cache")
-                    cache_key = self._get_cache_key()
-                    if cache_key in self._model_cache:
-                        models, _ = self._model_cache[cache_key]
+                    stale = self._get_stale_cached_models()
+                    if stale:
                         logger.info("Using stale cached models from CLIProxyAPI (empty list returned)")
-                        return models
+                        return stale
                     # No stale cache available, return empty list
                     return []
         except Exception as e:
             logger.warning(f"Failed to fetch models from CLIProxyAPI: {e}")
-            # Return stale cache if available
-            cache_key = self._get_cache_key()
-            if cache_key in self._model_cache:
-                models, _ = self._model_cache[cache_key]
+            # Return stale cache if available (with max age limit)
+            stale = self._get_stale_cached_models()
+            if stale:
                 logger.info("Using stale cached models from CLIProxyAPI")
-                return models
+                return stale
         
         # No cache, no API response - return empty list
         return []

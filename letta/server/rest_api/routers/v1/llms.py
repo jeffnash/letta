@@ -76,6 +76,29 @@ async def get_model_policy(
     return await server.get_model_policy_async(actor=actor)
 
 
+@router.post("/refresh", operation_id="refresh_model_cache")
+async def refresh_model_cache(
+    server: "SyncServer" = Depends(get_letta_server),
+    headers: HeaderParams = Depends(get_headers),
+):
+    """
+    Clear the CLIProxyProvider model cache, forcing a fresh fetch on the next request.
+    
+    This is useful when models have been added/removed from the CLIProxy upstream
+    and you want to see the changes immediately without waiting for the cache TTL
+    to expire.
+    
+    Note: Currently only clears the CLIProxyProvider cache. Other providers do not
+    implement model caching.
+    """
+    from letta.schemas.providers.cliproxy import CLIProxyProvider
+    
+    # Clear CLIProxy's class-level cache
+    CLIProxyProvider._model_cache.clear()
+    
+    return {"status": "ok", "message": "Model cache cleared. Next /models request will fetch fresh data."}
+
+
 @router.post("/resolve", response_model=ModelSelectorResponse, operation_id="resolve_model_selector")
 async def resolve_model_selector(
     request: ModelSelectorRequest,
