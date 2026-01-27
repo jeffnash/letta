@@ -1253,6 +1253,7 @@ class Agent(BaseAgent):
             timezone=self.agent_state.timezone,
             previous_message_count=self.message_manager.size(actor=self.user, agent_id=self.agent_state.id),
             archival_memory_size=self.agent_manager.passage_size(actor=self.user, agent_id=self.agent_state.id),
+            conversation_start_date=self.agent_state.created_at,
         )
         num_tokens_external_memory_summary = count_tokens(external_memory_summary)
 

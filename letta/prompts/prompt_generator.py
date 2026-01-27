@@ -7,7 +7,7 @@ logger = get_logger(__name__)
 
 from letta.constants import IN_CONTEXT_MEMORY_KEYWORD
 from letta.helpers import ToolRulesSolver
-from letta.helpers.datetime_helpers import format_datetime, get_local_time_fast
+from letta.helpers.datetime_helpers import format_datetime
 from letta.otel.tracing import trace_method
 from letta.schemas.memory import Memory
 
@@ -22,54 +22,44 @@ class PromptGenerator:
         previous_message_count: int = 0,
         archival_memory_size: Optional[int] = 0,
         archive_tags: Optional[List[str]] = None,
+        conversation_start_date: Optional[datetime] = None,
     ) -> str:
         """
         Generate a memory metadata block for the agent's system prompt.
 
-        This creates a structured metadata section that informs the agent about
-        the current state of its memory systems, including timing information
-        and memory counts. This helps the agent understand what information
-        is available through its tools.
+        This creates a minimal, static metadata section to maximize prompt caching.
+        Dynamic values (current time, message counts) are intentionally excluded
+        to avoid cache invalidation on every request. The agent can use tools
+        (e.g., Bash with `date`) to get current time when needed.
 
         Args:
-            memory_edit_timestamp: When memory blocks were last modified
+            memory_edit_timestamp: When memory blocks were last modified (unused, kept for API compatibility)
             timezone: The timezone to use for formatting timestamps (e.g., 'America/Los_Angeles')
-            previous_message_count: Number of messages in recall memory (conversation history)
-            archival_memory_size: Number of items in archival memory (long-term storage)
-            archive_tags: List of unique tags available in archival memory
+            previous_message_count: Number of messages in recall memory (unused, kept for API compatibility)
+            archival_memory_size: Number of items in archival memory (unused, kept for API compatibility)
+            archive_tags: List of unique tags available in archival memory (unused, kept for API compatibility)
+            conversation_start_date: When the conversation/agent was created (fixed timestamp for caching)
 
         Returns:
             A formatted string containing the memory metadata block with XML-style tags
 
         Example Output:
             <memory_metadata>
-            - The current time is: 2024-01-15 10:30 AM PST
-            - Memory blocks were last modified: 2024-01-15 09:00 AM PST
-            - 42 previous messages between you and the user are stored in recall memory (use tools to access them)
-            - 156 total memories you created are stored in archival memory (use tools to access them)
-            - Available archival memory tags: project_x, meeting_notes, research, ideas
+            - Conversation started: January 15, 2024
+            - Use Bash with `date` to check current date/time if needed
+            - Use conversation_search to find past discussions
             </memory_metadata>
         """
-        # Put the timestamp in the local timezone (mimicking get_local_time())
-        timestamp_str = format_datetime(memory_edit_timestamp, timezone)
+        metadata_lines = ["<memory_metadata>"]
 
-        # Create a metadata block of info so the agent knows about the metadata of out-of-context memories
-        metadata_lines = [
-            "<memory_metadata>",
-            f"- The current system date is: {get_local_time_fast(timezone)}",
-            f"- Memory blocks were last modified: {timestamp_str}",
-            f"- {previous_message_count} previous messages between you and the user are stored in recall memory (use tools to access them)",
-        ]
+        # Only include conversation start date if provided (fixed, cacheable)
+        if conversation_start_date:
+            start_date_str = format_datetime(conversation_start_date, timezone)
+            metadata_lines.append(f"- Conversation started: {start_date_str}")
 
-        # Only include archival memory line if there are archival memories
-        if archival_memory_size is not None and archival_memory_size > 0:
-            metadata_lines.append(
-                f"- {archival_memory_size} total memories you created are stored in archival memory (use tools to access them)"
-            )
-
-        # Include archive tags if available
-        if archive_tags:
-            metadata_lines.append(f"- Available archival memory tags: {', '.join(archive_tags)}")
+        # Static instructions that don't change
+        metadata_lines.append("- Use Bash with `date` to check current date/time if needed")
+        metadata_lines.append("- Use conversation_search to find past discussions")
 
         metadata_lines.append("</memory_metadata>")
         memory_metadata_block = "\n".join(metadata_lines)
@@ -102,6 +92,7 @@ class PromptGenerator:
         previous_message_count: int = 0,
         archival_memory_size: int = 0,
         archive_tags: Optional[List[str]] = None,
+        conversation_start_date: Optional[datetime] = None,
     ) -> str:
         """Prepare the final/full system message that will be fed into the LLM API
 
@@ -127,6 +118,7 @@ class PromptGenerator:
                 archival_memory_size=archival_memory_size,
                 timezone=timezone,
                 archive_tags=archive_tags,
+                conversation_start_date=conversation_start_date,
             )
 
             full_memory_string = memory_with_sources + "\n\n" + memory_metadata_string
@@ -175,6 +167,7 @@ class PromptGenerator:
         sources: Optional[List] = None,
         max_files_open: Optional[int] = None,
         llm_config: Optional[object] = None,
+        conversation_start_date: Optional[datetime] = None,
     ) -> str:
         tool_constraint_block = None
         if tool_rules_solver is not None:
@@ -200,4 +193,5 @@ class PromptGenerator:
             template_format=template_format,
             previous_message_count=previous_message_count,
             archival_memory_size=archival_memory_size,
+            conversation_start_date=conversation_start_date,
         )

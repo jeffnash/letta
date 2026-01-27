@@ -2271,8 +2271,11 @@ class RepairMessageHistoryResponse(BaseModel):
         default_factory=list,
         description="List of orphaned tool_use blocks that were detected. Each entry contains message_id, tool_call_id, tool_name, and reason.",
     )
-    removed_message_ids: List[str] = Field(
-        default_factory=list, description="List of message IDs that were removed from the agent's context during repair"
+    injected_message_ids: List[str] = Field(
+        default_factory=list, description="List of synthetic tool_result message IDs that were injected during repair"
+    )
+    injected_tool_call_ids: List[str] = Field(
+        default_factory=list, description="List of tool_call_ids that had synthetic tool_results injected"
     )
 
 
@@ -2295,8 +2298,9 @@ async def repair_message_history(
     - Client disconnects before tool result is saved
     - Timeout during tool execution
 
-    The repair process scans all in-context messages and removes any assistant messages
-    that have tool_calls without corresponding tool_results.
+    The repair process scans all in-context messages and injects synthetic tool_result
+    messages for any orphaned tool_calls. This preserves message positions to maximize
+    prompt caching efficiency (removing messages would shift all subsequent positions).
     """
     actor = await server.user_manager.get_actor_or_default_async(actor_id=headers.actor_id)
     result = await server.agent_manager.repair_message_history_async(agent_id=agent_id, actor=actor, conversation_id=conversation_id)

@@ -1637,9 +1637,9 @@ class AgentManager:
 
         The repair process:
         1. Scans all in-context messages for orphaned tool_use blocks
-        2. For each orphaned tool_use, either:
-           a. Injects a synthetic tool_result message, or
-           b. Removes the orphaned assistant message (current implementation)
+        2. For each orphaned tool_use/tool_call_id, injects a synthetic tool result
+           message (role='tool') immediately after the orphaned assistant/approval
+           message and persists it.
 
         Args:
             agent_id: The ID of the agent to repair
@@ -1651,7 +1651,8 @@ class AgentManager:
                 - status: "ok" (no issues), "repaired" (fixed issues), or "error"
                 - message: Human-readable description
                 - orphaned_tool_calls: List of detected orphaned tool calls
-                - removed_message_ids: List of message IDs that were removed
+                - injected_message_ids: List of message IDs that were injected
+                - injected_tool_call_ids: List of tool_call_ids that were repaired
         """
         repair_conversation = conversation_id not in (None, "", "default")
         conversation_in_context_message_ids: Optional[List[str]] = None
@@ -1678,12 +1679,13 @@ class AgentManager:
 
         logger.info(f"[REPAIR] {repair_target}: Starting repair, found {len(messages)} messages")
 
-        if not messages or len(messages) < 2:
+        if not messages:
             return {
                 "status": "ok",
                 "message": "Conversation has no message history to repair" if repair_conversation else "Agent has no message history to repair",
                 "orphaned_tool_calls": [],
-                "removed_message_ids": [],
+                "injected_message_ids": [],
+                "injected_tool_call_ids": [],
             }
 
         # Get agent state to access llm_config for provider-specific formatting
@@ -1719,11 +1721,10 @@ class AgentManager:
             try:
                 anthropic_messages = PydanticMessageClass.to_anthropic_dicts_from_list(list(filtered_messages))
                 from letta.llm_api.anthropic_client import validate_and_repair_tool_use_pairing
-                # Run repair to detect orphans
-                repaired = validate_and_repair_tool_use_pairing(anthropic_messages)
-                # Extract tool_use_ids that got synthetic tool_results (these are the orphans)
-                # Original tool_results have actual content; synthetic ones have "[Error:" prefix
-                for m in repaired:
+
+                # Track *existing* synthetic tool_results so /repair is idempotent.
+                existing_error_tool_use_ids: Set[str] = set()
+                for m in anthropic_messages:
                     if m.get("role") == "user":
                         for b in (m.get("content") or []):
                             if isinstance(b, dict) and b.get("type") == "tool_result":
@@ -1731,6 +1732,20 @@ class AgentManager:
                                 if isinstance(content, str) and content.startswith("[Error: Tool execution"):
                                     tool_use_id = b.get("tool_use_id")
                                     if tool_use_id:
+                                        existing_error_tool_use_ids.add(tool_use_id)
+
+                # Run repair to detect orphans
+                repaired = validate_and_repair_tool_use_pairing(anthropic_messages)
+                # Extract tool_use_ids that got *new* synthetic tool_results (these are the orphans)
+                # Original synthetic tool_results already present in history are ignored.
+                for m in repaired:
+                    if m.get("role") == "user":
+                        for b in (m.get("content") or []):
+                            if isinstance(b, dict) and b.get("type") == "tool_result":
+                                content = b.get("content", "")
+                                if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                                    tool_use_id = b.get("tool_use_id")
+                                    if tool_use_id and tool_use_id not in existing_error_tool_use_ids:
                                         provider_detected_orphan_ids.add(tool_use_id)
                 if provider_detected_orphan_ids:
                     logger.warning(f"[REPAIR] Anthropic format detected {len(provider_detected_orphan_ids)} orphaned tool_use blocks: {provider_detected_orphan_ids}")
@@ -1743,16 +1758,26 @@ class AgentManager:
             try:
                 openai_messages = PydanticMessageClass.to_openai_dicts_from_list(list(filtered_messages))
                 from letta.llm_api.openai_client import validate_and_repair_openai_tool_call_pairing
-                # Run repair to detect orphans
-                repaired = validate_and_repair_openai_tool_call_pairing(openai_messages)
-                # Extract tool_call_ids that got synthetic responses (these are the orphans)
-                # Synthetic responses have "[Error: Tool execution" in content
-                for m in repaired:
+
+                # Track *existing* synthetic tool responses so /repair is idempotent.
+                existing_error_tool_call_ids: Set[str] = set()
+                for m in openai_messages:
                     if m.get("role") == "tool":
                         content = m.get("content", "")
                         if isinstance(content, str) and content.startswith("[Error: Tool execution"):
                             tool_call_id = m.get("tool_call_id")
                             if tool_call_id:
+                                existing_error_tool_call_ids.add(tool_call_id)
+
+                # Run repair to detect orphans
+                repaired = validate_and_repair_openai_tool_call_pairing(openai_messages)
+                # Extract tool_call_ids that got *new* synthetic responses (these are the orphans)
+                for m in repaired:
+                    if m.get("role") == "tool":
+                        content = m.get("content", "")
+                        if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                            tool_call_id = m.get("tool_call_id")
+                            if tool_call_id and tool_call_id not in existing_error_tool_call_ids:
                                 provider_detected_orphan_ids.add(tool_call_id)
                 if provider_detected_orphan_ids:
                     logger.warning(f"[REPAIR] OpenAI format detected {len(provider_detected_orphan_ids)} orphaned tool_calls: {provider_detected_orphan_ids}")
@@ -1769,7 +1794,6 @@ class AgentManager:
 
         # Find orphaned tool_use blocks in the FILTERED view (same as what API sees)
         orphaned_tool_calls: List[Dict[str, Any]] = []
-        message_ids_to_remove: Set[str] = set()
 
         for i, msg in enumerate(filtered_messages):
             # Check assistant and approval messages with tool_calls
@@ -1797,7 +1821,6 @@ class AgentManager:
                             "reason": "no_following_message",
                         }
                     )
-                    message_ids_to_remove.add(original_msg_id)
                 continue
 
             # Check if next message is a tool response
@@ -1814,7 +1837,6 @@ class AgentManager:
                             "reason": "next_message_not_tool_response",
                         }
                     )
-                    message_ids_to_remove.add(original_msg_id)
                 continue
 
             # Check which tool_call_ids have results
@@ -1841,19 +1863,7 @@ class AgentManager:
                                 "reason": "missing_tool_result",
                             }
                         )
-                        message_ids_to_remove.add(original_msg_id)
-                # Also remove the following tool message if it only contains unmatched tool returns
-                if next_msg and next_msg.role == MessageRole.tool:
-                    # Check if all tool_returns in next_msg are for orphaned tool_call_ids
-                    next_msg_tool_return_ids = set()
-                    if next_msg.tool_returns:
-                        next_msg_tool_return_ids = {tr.tool_call_id for tr in next_msg.tool_returns}
-                    if next_msg.tool_call_id:
-                        next_msg_tool_return_ids.add(next_msg.tool_call_id)
-                    # If all returns in next_msg are for tool_calls in this assistant message, remove it too
-                    if next_msg_tool_return_ids and next_msg_tool_return_ids.issubset(tool_call_ids):
-                        message_ids_to_remove.add(next_msg.id)
-
+    
         # ============================================================================
         # MERGE PROVIDER-DETECTED ORPHANS INTO RESULTS
         # ============================================================================
@@ -1885,56 +1895,113 @@ class AgentManager:
                         "tool_name": tool_name,
                         "reason": "provider_format_orphan",
                     })
-                    message_ids_to_remove.add(original_msg_id)
 
         if not orphaned_tool_calls:
             return {
                 "status": "ok",
                 "message": "No orphaned tool_use blocks found",
                 "orphaned_tool_calls": [],
-                "removed_message_ids": [],
+                "injected_message_ids": [],
+                "injected_tool_call_ids": [],
             }
 
-        # Remove the orphaned messages from in-context
-        if repair_conversation:
-            from letta.services.conversation_manager import ConversationManager
+        # Inject synthetic tool result messages (do NOT remove any messages).
+        # Removing messages shifts subsequent message positions and breaks prompt caching.
+        from letta.schemas.letta_message_content import TextContent
 
+        # Fetch the current in-context message id list we will mutate.
+        if repair_conversation:
             conversation_manager = ConversationManager()
             if conversation_in_context_message_ids is None:
                 conversation_in_context_message_ids = await conversation_manager.get_message_ids_for_conversation(
                     conversation_id=conversation_id,
                     actor=actor,
                 )
-            new_message_ids = [mid for mid in conversation_in_context_message_ids if mid not in message_ids_to_remove]
+            current_message_ids = list(conversation_in_context_message_ids)
         else:
             agent = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
-            new_message_ids = [mid for mid in agent.message_ids if mid not in message_ids_to_remove]
+            current_message_ids = list(agent.message_ids or [])
 
-        # Check if any messages were actually removed
-        if repair_conversation:
-            if conversation_in_context_message_ids is not None and len(new_message_ids) == len(conversation_in_context_message_ids):
-                # No messages changed - this shouldn't happen if orphaned_tool_calls is non-empty,
-                # but guard against it to ensure status reflects actual changes
-                return {
-                    "status": "ok",
-                    "message": "Orphaned tool_use blocks detected but no messages needed removal",
-                    "orphaned_tool_calls": orphaned_tool_calls,
-                    "removed_message_ids": [],
-                }
-        elif len(new_message_ids) == len(agent.message_ids):
-            # No messages changed - this shouldn't happen if orphaned_tool_calls is non-empty,
-            # but guard against it to ensure status reflects actual changes
+        # Deduplicate orphans by tool_call_id and group them by their originating message.
+        orphans_by_message_id: Dict[str, List[Dict[str, Any]]] = {}
+        seen_tool_call_ids: Set[str] = set()
+        for oc in orphaned_tool_calls:
+            tool_call_id = oc.get("tool_call_id")
+            if not tool_call_id or tool_call_id in seen_tool_call_ids:
+                continue
+            seen_tool_call_ids.add(tool_call_id)
+            orphans_by_message_id.setdefault(oc["message_id"], []).append(oc)
+
+        # Build synthetic tool messages in deterministic order: in-context order, then tool_call_id.
+        synthetic_messages: List[PydanticMessage] = []
+        for mid in current_message_ids:
+            if mid not in orphans_by_message_id:
+                continue
+            orphans_by_message_id[mid].sort(key=lambda x: (x.get("tool_call_id") or ""))
+            for oc in orphans_by_message_id[mid]:
+                tool_name = oc.get("tool_name") or "unknown"
+                tool_call_id = oc.get("tool_call_id")
+                if not tool_call_id:
+                    continue
+
+                synthetic_messages.append(
+                    Message(
+                        role=MessageRole.tool,
+                        tool_call_id=tool_call_id,
+                        content=[
+                            TextContent(
+                                text=f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]"
+                            )
+                        ],
+                        agent_id=agent_state.id,
+                        model=agent_state.llm_config.model,
+                    )
+                )
+
+        if not synthetic_messages:
             return {
                 "status": "ok",
-                "message": "Orphaned tool_use blocks detected but no messages needed removal",
+                "message": "Orphaned tool_use blocks detected but no synthetic tool results needed injection",
                 "orphaned_tool_calls": orphaned_tool_calls,
-                "removed_message_ids": [],
+                "injected_message_ids": [],
+                "injected_tool_call_ids": [],
             }
 
-        if repair_conversation:
-            from letta.services.conversation_manager import ConversationManager
+        # Persist the synthetic messages.
+        persisted_synthetic_messages = await self.message_manager.create_many_messages_async(
+            synthetic_messages,
+            actor=actor,
+            project_id=agent_state.project_id,
+            template_id=agent_state.template_id,
+        )
+        injected_message_ids = [m.id for m in persisted_synthetic_messages]
+        injected_tool_call_ids = [m.tool_call_id for m in persisted_synthetic_messages if m.tool_call_id]
 
-            conversation_manager = ConversationManager()
+        # Rebuild the in-context message id list with the injected messages.
+        injected_ids_by_after_id: Dict[str, List[str]] = {}
+        cursor = 0
+        for mid in current_message_ids:
+            if mid not in orphans_by_message_id:
+                continue
+            count = len(orphans_by_message_id[mid])
+            if count:
+                injected_ids_by_after_id[mid] = injected_message_ids[cursor : cursor + count]
+                cursor += count
+
+        new_message_ids: List[str] = []
+        for mid in current_message_ids:
+            new_message_ids.append(mid)
+            if mid in injected_ids_by_after_id:
+                new_message_ids.extend(injected_ids_by_after_id[mid])
+
+        # Persist the reordered in-context message list.
+        if repair_conversation:
+            await conversation_manager.add_messages_to_conversation(
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+                message_ids=injected_message_ids,
+                actor=actor,
+            )
             await conversation_manager.update_in_context_messages(
                 conversation_id=conversation_id,
                 in_context_message_ids=new_message_ids,
@@ -1944,15 +2011,16 @@ class AgentManager:
             await self.set_in_context_messages_async(agent_id=agent_id, message_ids=new_message_ids, actor=actor)
 
         logger.warning(
-            f"Repaired {repair_target} message history: removed {len(message_ids_to_remove)} messages "
-            f"with {len(orphaned_tool_calls)} orphaned tool_use blocks"
+            f"Repaired {repair_target} message history: injected {len(injected_message_ids)} synthetic tool result message(s) "
+            f"for {len(injected_tool_call_ids)} orphaned tool_call(s)"
         )
 
         return {
             "status": "repaired",
-            "message": f"Removed {len(message_ids_to_remove)} message(s) with {len(orphaned_tool_calls)} orphaned tool_use block(s)",
+            "message": f"Injected {len(injected_message_ids)} synthetic tool result message(s) for {len(injected_tool_call_ids)} orphaned tool_call(s)",
             "orphaned_tool_calls": orphaned_tool_calls,
-            "removed_message_ids": list(message_ids_to_remove),
+            "injected_message_ids": injected_message_ids,
+            "injected_tool_call_ids": injected_tool_call_ids,
         }
 
     @enforce_types

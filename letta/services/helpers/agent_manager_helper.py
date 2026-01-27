@@ -262,6 +262,7 @@ def compile_system_message(
     sources: Optional[List] = None,
     max_files_open: Optional[int] = None,
     llm_config: Optional[object] = None,
+    conversation_start_date: Optional[datetime] = None,
 ) -> str:
     """Prepare the final/full system message that will be fed into the LLM API
 
@@ -292,6 +293,7 @@ def compile_system_message(
             previous_message_count=previous_message_count,
             archival_memory_size=archival_memory_size or 0,
             timezone=timezone,
+            conversation_start_date=conversation_start_date,
         )
 
         memory_with_sources = in_context_memory.compile(
@@ -350,6 +352,7 @@ def initialize_message_sequence(
         archival_memory_size=archival_memory_size,
         sources=agent_state.sources,
         max_files_open=agent_state.max_files_open,
+        conversation_start_date=agent_state.created_at,
     )
     first_user_message = get_login_event(agent_state.timezone)  # event letting Letta know the user just logged in
 
@@ -420,6 +423,7 @@ async def initialize_message_sequence_async(
         archival_memory_size=archival_memory_size,
         sources=agent_state.sources,
         max_files_open=agent_state.max_files_open,
+        conversation_start_date=agent_state.created_at,
     )
     first_user_message = get_login_event(agent_state.timezone)  # event letting Letta know the user just logged in
 
