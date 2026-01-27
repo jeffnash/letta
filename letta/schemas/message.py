@@ -907,8 +907,12 @@ class Message(BaseMessage):
             # Handle non-JSON responses gracefully (e.g., interrupted tool executions
             # that stored error strings instead of JSON)
             logger.warning(f"Failed to parse tool response as JSON, treating as plain text: {e}")
-            # Determine status based on content
-            status = "error" if "error" in response_text.lower() or "interrupt" in response_text.lower() else "OK"
+            # Determine status based on content - if we can't parse it as JSON, it's likely an error
+            # Use conservative approach: treat unparseable responses as errors unless they look successful
+            # Check for common error indicators
+            lower_text = response_text.lower()
+            is_error = any(indicator in lower_text for indicator in ["error", "exception", "failed", "failure", "interrupt", "traceback"])
+            status = "error" if is_error else "success"
             return {
                 "message": response_text,
                 "status": status,
