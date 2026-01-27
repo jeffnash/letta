@@ -151,6 +151,12 @@ class LettaAgentV3(LettaAgentV2):
             run_id,
             conversation_id=conversation_id,
         )
+
+        # If input was stripped (e.g., stale approval after cancel race condition), return early
+        if not input_messages_to_persist:
+            self.stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+            return response_letta_messages
+
         follow_up_messages = []
         if len(input_messages_to_persist) > 1 and input_messages_to_persist[0].role == "approval":
             follow_up_messages = input_messages_to_persist[1:]
@@ -337,6 +343,12 @@ class LettaAgentV3(LettaAgentV2):
                 run_id,
                 conversation_id=conversation_id,
             )
+
+            # If input was stripped (e.g., stale approval after cancel race condition), return early
+            if not input_messages_to_persist:
+                self.stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+                return
+
             follow_up_messages = []
             if len(input_messages_to_persist) > 1 and input_messages_to_persist[0].role == "approval":
                 follow_up_messages = input_messages_to_persist[1:]
@@ -1483,6 +1495,10 @@ class LettaAgentV3(LettaAgentV2):
             request_heartbeat=False,  # NOTE: difference for v3 (don't add request heartbeat)
             terminal_tools=terminal_tool_names,
         )
+
+        # Deterministic tool ordering is required for prompt caching.
+        # Tool schema order is not semantically meaningful, so we sort by tool name.
+        allowed_tools = sorted(allowed_tools, key=lambda t: (t.get("name") or "").lower())
         return allowed_tools
 
     @trace_method

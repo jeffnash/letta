@@ -227,6 +227,12 @@ class LettaAgent(BaseAgent):
         current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
             input_messages, agent_state, self.message_manager, self.actor
         )
+
+        # If input was stripped (e.g., stale approval after cancel race condition), return early
+        if not new_in_context_messages:
+            # Yield empty completion for the async generator
+            return
+
         initial_messages = new_in_context_messages
         in_context_messages = current_in_context_messages
         tool_rules_solver = ToolRulesSolver(agent_state.tool_rules)
@@ -577,6 +583,13 @@ class LettaAgent(BaseAgent):
         current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
             input_messages, agent_state, self.message_manager, self.actor
         )
+
+        # If input was stripped (e.g., stale approval after cancel race condition), return early
+        if not new_in_context_messages:
+            if dry_run:
+                return {}
+            return ([], [], LettaStopReason(stop_reason=StopReasonType.end_turn.value), LettaUsageStatistics())
+
         initial_messages = new_in_context_messages
         in_context_messages = current_in_context_messages
         tool_rules_solver = ToolRulesSolver(agent_state.tool_rules)
@@ -927,6 +940,13 @@ class LettaAgent(BaseAgent):
         current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
             input_messages, agent_state, self.message_manager, self.actor
         )
+
+        # If input was stripped (e.g., stale approval after cancel race condition), return early
+        if not new_in_context_messages:
+            stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+            yield f"data: {stop_reason.model_dump_json()}\n\n"
+            return
+
         initial_messages = new_in_context_messages
         in_context_messages = current_in_context_messages
 

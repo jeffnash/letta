@@ -307,13 +307,27 @@ async def _prepare_in_context_messages_no_persist_async(
     if input_messages[0].type == "approval":
         # User is trying to send an approval response
         if current_in_context_messages and current_in_context_messages[-1].role != "approval":
-            logger.warn(
-                f"Cannot process approval response: No tool call is currently awaiting approval. Last message: {current_in_context_messages[-1]}"
+            # No pending approval - this commonly happens after a cancel race condition.
+            # The server-side cancel already created denial messages for the pending approvals,
+            # but the client may have also queued denials before the cancel completed.
+            # Silently strip the stale approval and continue with any follow-up messages.
+            logger.warning(
+                f"Ignoring stale approval response: No tool call is currently awaiting approval. "
+                f"Last message role: {current_in_context_messages[-1].role}. "
+                f"This commonly occurs after a cancel race condition."
             )
-            raise ValueError(
-                "Cannot process approval response: No tool call is currently awaiting approval. "
-                "Please send a regular message to interact with the agent."
-            )
+            if len(input_messages) > 1:
+                # Strip the stale approval and process the remaining messages as regular input
+                input_messages = input_messages[1:]
+                new_in_context_messages = await create_input_messages(
+                    input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=run_id, actor=actor
+                )
+            else:
+                # Approval-only payload with no pending approval - nothing to do
+                # Return empty new messages; caller will handle appropriately
+                new_in_context_messages = []
+            return current_in_context_messages, new_in_context_messages
+
         validate_approval_tool_call_ids(current_in_context_messages[-1], input_messages[0])
         new_in_context_messages = create_approval_response_message_from_input(
             agent_state=agent_state, input_message=input_messages[0], run_id=run_id

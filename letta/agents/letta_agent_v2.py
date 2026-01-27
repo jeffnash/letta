@@ -199,6 +199,12 @@ class LettaAgentV2(BaseAgentV2):
         in_context_messages, input_messages_to_persist = await _prepare_in_context_messages_no_persist_async(
             input_messages, self.agent_state, self.message_manager, self.actor, run_id
         )
+
+        # If input was stripped (e.g., stale approval after cancel race condition), return early
+        if not input_messages_to_persist:
+            self.stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+            return LettaResponse(messages=[], stop_reason=self.stop_reason, usage=self.usage)
+
         in_context_messages = in_context_messages + input_messages_to_persist
         response_letta_messages = []
         for i in range(max_steps):
@@ -311,6 +317,12 @@ class LettaAgentV2(BaseAgentV2):
             in_context_messages, input_messages_to_persist = await _prepare_in_context_messages_no_persist_async(
                 input_messages, self.agent_state, self.message_manager, self.actor, run_id
             )
+
+            # If input was stripped (e.g., stale approval after cancel race condition), return early
+            if not input_messages_to_persist:
+                self.stop_reason = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
+                return
+
             in_context_messages = in_context_messages + input_messages_to_persist
             for i in range(max_steps):
                 response = self._step(
