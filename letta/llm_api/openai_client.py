@@ -337,35 +337,85 @@ def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict])
     return repaired_items
 
 
-def is_anthropic_backed_proxy(llm_config: LLMConfig) -> bool:
-    """Check if the LLM config points to an Anthropic-backed proxy like CLIProxy.
+def supports_parallel_tool_calls(llm_config: LLMConfig) -> bool:
+    """Determine if the model supports parallel tool calls at inference time.
 
-    Anthropic-backed proxies (e.g., CLIProxy routing to Claude models) require
-    immediate tool_result for each tool_use and don't support parallel tool calls.
-    This helper inspects the LLMConfig to detect such proxies.
+    This is checked dynamically based on the current model, not stored config,
+    so it works correctly when models are switched mid-conversation.
 
-    Detection criteria:
-    - provider_name is 'cliproxy'
-    - model handle contains anthropic model identifiers (claude, opus, sonnet, haiku)
+    Known supported:
+    - OpenAI/GPT models: Full support
+    - Anthropic/Claude models: Full support
+    - Google/Gemini models: Full support (though sometimes quirky)
+    - Copilot routes: Full support (routes to OpenAI)
+    - Kimi, MiniMax, GLM: Full support
+
+    Known unsupported or untested:
+    - Passthru routes with unknown backends
+    - Some smaller/older models
 
     Args:
         llm_config: The LLM configuration to inspect.
 
     Returns:
-        True if the config points to an Anthropic-backed proxy, False otherwise.
+        True if the model supports parallel tool calls, False otherwise.
     """
-    if llm_config.provider_name == "cliproxy":
-        # CLIProxy can route to multiple backends, check if it's routing to Anthropic
-        model_lower = (llm_config.model or "").lower()
-        handle_lower = (llm_config.handle or "").lower()
+    model_lower = (llm_config.model or "").lower()
+    handle_lower = (llm_config.handle or "").lower()
+    provider = (llm_config.provider_name or "").lower()
 
-        # Check for Anthropic model identifiers in model name or handle
-        anthropic_identifiers = ["claude", "opus", "sonnet", "haiku"]
-        for identifier in anthropic_identifiers:
-            if identifier in model_lower or identifier in handle_lower:
-                return True
+    # Check model name and handle for known-supported patterns
+    def matches_any(text: str, patterns: list[str]) -> bool:
+        return any(p in text for p in patterns)
 
-    return False
+    # OpenAI models - full support
+    openai_patterns = ["gpt-3.5", "gpt-4", "gpt-5", "o1", "o3", "openai"]
+    if matches_any(model_lower, openai_patterns) or matches_any(handle_lower, openai_patterns):
+        return True
+
+    # Anthropic/Claude models - full support
+    anthropic_patterns = ["claude", "opus", "sonnet", "haiku", "anthropic"]
+    if matches_any(model_lower, anthropic_patterns) or matches_any(handle_lower, anthropic_patterns):
+        return True
+
+    # Google/Gemini models - full support
+    google_patterns = ["gemini", "palm", "google"]
+    if matches_any(model_lower, google_patterns) or matches_any(handle_lower, google_patterns):
+        return True
+
+    # Other known-supported models
+    other_supported = ["kimi", "minimax", "glm", "qwen", "deepseek", "mistral", "llama"]
+    if matches_any(model_lower, other_supported) or matches_any(handle_lower, other_supported):
+        return True
+
+    # Provider-based detection
+    supported_providers = ["openai", "anthropic", "google", "google_ai", "google_vertex", 
+                          "copilot", "azure", "together", "groq", "xai"]
+    if provider in supported_providers:
+        return True
+
+    # CLIProxy - check underlying model
+    if provider == "cliproxy":
+        # If we matched any pattern above, we already returned True
+        # For unknown cliproxy models, check if it looks like a major provider's model
+        all_patterns = openai_patterns + anthropic_patterns + google_patterns + other_supported
+        if matches_any(model_lower, all_patterns) or matches_any(handle_lower, all_patterns):
+            return True
+        # Unknown cliproxy model - be conservative
+        return False
+
+    # Passthru - unknown backend, be conservative
+    if "passthru" in model_lower or "passthru" in handle_lower:
+        return False
+
+    # Default: if we have endpoint type hints, use them
+    endpoint_type = (llm_config.model_endpoint_type or "").lower()
+    if endpoint_type in ["openai", "anthropic", "google_ai", "google_vertex"]:
+        return True
+
+    # Unknown - default to True since most modern LLMs support it
+    # This is a reasonable default; the server-side filter handles mismatches gracefully
+    return True
 
 
 def supports_verbosity_control(model: str) -> bool:

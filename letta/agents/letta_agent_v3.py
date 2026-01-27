@@ -720,24 +720,24 @@ class LettaAgentV3(LettaAgentV2):
                                     isinstance(request_data.get("tool_choice"), dict)
                                     and "disable_parallel_tool_use" in request_data["tool_choice"]
                                 ):
-                                    # Gate parallel tool use on both: no tool rules and toggled on
-                                    if no_tool_rules and self.agent_state.llm_config.parallel_tool_calls:
+                                    # Gate parallel tool use on both: no tool rules and model supports it
+                                    from letta.llm_api.openai_client import supports_parallel_tool_calls
+                                    model_supports_parallel = supports_parallel_tool_calls(self.agent_state.llm_config)
+                                    if no_tool_rules and model_supports_parallel:
                                         request_data["tool_choice"]["disable_parallel_tool_use"] = False
                                     else:
-                                        # Explicitly disable when tool rules present or llm_config toggled off
+                                        # Explicitly disable when tool rules present or model doesn't support it
                                         request_data["tool_choice"]["disable_parallel_tool_use"] = True
 
                             # OpenAI parallel tool use
                             elif self.agent_state.llm_config.model_endpoint_type == "openai":
-                                # For OpenAI, we control parallel tool calling via parallel_tool_calls field
-                                # Only allow parallel tool calls when no tool rules and enabled in config
+                                # For OpenAI-compatible endpoints, control parallel tool calling dynamically
+                                # based on the current model (not stored config) so it works when switching models
                                 if "parallel_tool_calls" in request_data:
-                                    # Anthropic-backed proxies (like CLIProxy routing to Claude) require
-                                    # immediate tool_result for each tool_use. Force parallel_tool_calls=False.
-                                    from letta.llm_api.openai_client import is_anthropic_backed_proxy
-                                    if is_anthropic_backed_proxy(self.agent_state.llm_config):
-                                        request_data["parallel_tool_calls"] = False
-                                    elif no_tool_rules and self.agent_state.llm_config.parallel_tool_calls:
+                                    from letta.llm_api.openai_client import supports_parallel_tool_calls
+                                    model_supports_parallel = supports_parallel_tool_calls(self.agent_state.llm_config)
+                                    # Only enable if: model supports it AND no tool rules restrict it
+                                    if no_tool_rules and model_supports_parallel:
                                         request_data["parallel_tool_calls"] = True
                                     else:
                                         request_data["parallel_tool_calls"] = False
@@ -843,11 +843,14 @@ class LettaAgentV3(LettaAgentV2):
                 else:
                     tool_calls = []
 
-                # Enforce parallel_tool_calls=false by truncating to first tool call
-                # Some providers (e.g. Gemini) don't respect this setting via API, so we enforce it client-side
-                if len(tool_calls) > 1 and not self.agent_state.llm_config.parallel_tool_calls:
+                # Enforce parallel_tool_calls restriction by truncating to first tool call
+                # Some providers don't respect this setting via API, so we enforce it server-side
+                # Use dynamic check based on current model (not stored config)
+                from letta.llm_api.openai_client import supports_parallel_tool_calls
+                model_supports_parallel = supports_parallel_tool_calls(self.agent_state.llm_config)
+                if len(tool_calls) > 1 and not model_supports_parallel:
                     self.logger.warning(
-                        f"LLM returned {len(tool_calls)} tool calls but parallel_tool_calls=false. "
+                        f"LLM returned {len(tool_calls)} tool calls but model doesn't support parallel tool calls. "
                         f"Truncating to first tool call: {tool_calls[0].function.name}"
                     )
                     tool_calls = [tool_calls[0]]
