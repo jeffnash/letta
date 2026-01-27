@@ -552,6 +552,10 @@ def _load_last_function_response(in_context_messages: list[Message]):
     for msg in reversed(in_context_messages):
         if msg.role == MessageRole.tool and msg.content and len(msg.content) == 1 and isinstance(msg.content[0], TextContent):
             text_content = msg.content[0].text
+            # Handle legacy plain text synthetic error messages from repair
+            # These start with "[Error:" and are not valid JSON - return the message directly
+            if text_content.startswith("[Error:"):
+                return text_content
             try:
                 response_json = json.loads(text_content)
                 if response_json.get("message"):
