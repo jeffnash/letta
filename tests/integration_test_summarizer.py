@@ -184,7 +184,7 @@ async def run_summarization(server: SyncServer, agent_state, in_context_messages
     agent_loop = LettaAgentV3(agent_state=agent_state, actor=actor)
 
     # Run summarization with force parameter
-    summary_message, messages, summary = await agent_loop.compact(messages=in_context_messages)
+    summary_message, messages, summary, _ = await agent_loop.compact(messages=in_context_messages)
 
     return summary_message, messages, summary
 
@@ -725,7 +725,7 @@ async def test_summarize_with_mode(server: SyncServer, actor, llm_config: LLMCon
 
     agent_loop = LettaAgentV3(agent_state=agent_state, actor=actor)
 
-    summary, result, _ = await agent_loop.compact(messages=in_context_messages)
+    summary, result, _, _ = await agent_loop.compact(messages=in_context_messages)
 
     assert isinstance(result, list)
 
@@ -823,7 +823,7 @@ async def test_v3_compact_uses_compaction_settings_model_and_model_settings(serv
     # Patch simple_summary so we don't hit the real LLM and can inspect llm_config
     with patch.object(summarizer_all, "simple_summary", new=fake_simple_summary):
         agent_loop = LettaAgentV3(agent_state=agent_state, actor=actor)
-        summary_msg, compacted, _ = await agent_loop.compact(messages=in_context_messages)
+        summary_msg, compacted, _, _ = await agent_loop.compact(messages=in_context_messages)
 
     assert summary_msg is not None
     assert "value" in captured_llm_config
@@ -911,7 +911,7 @@ async def test_v3_summarize_hard_eviction_when_still_over_threshold(
 
         caplog.set_level("ERROR")
 
-        summary, result, _ = await agent_loop.compact(
+        summary, result, _, _ = await agent_loop.compact(
             messages=in_context_messages,
             trigger_threshold=context_limit,
         )
