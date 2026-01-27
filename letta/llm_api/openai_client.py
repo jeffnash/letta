@@ -222,7 +222,7 @@ def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[d
                 synthetic_response = {
                     "role": "tool",
                     "tool_call_id": tid,
-                    "content": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "content": json.dumps({"message": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"}),
                 }
                 repaired_messages.insert(insert_position, synthetic_response)
                 insert_position += 1
@@ -317,7 +317,7 @@ def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict])
             synthetic_output = {
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                "output": json.dumps({"message": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"}),
             }
             repaired_items.append(synthetic_output)
             orphaned_count += 1

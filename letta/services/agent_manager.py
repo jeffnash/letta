@@ -2068,7 +2068,8 @@ class AgentManager:
                         for b in (m.get("content") or []):
                             if isinstance(b, dict) and b.get("type") == "tool_result":
                                 content = b.get("content", "")
-                                if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                                # Check for both old plain text format and new JSON format
+                                if isinstance(content, str) and (content.startswith("[Error: Tool execution") or '"status": "error"' in content):
                                     tool_use_id = b.get("tool_use_id")
                                     if tool_use_id:
                                         existing_error_tool_use_ids.add(tool_use_id)
@@ -2082,7 +2083,8 @@ class AgentManager:
                         for b in (m.get("content") or []):
                             if isinstance(b, dict) and b.get("type") == "tool_result":
                                 content = b.get("content", "")
-                                if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                                # Check for both old plain text format and new JSON format
+                                if isinstance(content, str) and (content.startswith("[Error: Tool execution") or '"status": "error"' in content):
                                     tool_use_id = b.get("tool_use_id")
                                     if tool_use_id and tool_use_id not in existing_error_tool_use_ids:
                                         provider_detected_orphan_ids.add(tool_use_id)
@@ -2103,7 +2105,8 @@ class AgentManager:
                 for m in openai_messages:
                     if m.get("role") == "tool":
                         content = m.get("content", "")
-                        if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                        # Check for both old plain text format and new JSON format
+                        if isinstance(content, str) and (content.startswith("[Error: Tool execution") or '"status": "error"' in content):
                             tool_call_id = m.get("tool_call_id")
                             if tool_call_id:
                                 existing_error_tool_call_ids.add(tool_call_id)
@@ -2114,7 +2117,8 @@ class AgentManager:
                 for m in repaired:
                     if m.get("role") == "tool":
                         content = m.get("content", "")
-                        if isinstance(content, str) and content.startswith("[Error: Tool execution"):
+                        # Check for both old plain text format and new JSON format
+                        if isinstance(content, str) and (content.startswith("[Error: Tool execution") or '"status": "error"' in content):
                             tool_call_id = m.get("tool_call_id")
                             if tool_call_id and tool_call_id not in existing_error_tool_call_ids:
                                 provider_detected_orphan_ids.add(tool_call_id)
@@ -2289,7 +2293,7 @@ class AgentManager:
                         tool_call_id=tool_call_id,
                         content=[
                             TextContent(
-                                text=f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]"
+                                text=json.dumps({"message": f"[Error: Tool execution for '{tool_name}' was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"})
                             )
                         ],
                         agent_id=agent_state.id,

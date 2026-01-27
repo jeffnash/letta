@@ -1681,7 +1681,7 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
                 {
                     "type": "tool_result",
                     "tool_use_id": tid,
-                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "content": json.dumps({"message": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"}),
                     "is_error": True,
                 }
                 for tid in sorted(tool_use_ids)
@@ -1701,7 +1701,7 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
                 {
                     "type": "tool_result",
                     "tool_use_id": tid,
-                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "content": json.dumps({"message": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"}),
                     "is_error": True,
                 }
                 for tid in sorted(tool_use_ids)
@@ -1733,7 +1733,7 @@ def validate_and_repair_tool_use_pairing(messages: List[dict]) -> List[dict]:
                 {
                     "type": "tool_result",
                     "tool_use_id": tid,
-                    "content": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]",
+                    "content": json.dumps({"message": "[Error: Tool execution was interrupted before completion. The tool call was not executed. Please retry if needed.]", "status": "error"}),
                     "is_error": True,
                 }
                 for tid in sorted(missing_ids)
