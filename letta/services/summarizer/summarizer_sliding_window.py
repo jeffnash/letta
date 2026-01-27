@@ -11,6 +11,7 @@ from letta.schemas.message import Message, MessageCreate
 from letta.schemas.user import User
 from letta.services.context_window_calculator.token_counter import create_token_counter
 from letta.services.message_manager import MessageManager
+from letta.services.summarizer.memory_message_utils import filter_memory_messages
 from letta.services.summarizer.summarizer import simple_summary
 from letta.services.summarizer.summarizer_config import CompactionSettings
 from letta.system import package_summarize_message_no_counts
@@ -193,23 +194,41 @@ async def summarize_via_sliding_window(
     A tool response message (role=tool) will never be orphaned from its corresponding assistant
     message (which contains the tool_use block).
 
+    IMPORTANT: Memory context messages (identified by name tag or content patterns) are NOT
+    included in summarization. They are filtered out before processing and should be re-added
+    by the caller (compact() in LettaAgentV3) with fresh memory state.
+
     Returns:
     - The summary string
-    - The list of message IDs to keep in-context
+    - The list of messages to keep in-context (system prompt + retained conversation, NO memory messages)
     """
     system_prompt = in_context_messages[0]
-    total_message_count = len(in_context_messages)
+    
+    # Filter out memory messages - they should not be summarized
+    # Memory will be re-injected fresh by the caller after compaction
+    conversation_messages_raw = in_context_messages[1:]  # Everything after system prompt
+    conversation_messages, memory_messages = filter_memory_messages(conversation_messages_raw)
+    
+    if memory_messages:
+        logger.info(f"Filtered out {len(memory_messages)} memory message(s) from summarization")
+    
+    # If no conversation messages left after filtering, nothing to summarize
+    if not conversation_messages:
+        logger.warning("No conversation messages to summarize after filtering memory messages")
+        return "", [system_prompt]
+    
+    total_message_count = len(conversation_messages)
 
     # cannot evict a pending approval request (will cause client-side errors)
-    if in_context_messages[-1].role == MessageRole.approval:
+    if conversation_messages[-1].role == MessageRole.approval:
         maximum_message_index = total_message_count - 2
     else:
         maximum_message_index = total_message_count - 1
 
-    # Build tool call pairing maps for atomic eviction
-    tool_call_id_to_assistant_idx = _build_tool_call_id_to_assistant_index(in_context_messages)
+    # Build tool call pairing maps for atomic eviction (on conversation messages only)
+    tool_call_id_to_assistant_idx = _build_tool_call_id_to_assistant_index(conversation_messages)
     assistant_idx_to_tool_indices = _build_assistant_index_to_tool_response_indices(
-        in_context_messages, tool_call_id_to_assistant_idx
+        conversation_messages, tool_call_id_to_assistant_idx
     )
 
     # Starts at N% (eg 70%), and increments up until 100%
@@ -223,7 +242,7 @@ async def summarize_via_sliding_window(
     # valid_cutoff_roles = {MessageRole.assistant, MessageRole.approval}
     valid_cutoff_roles = {MessageRole.assistant}
 
-    # simple version: summarize(in_context[1:round(summarizer_config.sliding_window_percentage * len(in_context_messages))])
+    # simple version: summarize(conversation[0:round(summarizer_config.sliding_window_percentage * len(conversation))])
     # this evicts 30% of the messages (via summarization) and keeps the remaining 70%
     # problem: we need the cutoff point to be an assistant message, so will grow the cutoff point until we find an assistant message
     # also need to grow the cutoff point until the token count is less than the target token count
@@ -233,12 +252,12 @@ async def summarize_via_sliding_window(
         # more eviction percentage
         eviction_percentage += 0.10
 
-        # calculate message_cutoff_index
+        # calculate message_cutoff_index (relative to conversation_messages, not in_context_messages)
         message_cutoff_index = round(eviction_percentage * total_message_count)
 
         # Find a safe cutoff index that respects tool pairing constraints
         safe_cutoff_index = _find_safe_cutoff_index(
-            messages=in_context_messages,
+            messages=conversation_messages,
             target_cutoff_index=message_cutoff_index,
             tool_call_id_to_assistant_idx=tool_call_id_to_assistant_idx,
             assistant_idx_to_tool_indices=assistant_idx_to_tool_indices,
@@ -249,12 +268,12 @@ async def summarize_via_sliding_window(
             logger.warning(f"No safe cutoff found for evicting up to index {message_cutoff_index}, incrementing eviction percentage")
             continue
 
-        # update token count
-        logger.info(f"Attempting to compact messages index 1:{safe_cutoff_index} messages")
-        post_summarization_buffer = [system_prompt] + in_context_messages[safe_cutoff_index:]
+        # update token count - note: memory will be added back by caller, so we only count system + retained conversation
+        logger.info(f"Attempting to compact messages index 0:{safe_cutoff_index} (conversation only)")
+        post_summarization_buffer = [system_prompt] + conversation_messages[safe_cutoff_index:]
         approx_token_count = await count_tokens(actor, llm_config, post_summarization_buffer)
         logger.info(
-            f"Compacting messages index 1:{safe_cutoff_index} messages resulted in {approx_token_count} tokens, goal is {(1 - summarizer_config.sliding_window_percentage) * llm_config.context_window}"
+            f"Compacting messages index 0:{safe_cutoff_index} messages resulted in {approx_token_count} tokens, goal is {(1 - summarizer_config.sliding_window_percentage) * llm_config.context_window}"
         )
 
     if safe_cutoff_index is None or eviction_percentage >= 1.0:
@@ -264,9 +283,9 @@ async def summarize_via_sliding_window(
         # need to keep the last message (might contain an approval request)
         raise ValueError(f"Safe cutoff index {safe_cutoff_index} is at the end of the message buffer, skipping summarization")
 
-    messages_to_summarize = in_context_messages[1:safe_cutoff_index]
+    messages_to_summarize = conversation_messages[:safe_cutoff_index]
     logger.info(
-        f"Summarizing {len(messages_to_summarize)} messages, from index 1 to {safe_cutoff_index} (out of {total_message_count})"
+        f"Summarizing {len(messages_to_summarize)} messages, from index 0 to {safe_cutoff_index} (out of {total_message_count} conversation messages)"
     )
 
     summary_message_str = await simple_summary(
@@ -281,5 +300,6 @@ async def summarize_via_sliding_window(
         logger.warning(f"Summary length {len(summary_message_str)} exceeds clip length {summarizer_config.clip_chars}. Truncating.")
         summary_message_str = summary_message_str[: summarizer_config.clip_chars] + "... [summary truncated to fit]"
 
-    updated_in_context_messages = in_context_messages[safe_cutoff_index:]
+    # Return system prompt + retained conversation messages (NO memory messages - caller will add fresh memory)
+    updated_in_context_messages = conversation_messages[safe_cutoff_index:]
     return summary_message_str, [system_prompt] + updated_in_context_messages

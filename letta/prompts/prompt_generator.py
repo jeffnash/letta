@@ -93,6 +93,7 @@ class PromptGenerator:
         archival_memory_size: int = 0,
         archive_tags: Optional[List[str]] = None,
         conversation_start_date: Optional[datetime] = None,
+        exclude_memory: bool = False,
     ) -> str:
         """Prepare the final/full system message that will be fed into the LLM API
 
@@ -100,6 +101,11 @@ class PromptGenerator:
 
         The following are reserved variables:
         - CORE_MEMORY: the in-context memory of the LLM
+
+        Args:
+            exclude_memory: If True, memory is excluded (sent separately as a context message).
+                           The {CORE_MEMORY} placeholder will be replaced with empty string or
+                           a minimal note about memory being provided separately.
         """
         if user_defined_variables is not None:
             # TODO eventually support the user defining their own variables to inject
@@ -111,17 +117,22 @@ class PromptGenerator:
         if IN_CONTEXT_MEMORY_KEYWORD in variables:
             raise ValueError(f"Found protected variable '{IN_CONTEXT_MEMORY_KEYWORD}' in user-defined vars: {str(user_defined_variables)}")
         else:
-            # TODO should this all put into the memory.__repr__ function?
-            memory_metadata_string = PromptGenerator.compile_memory_metadata_block(
-                memory_edit_timestamp=in_context_memory_last_edit,
-                previous_message_count=previous_message_count,
-                archival_memory_size=archival_memory_size,
-                timezone=timezone,
-                archive_tags=archive_tags,
-                conversation_start_date=conversation_start_date,
-            )
+            if exclude_memory:
+                # When memory is excluded, don't add memory or metadata to system prompt
+                # Memory will be sent as a separate developer/user message
+                full_memory_string = ""
+            else:
+                # TODO should this all put into the memory.__repr__ function?
+                memory_metadata_string = PromptGenerator.compile_memory_metadata_block(
+                    memory_edit_timestamp=in_context_memory_last_edit,
+                    previous_message_count=previous_message_count,
+                    archival_memory_size=archival_memory_size,
+                    timezone=timezone,
+                    archive_tags=archive_tags,
+                    conversation_start_date=conversation_start_date,
+                )
 
-            full_memory_string = memory_with_sources + "\n\n" + memory_metadata_string
+                full_memory_string = memory_with_sources + "\n\n" + memory_metadata_string
 
             # Add to the variables list to inject
             variables[IN_CONTEXT_MEMORY_KEYWORD] = full_memory_string
@@ -130,7 +141,7 @@ class PromptGenerator:
             memory_variable_string = "{" + IN_CONTEXT_MEMORY_KEYWORD + "}"
 
             # Catch the special case where the system prompt is unformatted
-            if append_icm_if_missing:
+            if append_icm_if_missing and not exclude_memory:
                 if memory_variable_string not in system_prompt:
                     # In this case, append it to the end to make sure memory is still injected
                     # logger.warning(f"{IN_CONTEXT_MEMORY_KEYWORD} variable was missing from system prompt, appending instead")
@@ -168,7 +179,15 @@ class PromptGenerator:
         max_files_open: Optional[int] = None,
         llm_config: Optional[object] = None,
         conversation_start_date: Optional[datetime] = None,
+        exclude_memory: bool = False,
     ) -> str:
+        """Compile the system message for the agent.
+
+        Args:
+            exclude_memory: If True, memory blocks are NOT included in the system prompt.
+                           Use this when memory_mode='context_message' and memory is
+                           sent as a separate developer/user message instead.
+        """
         tool_constraint_block = None
         if tool_rules_solver is not None:
             tool_constraint_block = tool_rules_solver.compile_tool_rule_prompts()
@@ -179,9 +198,24 @@ class PromptGenerator:
         else:
             pass
 
-        memory_with_sources = in_context_memory.compile(
-            tool_usage_rules=tool_constraint_block, sources=sources, max_files_open=max_files_open, llm_config=llm_config
-        )
+        # When exclude_memory is True, don't include memory in the system prompt
+        # (memory will be sent as a separate context message for better caching)
+        if exclude_memory:
+            # Compile only tool rules and sources, without memory blocks
+            memory_with_sources = ""
+            if tool_constraint_block:
+                memory_with_sources = f"\n\n<tool_usage_rules>\n{tool_constraint_block.description or ''}\n\n{tool_constraint_block.value or ''}\n</tool_usage_rules>"
+            if sources:
+                # Still need to render directories/sources
+                from io import StringIO
+
+                s = StringIO()
+                in_context_memory._render_directories_common(s, sources, max_files_open)
+                memory_with_sources += s.getvalue()
+        else:
+            memory_with_sources = in_context_memory.compile(
+                tool_usage_rules=tool_constraint_block, sources=sources, max_files_open=max_files_open, llm_config=llm_config
+            )
 
         return PromptGenerator.get_system_message_from_compiled_memory(
             system_prompt=system_prompt,
@@ -194,4 +228,5 @@ class PromptGenerator:
             previous_message_count=previous_message_count,
             archival_memory_size=archival_memory_size,
             conversation_start_date=conversation_start_date,
+            exclude_memory=exclude_memory,
         )

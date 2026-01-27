@@ -18,18 +18,24 @@ def memory(
     insert_text: Optional[str] = None,
     old_path: Optional[str] = None,
     new_path: Optional[str] = None,
+    query: Optional[str] = None,
+    context_lines: Optional[int] = None,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
 ) -> Optional[str]:
     """
     Memory management tool with various sub-commands for memory block operations.
 
     Args:
         command (str): The sub-command to execute. Supported commands:
+            - "read": Read a memory block with line numbers (useful before using insert)
+            - "search": Search a memory block for a keyword and return matches with context
             - "create": Create a new memory block
             - "str_replace": Replace text in a memory block
             - "insert": Insert text at a specific line in a memory block
             - "delete": Delete a memory block
             - "rename": Rename a memory block
-        path (Optional[str]): Path to the memory block (for str_replace, insert, delete)
+        path (Optional[str]): Path to the memory block (for read, search, str_replace, insert, delete)
         file_text (Optional[str]): The value to set in the memory block (for create)
         description (Optional[str]): The description to set in the memory block (for create, rename)
         old_string (Optional[str]): Old text to replace (for str_replace)
@@ -38,11 +44,27 @@ def memory(
         insert_text (Optional[str]): Text to insert (for insert)
         old_path (Optional[str]): Old path for rename operation
         new_path (Optional[str]): New path for rename operation
+        query (Optional[str]): Search string for search command (case-insensitive)
+        context_lines (Optional[int]): Number of lines to show before/after each match (for search, default: 3)
+        offset (Optional[int]): Starting line number, 1-indexed (for read). If None, starts from line 1.
+        limit (Optional[int]): Maximum number of lines to return (for read). If None, returns all lines.
 
     Returns:
         Optional[str]: Success message or error description
 
     Examples:
+        # Read a memory block with line numbers
+        memory(agent_state, "read", path="/memories/project")
+
+        # Read lines 10-20 of a memory block
+        memory(agent_state, "read", path="/memories/project", offset=10, limit=11)
+
+        # Search for a keyword with default context (3 lines before/after)
+        memory(agent_state, "search", path="/memories/project", query="database")
+
+        # Search with more context (10 lines before/after each match)
+        memory(agent_state, "search", path="/memories/project", query="API", context_lines=10)
+
         # Replace text in a memory block
         memory(agent_state, "str_replace", path="/memories/user_preferences", old_string="theme: dark", new_string="theme: light")
 

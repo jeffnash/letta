@@ -27,6 +27,80 @@ logger = get_logger(__name__)
 class LettaCoreToolExecutor(ToolExecutor):
     """Executor for LETTA core tools with direct implementation of functions."""
 
+    async def _update_memory_in_context(
+        self,
+        agent_state: AgentState,
+        actor: User,
+        operation: str,
+        block_label: str,
+        old_content: Optional[str] = None,
+        new_content: Optional[str] = None,
+        insert_line: Optional[int] = None,
+    ) -> None:
+        """Update memory in the conversation context.
+
+        For context_message mode: Injects a memory update message instead of rebuilding system prompt.
+        For system_prompt mode: Falls back to rebuild_system_prompt_async.
+
+        Args:
+            agent_state: The current agent state
+            actor: The user performing the action
+            operation: Type of operation (str_replace, insert, create, etc.)
+            block_label: The label of the memory block being updated
+            old_content: For str_replace, the content being replaced
+            new_content: The new content being added
+            insert_line: For insert operations, the line number
+        """
+        from letta.schemas.agent import MemoryMode
+        from letta.helpers.datetime_helpers import get_utc_time
+
+        if agent_state.memory_mode == MemoryMode.context_message:
+            # Build the memory update message content
+            timestamp = get_utc_time().isoformat()
+
+            if operation == "str_replace":
+                update_content = f"""<memory_update block="{block_label}" operation="str_replace" timestamp="{timestamp}">
+<old_string>{old_content or ''}</old_string>
+<new_string>{new_content or ''}</new_string>
+</memory_update>"""
+            elif operation == "insert":
+                update_content = f"""<memory_update block="{block_label}" operation="insert" line="{insert_line}" timestamp="{timestamp}">
+<inserted_text>{new_content or ''}</inserted_text>
+</memory_update>"""
+            elif operation == "create":
+                update_content = f"""<memory_update block="{block_label}" operation="create" timestamp="{timestamp}">
+<initial_value>{new_content or ''}</initial_value>
+</memory_update>"""
+            elif operation == "rename":
+                update_content = f"""<memory_update block="{block_label}" operation="rename" timestamp="{timestamp}">
+<new_label>{new_content or ''}</new_label>
+</memory_update>"""
+            elif operation == "update_description":
+                update_content = f"""<memory_update block="{block_label}" operation="update_description" timestamp="{timestamp}">
+<new_description>{new_content or ''}</new_description>
+</memory_update>"""
+            else:
+                # Generic update - send full memory state
+                update_content = agent_state.memory.compile_for_message(
+                    llm_config=agent_state.llm_config,
+                    use_developer_role=True,  # Will be wrapped if needed by inject method
+                    conversation_start_date=agent_state.created_at,
+                    timezone=agent_state.timezone,
+                )
+
+            await self.agent_manager.inject_memory_update_message_async(
+                agent_id=agent_state.id,
+                actor=actor,
+                memory_update_content=update_content,
+                operation=operation,
+                block_label=block_label,
+            )
+        else:
+            # Legacy mode: rebuild system prompt
+            await self.agent_manager.rebuild_system_prompt_async(
+                agent_id=agent_state.id, actor=actor, force=True
+            )
+
     async def execute(
         self,
         function_name: str,
@@ -850,7 +924,13 @@ class LettaCoreToolExecutor(ToolExecutor):
             await self.block_manager.update_block_async(
                 block_id=memory_block.id, block_update=BlockUpdate(description=description), actor=actor
             )
-            await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_state.id, actor=actor, force=True)
+            await self._update_memory_in_context(
+                agent_state=agent_state,
+                actor=actor,
+                operation="update_description",
+                block_label=label,
+                new_content=description,
+            )
 
             return f"Successfully updated description of memory block '{label}'"
 
@@ -870,12 +950,151 @@ class LettaCoreToolExecutor(ToolExecutor):
                 raise ValueError(f"Error: Memory block '{old_label}' does not exist")
 
             await self.block_manager.update_block_async(block_id=memory_block.id, block_update=BlockUpdate(label=new_label), actor=actor)
-            await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_state.id, actor=actor, force=True)
+            await self._update_memory_in_context(
+                agent_state=agent_state,
+                actor=actor,
+                operation="rename",
+                block_label=old_label,
+                new_content=new_label,
+            )
 
             return f"Successfully renamed memory block '{old_label}' to '{new_label}'"
 
         except Exception as e:
             raise Exception(f"Error performing rename: {str(e)}")
+
+    async def memory_read(
+        self,
+        agent_state: AgentState,
+        actor: User,
+        path: str,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> str:
+        """Read a memory block and return its content with line numbers.
+
+        This allows the agent to inspect memory blocks programmatically,
+        which is useful for determining line numbers before using 'insert'.
+
+        Args:
+            agent_state: The agent's state
+            actor: The user performing the action
+            path: Path to the memory block
+            offset: Starting line number (1-indexed). If None, starts from line 1.
+            limit: Maximum number of lines to return. If None, returns all lines.
+
+        Returns:
+            Formatted string with the memory block content and line numbers.
+        """
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
+
+        try:
+            memory_block = agent_state.memory.get_block(label)
+        except KeyError:
+            # List available blocks to help the agent
+            available_blocks = [block.label for block in agent_state.memory.blocks]
+            return f"Error: Memory block '{label}' does not exist. Available blocks: {available_blocks}"
+
+        # Format with line numbers (1-indexed like the insert command expects)
+        lines = memory_block.value.split("\n")
+        total_lines = len(lines)
+
+        # Apply offset (convert from 1-indexed to 0-indexed)
+        start_idx = 0
+        if offset is not None:
+            start_idx = max(0, offset - 1)  # Convert 1-indexed to 0-indexed
+
+        # Apply limit
+        end_idx = total_lines
+        if limit is not None:
+            end_idx = min(total_lines, start_idx + limit)
+
+        # Get the slice of lines
+        selected_lines = lines[start_idx:end_idx]
+        numbered_lines = [f"{start_idx + i + 1:4d}\t{line}" for i, line in enumerate(selected_lines)]
+        content_with_line_numbers = "\n".join(numbered_lines)
+
+        # Include metadata
+        result = f"Memory block '{label}':\n"
+        result += f"Description: {memory_block.description or '(no description)'}\n"
+        result += f"Characters: {len(memory_block.value)} / {memory_block.limit}\n"
+        result += f"Total lines: {total_lines}\n"
+        if offset is not None or limit is not None:
+            result += f"Showing lines {start_idx + 1}-{end_idx} of {total_lines}\n"
+        result += f"---\n{content_with_line_numbers}"
+
+        return result
+
+    async def memory_search(
+        self,
+        agent_state: AgentState,
+        actor: User,
+        path: str,
+        query: str,
+        context_lines: int = 3,
+    ) -> str:
+        """Search a memory block for a keyword and return matching lines with context.
+
+        Args:
+            agent_state: The agent's state
+            actor: The user performing the action
+            path: Path to the memory block
+            query: The search string (case-insensitive)
+            context_lines: Number of lines to show before and after each match (default: 3)
+
+        Returns:
+            Formatted string with matching lines and their context, including line numbers.
+        """
+        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
+
+        try:
+            memory_block = agent_state.memory.get_block(label)
+        except KeyError:
+            available_blocks = [block.label for block in agent_state.memory.blocks]
+            return f"Error: Memory block '{label}' does not exist. Available blocks: {available_blocks}"
+
+        lines = memory_block.value.split("\n")
+        query_lower = query.lower()
+
+        # Find all matching line indices
+        matching_indices = [i for i, line in enumerate(lines) if query_lower in line.lower()]
+
+        if not matching_indices:
+            return f"No matches found for '{query}' in memory block '{label}'."
+
+        # Build result with context around each match
+        result_parts = [f"Found {len(matching_indices)} match(es) for '{query}' in memory block '{label}':\n"]
+
+        # Track which lines we've already shown to avoid duplicates
+        shown_lines = set()
+
+        for match_idx in matching_indices:
+            # Calculate context range
+            start = max(0, match_idx - context_lines)
+            end = min(len(lines), match_idx + context_lines + 1)
+
+            # Check if this range overlaps with already shown lines
+            range_lines = set(range(start, end))
+            if range_lines.issubset(shown_lines):
+                continue  # Skip if all lines in this range were already shown
+
+            # Add separator if not the first match
+            if shown_lines:
+                result_parts.append("---")
+
+            # Add lines with context
+            for i in range(start, end):
+                if i in shown_lines:
+                    continue
+                shown_lines.add(i)
+
+                line_num = i + 1  # 1-indexed
+                line_content = lines[i]
+                # Mark the matching line
+                marker = ">>>" if i == match_idx else "   "
+                result_parts.append(f"{marker} {line_num:4d}\t{line_content}")
+
+        return "\n".join(result_parts)
 
     async def memory_create(
         self, agent_state: AgentState, actor: User, path: str, description: str, file_text: Optional[str] = None
@@ -950,7 +1169,14 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         # Write the new content to the block
         await self.block_manager.update_block_async(block_id=memory_block.id, block_update=BlockUpdate(value=new_value), actor=actor)
-        await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_state.id, actor=actor, force=True)
+        await self._update_memory_in_context(
+            agent_state=agent_state,
+            actor=actor,
+            operation="str_replace",
+            block_label=label,
+            old_content=old_str,
+            new_content=new_str,
+        )
 
         # Prepare the success message
         success_msg = f"The core memory block with label `{label}` has been edited. "
@@ -1016,7 +1242,14 @@ class LettaCoreToolExecutor(ToolExecutor):
 
         # Write into the block
         await self.block_manager.update_block_async(block_id=memory_block.id, block_update=BlockUpdate(value=new_value), actor=actor)
-        await self.agent_manager.rebuild_system_prompt_async(agent_id=agent_state.id, actor=actor, force=True)
+        await self._update_memory_in_context(
+            agent_state=agent_state,
+            actor=actor,
+            operation="insert",
+            block_label=label,
+            new_content=insert_text,
+            insert_line=insert_line,
+        )
 
         # Prepare the success message
         success_msg = f"The core memory block with label `{label}` has been edited. "
@@ -1041,6 +1274,10 @@ class LettaCoreToolExecutor(ToolExecutor):
         insert_text: Optional[str] = None,
         old_path: Optional[str] = None,
         new_path: Optional[str] = None,
+        query: Optional[str] = None,
+        context_lines: Optional[int] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> Optional[str]:
         if command == "create":
             if path is None:
@@ -1080,5 +1317,17 @@ class LettaCoreToolExecutor(ToolExecutor):
                     "Error: path and description are required for update_description command, or old_path and new_path are required for rename command"
                 )
 
+        elif command == "read":
+            if path is None:
+                raise ValueError("Error: path is required for read command")
+            return await self.memory_read(agent_state, actor, path, offset, limit)
+
+        elif command == "search":
+            if path is None:
+                raise ValueError("Error: path is required for search command")
+            if query is None:
+                raise ValueError("Error: query is required for search command")
+            return await self.memory_search(agent_state, actor, path, query, context_lines or 3)
+
         else:
-            raise ValueError(f"Error: Unknown command '{command}'. Supported commands: create, str_replace, insert, delete, rename")
+            raise ValueError(f"Error: Unknown command '{command}'. Supported commands: create, str_replace, insert, delete, rename, read, search")

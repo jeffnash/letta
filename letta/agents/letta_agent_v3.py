@@ -790,14 +790,17 @@ class LettaAgentV3(LettaAgentV2):
                             # checkpoint summarized messages
                             # TODO: might want to delay this checkpoint in case of corrupated state
                             try:
-                                summary_message, messages, _ = await self.compact(
+                                summary_message, messages, _, memory_message = await self.compact(
                                     messages, trigger_threshold=self.agent_state.llm_config.context_window
                                 )
                                 self.logger.info("Summarization succeeded, continuing to retry LLM request")
 
-                                # update the messages
+                                # update the messages (include memory message if created)
+                                new_messages = [summary_message]
+                                if memory_message:
+                                    new_messages.append(memory_message)
                                 await self._checkpoint_messages(
-                                    run_id=run_id, step_id=step_id, new_messages=[summary_message], in_context_messages=messages
+                                    run_id=run_id, step_id=step_id, new_messages=new_messages, in_context_messages=messages
                                 )
                                 continue
                             except SystemPromptTokenExceededError:
@@ -926,14 +929,18 @@ class LettaAgentV3(LettaAgentV2):
                 self.logger.info(
                     f"Context window exceeded (current: {self.context_token_estimate}, threshold: {self.agent_state.llm_config.context_window}), trying to compact messages"
                 )
-                summary_message, messages, _ = await self.compact(messages, trigger_threshold=self.agent_state.llm_config.context_window)
+                summary_message, messages, _, memory_message = await self.compact(messages, trigger_threshold=self.agent_state.llm_config.context_window)
                 # TODO: persist + return the summary message
                 # TODO: convert this to a SummaryMessage
                 self.response_messages.append(summary_message)
                 for message in Message.to_letta_messages(summary_message):
                     yield message
+                # Include memory message if created
+                new_messages = [summary_message]
+                if memory_message:
+                    new_messages.append(memory_message)
                 await self._checkpoint_messages(
-                    run_id=run_id, step_id=step_id, new_messages=[summary_message], in_context_messages=messages
+                    run_id=run_id, step_id=step_id, new_messages=new_messages, in_context_messages=messages
                 )
 
         except Exception as e:
@@ -1504,13 +1511,24 @@ class LettaAgentV3(LettaAgentV2):
     @trace_method
     async def compact(
         self, messages, trigger_threshold: Optional[int] = None, compaction_settings: Optional["CompactionSettings"] = None
-    ) -> tuple[Message, list[Message], str]:
+    ) -> tuple[Message, list[Message], str, Optional[Message]]:
         """Compact the current in-context messages for this agent.
 
         Compaction uses a summarizer LLM configuration derived from
         ``compaction_settings.model`` when provided. This mirrors how agent
         creation derives defaults from provider-specific ModelSettings, but is
         localized to summarization.
+
+        For agents using memory_mode=context_message, compaction will:
+        - Filter out all memory messages (full context + deltas) before summarization
+        - Inject a fresh canonical memory message after compaction
+
+        Returns:
+            Tuple of (summary_message, final_messages, summary_text, memory_message)
+            - summary_message: The persisted summary message object
+            - final_messages: List of messages in order [system, (memory), summary, ...retained]
+            - summary_text: The raw summary text
+            - memory_message: The new canonical memory message (if context_message mode), or None
         """
 
         # Use the passed-in compaction_settings first, then agent's compaction_settings if set,
@@ -1662,12 +1680,58 @@ class LettaAgentV3(LettaAgentV2):
             self.logger.error(f"Expected only one summary message, got {len(summary_messages)} in {summary_messages}")
         summary_message_obj = summary_messages[0]
 
-        # final messages: inject summarization message at the beginning
-        final_messages = [compacted_messages[0]] + [summary_message_obj]
+        # For context_message mode agents, inject a fresh canonical memory message
+        # after compaction to replace all the filtered-out memory delta messages
+        from letta.schemas.agent import MemoryMode
+        from letta.services.summarizer.memory_message_utils import MEMORY_MESSAGE_NAME
+        
+        memory_message_obj = None
+        if self.agent_state.memory_mode == MemoryMode.context_message:
+            # Build fresh memory content from current agent state
+            use_developer_role = LLMConfig.supports_developer_role(self.agent_state.llm_config)
+            role = "developer" if use_developer_role else "user"
+            
+            memory_content = self.agent_state.memory.compile_for_message(
+                llm_config=self.agent_state.llm_config,
+                use_developer_role=use_developer_role,
+                conversation_start_date=self.agent_state.created_at,
+                timezone=self.agent_state.timezone,
+            )
+            
+            # If using user role, wrap in system-reminder tags
+            if not use_developer_role:
+                memory_content = f"<system-reminder>\n{memory_content}\n</system-reminder>"
+            
+            # Create the canonical memory message (will be persisted by caller)
+            memory_messages = await convert_message_creates_to_messages(
+                message_creates=[
+                    MessageCreate(
+                        role=MessageRole(role),
+                        content=[TextContent(text=memory_content)],
+                        name=MEMORY_MESSAGE_NAME,
+                    )
+                ],
+                agent_id=self.agent_state.id,
+                timezone=self.agent_state.timezone,
+                wrap_user_message=False,
+                wrap_system_message=False,
+                run_id=None,
+            )
+            if len(memory_messages) == 1:
+                memory_message_obj = memory_messages[0]
+                self.logger.info("Created fresh canonical memory message for post-compaction context")
+            else:
+                self.logger.error(f"Expected one memory message, got {len(memory_messages)}")
+
+        # final messages: [system, (memory if context_message mode), summary, ...retained]
+        final_messages = [compacted_messages[0]]  # System prompt
+        if memory_message_obj:
+            final_messages.append(memory_message_obj)
+        final_messages.append(summary_message_obj)
         if len(compacted_messages) > 1:
             final_messages += compacted_messages[1:]
 
-        return summary_message_obj, final_messages, summary
+        return summary_message_obj, final_messages, summary, memory_message_obj
 
     @staticmethod
     def _build_summarizer_llm_config(

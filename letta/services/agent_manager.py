@@ -41,6 +41,7 @@ from letta.orm import (
     Group as GroupModel,
     GroupsAgents,
     IdentitiesAgents,
+    Message as MessageModel,
     Source as SourceModel,
     SourcePassage,
     SourcesAgents,
@@ -57,6 +58,7 @@ from letta.schemas.agent import (
     AgentState as PydanticAgentState,
     CreateAgent,
     InternalTemplateAgentCreate,
+    MemoryMode,
     UpdateAgent,
 )
 from letta.schemas.block import DEFAULT_BLOCKS, Block as PydanticBlock, BlockUpdate
@@ -519,6 +521,10 @@ class AgentManager:
                     timezone=agent_create.timezone if agent_create.timezone else DEFAULT_TIMEZONE,
                     max_files_open=agent_create.max_files_open,
                     per_file_view_window_char_limit=agent_create.per_file_view_window_char_limit,
+                    # Auto-enable context_message mode for new agents if not explicitly set
+                    memory_mode=(
+                        agent_create.memory_mode.value if agent_create.memory_mode else MemoryMode.context_message.value
+                    ),
                 )
 
                 # Set template fields for InternalTemplateAgentCreate (similar to group creation)
@@ -1127,8 +1133,23 @@ class AgentManager:
         actor: PydanticUser,
         include_relationships: Optional[List[str]] = None,
         include: List[str] = [],
+        auto_migrate_memory_mode: bool = False,
     ) -> PydanticAgentState:
-        """Fetch an agent by its ID."""
+        """Fetch an agent by its ID.
+
+        Args:
+            agent_id: The agent's unique identifier.
+            actor: The user performing the action.
+            include_relationships: Optional list of relationships to eager load.
+            include: Additional fields to include.
+            auto_migrate_memory_mode: If True and agent has memory_mode=None,
+                automatically migrate to the appropriate memory mode. This should
+                only be enabled for execution paths (e.g., agent.step()) to avoid
+                unnecessary migration overhead on read-only operations.
+
+        Returns:
+            The agent state.
+        """
 
         try:
             async with db_registry.async_session() as session:
@@ -1147,7 +1168,25 @@ class AgentManager:
                 agent_encrypted = await agent.to_pydantic_async(include_relationships=include_relationships, include=include, decrypt=False)
 
             # Decrypt secrets outside session
-            return (await decrypt_agent_secrets([agent_encrypted]))[0]
+            agent_state = (await decrypt_agent_secrets([agent_encrypted]))[0]
+
+            # Auto-migrate memory mode if requested and needed
+            if auto_migrate_memory_mode and agent_state.memory_mode is None:
+                migrated = await self._auto_migrate_memory_mode_if_needed_async(
+                    agent_id=agent_id,
+                    actor=actor,
+                )
+                if migrated:
+                    # Re-fetch to get updated state
+                    return await self.get_agent_by_id_async(
+                        agent_id=agent_id,
+                        actor=actor,
+                        include_relationships=include_relationships,
+                        include=include,
+                        auto_migrate_memory_mode=False,  # Don't re-migrate
+                    )
+
+            return agent_state
         except NoResultFound:
             # Re-raise NoResultFound without logging to preserve 404 handling
             raise
@@ -1428,10 +1467,28 @@ class AgentManager:
         Updates to core memory blocks should trigger a "rebuild", which itself will create a new message object
 
         Updates to the memory header should *not* trigger a rebuild, since that will simply flood recall storage with excess messages
+
+        For agents using memory_mode=context_message, this method should NOT be used to update memory.
+        Instead, use inject_memory_update_message_async() to add a memory context message.
         """
         num_messages = await self.message_manager.size_async(actor=actor, agent_id=agent_id)
         num_archival_memories = await self.passage_manager.agent_passage_size_async(actor=actor, agent_id=agent_id)
         agent_state = await self.get_agent_by_id_async(agent_id=agent_id, include_relationships=["memory", "sources", "tools"], actor=actor)
+
+        # For context_message mode, memory is NOT embedded in system prompt.
+        # Skip system prompt rebuild and inject a memory update message instead.
+        if agent_state.memory_mode == MemoryMode.context_message:
+            if not agent_state.message_ids:
+                curr_system_message = None
+            else:
+                curr_system_message = await self.message_manager.get_message_by_id_async(
+                    message_id=agent_state.message_ids[0], actor=actor
+                )
+            logger.debug(
+                f"Agent {agent_id} uses context_message mode, skipping system prompt memory embed. "
+                "Use inject_memory_update_message_async() for memory updates."
+            )
+            return agent_state, curr_system_message, num_messages, num_archival_memories
 
         tool_rules_solver = ToolRulesSolver(agent_state.tool_rules)
 
@@ -1503,6 +1560,272 @@ class AgentManager:
                 curr_system_message = temp_message
 
         return agent_state, curr_system_message, num_messages, num_archival_memories
+
+    @enforce_types
+    @trace_method
+    async def inject_memory_update_message_async(
+        self,
+        agent_id: str,
+        actor: PydanticUser,
+        memory_update_content: str,
+        operation: str = "update",
+        block_label: Optional[str] = None,
+    ) -> Tuple[PydanticAgentState, PydanticMessage]:
+        """Inject a memory update message into the conversation (for context_message mode).
+
+        Instead of rebuilding the system prompt when memory changes, this method
+        adds a new message containing the memory update. This keeps the system
+        prompt static for better prompt caching.
+
+        Args:
+            agent_id: The agent ID
+            actor: The user performing the action
+            memory_update_content: The formatted memory update content (full or delta)
+            operation: The type of operation (e.g., "str_replace", "insert", "create")
+            block_label: The label of the block being updated (for delta messages)
+
+        Returns:
+            Tuple of (updated agent state, new memory update message)
+        """
+        from letta.schemas.agent import MemoryMode
+        from letta.schemas.llm_config import LLMConfig
+        from letta.services.summarizer.memory_message_utils import MEMORY_MESSAGE_NAME
+
+        agent_state = await self.get_agent_by_id_async(
+            agent_id=agent_id, include_relationships=["memory"], actor=actor
+        )
+
+        # Determine the role based on model support
+        use_developer_role = LLMConfig.supports_developer_role(agent_state.llm_config)
+        role = "developer" if use_developer_role else "user"
+
+        # If using user role, wrap in system-reminder tags
+        content = memory_update_content
+        if not use_developer_role:
+            content = f"<system-reminder>\n{content}\n</system-reminder>"
+
+        # Create the memory update message with name tag for identification during compaction
+        memory_message = PydanticMessage.dict_to_message(
+            agent_id=agent_id,
+            model=agent_state.llm_config.model,
+            openai_message_dict={"role": role, "content": content, "name": MEMORY_MESSAGE_NAME},
+        )
+
+        # Persist the message
+        memory_message = await self.message_manager.create_message_async(message=memory_message, actor=actor)
+
+        # Add to in-context messages
+        message_ids = agent_state.message_ids or []
+        message_ids.append(memory_message.id)
+        agent_state = await self.update_agent_async(
+            agent_id=agent_id, agent_update=UpdateAgent(message_ids=message_ids), actor=actor
+        )
+
+        return agent_state, memory_message
+
+    @enforce_types
+    @trace_method
+    async def _auto_migrate_memory_mode_if_needed_async(
+        self,
+        agent_id: str,
+        actor: PydanticUser,
+    ) -> bool:
+        """Auto-migrate an agent from memory_mode=None to the appropriate mode.
+
+        This is a lazy, idempotent migration that runs when an agent is loaded for execution.
+        For agents with memory_mode=None (pre-feature agents):
+        - If model supports developer role: migrate to context_message mode
+        - Otherwise: set to system_prompt mode (evaluated but stays legacy)
+
+        Migration steps for context_message mode:
+        1. Rebuild system message using exclude_memory=True
+        2. Create a new memory context message
+        3. Insert memory message at position 1 (after system)
+        4. Update agent.message_ids and memory_mode atomically
+
+        Returns:
+            True if migration occurred, False if no migration needed.
+        """
+        from letta.services.summarizer.memory_message_utils import MEMORY_MESSAGE_NAME
+
+        async with db_registry.async_session() as session:
+            async with session.begin():
+                # Lock the agent row to prevent concurrent migrations
+                query = (
+                    select(AgentModel)
+                    .where(AgentModel.id == agent_id)
+                    .with_for_update()
+                )
+                query = AgentModel.apply_access_predicate(query, actor, ["write"], AccessType.ORGANIZATION)
+                result = await session.execute(query)
+                agent = result.scalar_one_or_none()
+
+                if agent is None:
+                    raise LettaAgentNotFoundError(f"Agent with ID {agent_id} not found")
+
+                # Check if migration is needed (re-check after acquiring lock)
+                if agent.memory_mode is not None:
+                    # Already evaluated, no migration needed
+                    return False
+
+                # Determine if model supports developer role
+                supports_developer = LLMConfig.supports_developer_role(agent.llm_config)
+
+                if not supports_developer:
+                    # Model doesn't support developer role - mark as evaluated, stay on system_prompt mode
+                    agent.memory_mode = MemoryMode.system_prompt.value
+                    logger.info(
+                        f"Agent {agent_id} uses unsupported model for context_message mode, "
+                        f"setting memory_mode=system_prompt"
+                    )
+                    return True
+
+                # Validate agent has message_ids
+                if not agent.message_ids or len(agent.message_ids) == 0:
+                    # No messages yet - just set the mode, migration will happen on first message init
+                    agent.memory_mode = MemoryMode.context_message.value
+                    logger.info(
+                        f"Agent {agent_id} has no messages, setting memory_mode=context_message for future use"
+                    )
+                    return True
+
+                # Get system message
+                system_message_id = agent.message_ids[0]
+                system_msg_result = await session.execute(
+                    select(MessageModel).where(MessageModel.id == system_message_id)
+                )
+                system_message = system_msg_result.scalar_one_or_none()
+
+                if system_message is None:
+                    logger.warning(
+                        f"Agent {agent_id} has no system message at message_ids[0], "
+                        f"setting memory_mode=context_message without migration"
+                    )
+                    agent.memory_mode = MemoryMode.context_message.value
+                    return True
+
+                # Check if already has a memory context message at position 1
+                # (idempotency check for partial migrations)
+                if len(agent.message_ids) >= 2:
+                    second_msg_id = agent.message_ids[1]
+                    second_msg_result = await session.execute(
+                        select(MessageModel).where(MessageModel.id == second_msg_id)
+                    )
+                    second_message = second_msg_result.scalar_one_or_none()
+                    if second_message:
+                        content = second_message.content
+                        # Check if it's already a memory context message
+                        if content and len(content) > 0:
+                            text_content = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+                            if "<memory_blocks>" in text_content or "<memory_metadata>" in text_content:
+                                # Already has memory message - just update the mode
+                                agent.memory_mode = MemoryMode.context_message.value
+                                logger.info(
+                                    f"Agent {agent_id} already has memory context message, "
+                                    f"setting memory_mode=context_message"
+                                )
+                                return True
+
+                # Load memory blocks for compiling
+                memory_result = await session.execute(
+                    select(BlockModel).where(BlockModel.id.in_(
+                        select(BlocksAgents.block_id).where(BlocksAgents.agent_id == agent_id)
+                    ))
+                )
+                memory_blocks = [b.to_pydantic() for b in memory_result.scalars().all()]
+
+                # Load file blocks to preserve open-file context during migration
+                per_file_view_window_char_limit = agent._get_per_file_view_window_char_limit()
+                file_blocks = await self.file_agent_manager.list_files_for_agent(
+                    agent_id=agent_id,
+                    per_file_view_window_char_limit=per_file_view_window_char_limit,
+                    actor=actor,
+                    return_as_blocks=True,
+                )
+
+                memory = Memory(
+                    blocks=memory_blocks,
+                    file_blocks=[b for b in file_blocks if b is not None],
+                    agent_type=agent.agent_type,
+                )
+
+                # Step 1: Rebuild system message without memory
+                tool_rules_solver = ToolRulesSolver(agent.tool_rules) if agent.tool_rules else None
+
+                # Load sources for system prompt compilation
+                sources_result = await session.execute(
+                    select(SourceModel).where(SourceModel.id.in_(
+                        select(SourcesAgents.source_id).where(SourcesAgents.agent_id == agent_id)
+                    ))
+                )
+                sources = [s.to_pydantic() for s in sources_result.scalars().all()]
+
+                new_system_content = await PromptGenerator.compile_system_message_async(
+                    system_prompt=agent.system,
+                    in_context_memory=memory,
+                    in_context_memory_last_edit=agent.created_at or get_utc_time(),
+                    timezone=agent.timezone,
+                    user_defined_variables=None,
+                    append_icm_if_missing=True,
+                    tool_rules_solver=tool_rules_solver,
+                    sources=sources,
+                    max_files_open=agent.max_files_open,
+                    llm_config=agent.llm_config,
+                    conversation_start_date=agent.created_at,
+                    exclude_memory=True,  # Key: exclude memory from system prompt
+                )
+
+                # Update system message content
+                system_message.content = [{"type": "text", "text": new_system_content}]
+
+                # Step 2: Create memory context message
+                memory_content = memory.compile_for_message(
+                    llm_config=agent.llm_config,
+                    use_developer_role=True,
+                    conversation_start_date=agent.created_at,
+                    timezone=agent.timezone,
+                )
+
+                role = "developer"  # We already checked supports_developer_role above
+
+                memory_message = PydanticMessage.dict_to_message(
+                    agent_id=agent_id,
+                    model=agent.llm_config.model if agent.llm_config else None,
+                    openai_message_dict={"role": role, "content": memory_content, "name": MEMORY_MESSAGE_NAME},
+                )
+
+                # Create ORM message object
+                memory_msg_orm = MessageModel(
+                    id=memory_message.id,
+                    organization_id=agent.organization_id,
+                    role=memory_message.role,
+                    content=memory_message.content,
+                    model=memory_message.model,
+                    name=memory_message.name,
+                    tool_calls=memory_message.tool_calls,
+                    tool_call_id=memory_message.tool_call_id,
+                    agent_id=agent_id,
+                )
+                session.add(memory_msg_orm)
+
+                # Step 3: Update message_ids to insert memory message at position 1
+                new_message_ids = [
+                    agent.message_ids[0],  # System message
+                    memory_message.id,     # New memory context message
+                    *agent.message_ids[1:],  # Rest of conversation
+                ]
+                agent.message_ids = new_message_ids
+
+                # Step 4: Set memory_mode
+                agent.memory_mode = MemoryMode.context_message.value
+
+                logger.info(
+                    f"Migrated agent {agent_id} to memory_mode=context_message: "
+                    f"rebuilt system message, inserted memory context message at position 1"
+                )
+
+                # Transaction commits automatically on context exit
+                return True
 
     @enforce_types
     @trace_method

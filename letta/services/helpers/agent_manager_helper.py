@@ -409,9 +409,21 @@ async def initialize_message_sequence_async(
     previous_message_count: int = 0,
     archival_memory_size: int = 0,
 ) -> List[dict]:
+    """Initialize the message sequence for an agent.
+
+    If agent uses context_message memory mode, memory is sent as a separate
+    developer/user message rather than embedded in the system prompt.
+    """
+    from letta.schemas.agent import MemoryMode
+    from letta.schemas.llm_config import LLMConfig
+
     if memory_edit_timestamp is None:
         memory_edit_timestamp = get_local_time()
 
+    # Determine if we should use context_message mode
+    use_context_message_mode = agent_state.memory_mode == MemoryMode.context_message
+
+    # Compile system message (with or without memory based on mode)
     full_system_message = await PromptGenerator.compile_system_message_async(
         system_prompt=agent_state.system,
         in_context_memory=agent_state.memory,
@@ -424,11 +436,33 @@ async def initialize_message_sequence_async(
         sources=agent_state.sources,
         max_files_open=agent_state.max_files_open,
         conversation_start_date=agent_state.created_at,
+        exclude_memory=use_context_message_mode,
     )
     first_user_message = get_login_event(agent_state.timezone)  # event letting Letta know the user just logged in
 
+    # If using context_message mode, prepare the memory message
+    memory_context_message = None
+    if use_context_message_mode:
+        # Determine the role based on model support
+        use_developer_role = LLMConfig.supports_developer_role(agent_state.llm_config)
+        role = "developer" if use_developer_role else "user"
+
+        # Compile memory content for the context message
+        memory_content = agent_state.memory.compile_for_message(
+            llm_config=agent_state.llm_config,
+            use_developer_role=use_developer_role,
+            conversation_start_date=agent_state.created_at,
+            timezone=agent_state.timezone,
+        )
+        # Include name tag for identification during compaction
+        from letta.services.summarizer.memory_message_utils import MEMORY_MESSAGE_NAME
+        memory_context_message = {"role": role, "content": memory_content, "name": MEMORY_MESSAGE_NAME}
+
     if agent_state.agent_type == AgentType.letta_v1_agent:
-        return [{"role": "system", "content": full_system_message}]
+        messages = [{"role": "system", "content": full_system_message}]
+        if memory_context_message:
+            messages.append(memory_context_message)
+        return messages
 
     if include_initial_boot_message:
         llm_config = agent_state.llm_config
@@ -444,12 +478,16 @@ async def initialize_message_sequence_async(
         else:
             initial_boot_messages = get_initial_boot_messages("startup_with_send_message", agent_state.timezone, tool_call_id)
 
+        # Build message sequence with optional memory context message
+        system_messages = [{"role": "system", "content": full_system_message}]
+        if memory_context_message:
+            # Memory context message comes right after system message
+            system_messages.append(memory_context_message)
+
         # Some LMStudio models (e.g. meta-llama-3.1) require the user message before any tool calls
         if llm_config.provider_name == "lmstudio_openai":
             messages = (
-                [
-                    {"role": "system", "content": full_system_message},
-                ]
+                system_messages
                 + [
                     {"role": "user", "content": first_user_message},
                 ]
@@ -457,9 +495,7 @@ async def initialize_message_sequence_async(
             )
         else:
             messages = (
-                [
-                    {"role": "system", "content": full_system_message},
-                ]
+                system_messages
                 + initial_boot_messages
                 + [
                     {"role": "user", "content": first_user_message},
@@ -469,8 +505,10 @@ async def initialize_message_sequence_async(
     else:
         messages = [
             {"role": "system", "content": full_system_message},
-            {"role": "user", "content": first_user_message},
         ]
+        if memory_context_message:
+            messages.append(memory_context_message)
+        messages.append({"role": "user", "content": first_user_message})
 
     return messages
 

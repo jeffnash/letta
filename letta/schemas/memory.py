@@ -318,6 +318,83 @@ class Memory(BaseModel, validate_assignment=True):
             llm_config=llm_config,
         )
 
+    def compile_for_message(
+        self,
+        llm_config=None,
+        use_developer_role: bool = True,
+        conversation_start_date: Optional[datetime] = None,
+        timezone: Optional[str] = None,
+    ) -> str:
+        """Compile memory blocks for use in a context message (developer or user role).
+
+        This is used when memory_mode='context_message' to create a standalone memory
+        message that can be updated without modifying the system prompt.
+
+        Args:
+            llm_config: LLM configuration (used for line numbering decision)
+            use_developer_role: If True, memory is for developer role. If False,
+                               wraps content in <system-reminder> tags for user role.
+            conversation_start_date: When the conversation started (for metadata)
+            timezone: Timezone for formatting dates
+
+        Returns:
+            Formatted string containing memory blocks and metadata, optionally
+            wrapped in <system-reminder> tags.
+        """
+        s = StringIO()
+
+        # Determine if we should use line numbers (same logic as compile())
+        raw_type = self.agent_type.value if hasattr(self.agent_type, "value") else (self.agent_type or "")
+        norm_type = raw_type.lower()
+        is_line_numbered = False
+        if llm_config and hasattr(llm_config, "model_endpoint_type"):
+            is_anthropic = llm_config.model_endpoint_type == "anthropic"
+            is_line_numbered_agent_type = norm_type in ("sleeptime_agent", "memgpt_v2_agent", "letta_v1_agent")
+            is_line_numbered = is_line_numbered_agent_type and is_anthropic
+
+        # Render memory blocks
+        if is_line_numbered:
+            self._render_memory_blocks_line_numbered(s)
+        else:
+            self._render_memory_blocks_standard(s)
+
+        # Add minimal metadata
+        s.write("\n\n<memory_metadata>\n")
+        if conversation_start_date:
+            from letta.helpers.datetime_helpers import format_datetime
+
+            tz = timezone or "UTC"
+            start_date_str = format_datetime(conversation_start_date, tz)
+            s.write(f"- Conversation started: {start_date_str}\n")
+        s.write("- Use Bash with `date` to check current date/time if needed\n")
+        s.write("- Use conversation_search to find past discussions\n")
+        s.write("</memory_metadata>")
+
+        content = s.getvalue()
+
+        # Wrap in system-reminder tags if using user role (for non-developer-supporting models)
+        if not use_developer_role:
+            content = f"<system-reminder>\n{content}\n</system-reminder>"
+
+        return content
+
+    @trace_method
+    async def compile_for_message_async(
+        self,
+        llm_config=None,
+        use_developer_role: bool = True,
+        conversation_start_date: Optional[datetime] = None,
+        timezone: Optional[str] = None,
+    ) -> str:
+        """Async version of compile_for_message."""
+        return await asyncio.to_thread(
+            self.compile_for_message,
+            llm_config=llm_config,
+            use_developer_role=use_developer_role,
+            conversation_start_date=conversation_start_date,
+            timezone=timezone,
+        )
+
     def list_block_labels(self) -> List[str]:
         """Return a list of the block names held inside the memory object"""
         return [block.label for block in self.blocks]
