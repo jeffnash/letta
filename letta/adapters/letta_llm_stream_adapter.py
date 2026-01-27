@@ -208,9 +208,15 @@ class LettaLLMStreamAdapter(LettaLLMAdapter):
         if step_id is None or actor is None:
             return
 
+        # Ensure tool_calls is always a list (may not be set if streaming failed early)
+        tool_calls_list = getattr(self, "tool_calls", None) or []
+
         response_json = {
             "content": {
+                # Singular tool_call for backward compatibility
                 "tool_call": self.tool_call.model_dump_json() if self.tool_call else None,
+                # All tool calls for parallel tool call support
+                "tool_calls": [tc.model_dump_json() for tc in tool_calls_list] if tool_calls_list else [],
                 "reasoning": [content.model_dump_json() for content in self.reasoning_content],
             },
             "id": self.interface.message_id,
