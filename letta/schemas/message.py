@@ -903,8 +903,16 @@ class Message(BaseMessage):
                 "message": str(function_return.get("message", response_text)),
                 "status": self._parse_tool_status(function_return.get("status", "OK")),
             }
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to decode function return: {response_text}") from e
+        except (json.JSONDecodeError, Exception) as e:
+            # Handle non-JSON responses gracefully (e.g., interrupted tool executions
+            # that stored error strings instead of JSON)
+            logger.warning(f"Failed to parse tool response as JSON, treating as plain text: {e}")
+            # Determine status based on content
+            status = "error" if "error" in response_text.lower() or "interrupt" in response_text.lower() else "OK"
+            return {
+                "message": response_text,
+                "status": status,
+            }
 
     def _create_tool_return_message(
         self,
