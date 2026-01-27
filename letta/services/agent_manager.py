@@ -1172,11 +1172,16 @@ class AgentManager:
 
             # Auto-migrate memory mode if requested and needed
             if auto_migrate_memory_mode and agent_state.memory_mode is None:
+                logger.info(
+                    f"[MEMORY_MODE] Agent {agent_id} has memory_mode=None, "
+                    f"triggering auto-migration (model={agent_state.llm_config.model if agent_state.llm_config else 'unknown'})"
+                )
                 migrated = await self._auto_migrate_memory_mode_if_needed_async(
                     agent_id=agent_id,
                     actor=actor,
                 )
                 if migrated:
+                    logger.info(f"[MEMORY_MODE] Agent {agent_id} migration completed, re-fetching state")
                     # Re-fetch to get updated state
                     return await self.get_agent_by_id_async(
                         agent_id=agent_id,
@@ -1185,6 +1190,12 @@ class AgentManager:
                         include=include,
                         auto_migrate_memory_mode=False,  # Don't re-migrate
                     )
+                else:
+                    logger.debug(f"[MEMORY_MODE] Agent {agent_id} migration not needed (already evaluated)")
+            elif auto_migrate_memory_mode and agent_state.memory_mode is not None:
+                logger.debug(
+                    f"[MEMORY_MODE] Agent {agent_id} already has memory_mode={agent_state.memory_mode}, skipping migration"
+                )
 
             return agent_state
         except NoResultFound:
@@ -1670,6 +1681,11 @@ class AgentManager:
 
                 # Determine if model supports developer role
                 supports_developer = LLMConfig.supports_developer_role(agent.llm_config)
+                logger.info(
+                    f"[MEMORY_MODE] Agent {agent_id} model={agent.llm_config.model if agent.llm_config else 'unknown'}, "
+                    f"endpoint_type={agent.llm_config.model_endpoint_type if agent.llm_config else 'unknown'}, "
+                    f"supports_developer_role={supports_developer}"
+                )
 
                 if not supports_developer:
                     # Model doesn't support developer role - mark as evaluated, stay on system_prompt mode
