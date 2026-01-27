@@ -25,6 +25,50 @@ from letta.services.message_manager import MessageManager
 logger = get_logger(__name__)
 
 
+def _find_matching_approval_request(
+    messages: List[Message], 
+    approval_response_tool_call_ids: List[str]
+) -> Optional[Message]:
+    """
+    Find the approval request message that matches the given tool_call_ids.
+    
+    Instead of blindly using messages[-1], this function searches for an approval
+    request message whose tool_call_ids overlap with the response. This handles
+    cases where message history is corrupted or out of order.
+    
+    Args:
+        messages: List of in-context messages (ordered by position/creation)
+        approval_response_tool_call_ids: Tool call IDs from the approval response
+        
+    Returns:
+        The matching approval request message, or None if not found
+    """
+    if not messages or not approval_response_tool_call_ids:
+        return None
+    
+    response_id_set = set(approval_response_tool_call_ids)
+    
+    # Search from most recent to oldest for an approval request with matching IDs
+    for msg in reversed(messages):
+        if msg.role != "approval":
+            continue
+        if not msg.tool_calls:
+            continue
+            
+        request_id_set = {tc.id for tc in msg.tool_calls}
+        
+        # Check for any overlap between request and response tool_call_ids
+        if request_id_set & response_id_set:
+            logger.debug(
+                f"Found matching approval request: message_id={msg.id}, "
+                f"request_ids={request_id_set}, response_ids={response_id_set}, "
+                f"overlap={request_id_set & response_id_set}"
+            )
+            return msg
+    
+    return None
+
+
 def _create_letta_response(
     new_in_context_messages: list[Message],
     use_assistant_message: bool,
@@ -318,29 +362,62 @@ async def _prepare_in_context_messages_no_persist_async(
     # Check for approval-related message validation
     if input_messages[0].type == "approval":
         # User is trying to send an approval response
-        if current_in_context_messages and current_in_context_messages[-1].role != "approval":
-            # No pending approval - this commonly happens after a cancel race condition.
-            # The server-side cancel already created denial messages for the pending approvals,
-            # but the client may have also queued denials before the cancel completed.
-            # Silently strip the stale approval and continue with any follow-up messages.
-            logger.warning(
-                f"Ignoring stale approval response: No tool call is currently awaiting approval. "
-                f"Last message role: {current_in_context_messages[-1].role}. "
-                f"This commonly occurs after a cancel race condition."
-            )
-            if len(input_messages) > 1:
-                # Strip the stale approval and process the remaining messages as regular input
-                input_messages = input_messages[1:]
-                new_in_context_messages = await create_input_messages(
-                    input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=run_id, actor=actor
+        # Extract tool_call_ids from the approval response for matching
+        approval_response = input_messages[0]
+        response_tool_call_ids = []
+        if hasattr(approval_response, 'approvals') and approval_response.approvals:
+            response_tool_call_ids = [a.tool_call_id for a in approval_response.approvals if hasattr(a, 'tool_call_id')]
+        
+        # Find the matching approval request using tool_call_id overlap
+        # This is more robust than blindly trusting [-1] in corrupted histories
+        approval_request = _find_matching_approval_request(current_in_context_messages, response_tool_call_ids)
+        
+        if approval_request is None:
+            # No matching approval request found
+            # Check if messages[-1] is an approval request (fallback for backward compatibility)
+            if current_in_context_messages and current_in_context_messages[-1].role == "approval":
+                # There IS an approval request at [-1], but its IDs don't match
+                # This is a complete mismatch - log detailed diagnostics
+                last_msg = current_in_context_messages[-1]
+                last_msg_ids = [tc.id for tc in (last_msg.tool_calls or [])]
+                logger.error(
+                    f"Approval ID mismatch: response tool_call_ids {response_tool_call_ids} "
+                    f"do not match any approval request. Last message ({last_msg.id}) "
+                    f"has tool_call_ids {last_msg_ids}. This may indicate corrupted message history "
+                    f"or a client/server desync. agent_id={agent_state.id}"
                 )
+                # Still attempt to validate against [-1] for backward compatibility
+                # The validate function will log detailed warnings/errors
+                approval_request = last_msg
             else:
-                # Approval-only payload with no pending approval - nothing to do
-                # Return empty new messages; caller will handle appropriately
-                new_in_context_messages = []
-            return current_in_context_messages, new_in_context_messages
+                # No approval request at all - this is a stale approval response
+                logger.warning(
+                    f"Ignoring stale approval response: No tool call is currently awaiting approval. "
+                    f"Last message role: {current_in_context_messages[-1].role if current_in_context_messages else 'none'}. "
+                    f"Response tool_call_ids: {response_tool_call_ids}. "
+                    f"This commonly occurs after a cancel race condition."
+                )
+                if len(input_messages) > 1:
+                    # Strip the stale approval and process the remaining messages as regular input
+                    input_messages = input_messages[1:]
+                    new_in_context_messages = await create_input_messages(
+                        input_messages=input_messages, agent_id=agent_state.id, timezone=agent_state.timezone, run_id=run_id, actor=actor
+                    )
+                else:
+                    # Approval-only payload with no pending approval - nothing to do
+                    # Return empty new messages; caller will handle appropriately
+                    new_in_context_messages = []
+                return current_in_context_messages, new_in_context_messages
+        else:
+            # Found a matching approval request - log if it wasn't at [-1]
+            if current_in_context_messages and approval_request.id != current_in_context_messages[-1].id:
+                logger.warning(
+                    f"Approval request found at non-terminal position. "
+                    f"Matched message {approval_request.id} instead of [-1] message {current_in_context_messages[-1].id}. "
+                    f"This may indicate message history issues. agent_id={agent_state.id}"
+                )
 
-        validate_approval_tool_call_ids(current_in_context_messages[-1], input_messages[0])
+        validate_approval_tool_call_ids(approval_request, input_messages[0])
         new_in_context_messages = create_approval_response_message_from_input(
             agent_state=agent_state, input_message=input_messages[0], run_id=run_id
         )

@@ -104,10 +104,20 @@ class LettaLLMStreamAdapter(LettaLLMAdapter):
         # After streaming completes, extract the accumulated data
         self.llm_request_finish_timestamp_ns = get_utc_timestamp_ns()
 
-        # Extract tool call from the interface
+        # Extract tool calls from the interface (plural - supports parallel tool calls)
+        # Try get_tool_call_objects() first for interfaces that support it
+        if hasattr(self.interface, "get_tool_call_objects"):
+            try:
+                self.tool_calls = self.interface.get_tool_call_objects()
+            except (ValueError, AttributeError):
+                self.tool_calls = []
+        else:
+            self.tool_calls = []
+
+        # Also set singular tool_call for backward compatibility
         try:
             self.tool_call = self.interface.get_tool_call_object()
-        except ValueError as e:
+        except ValueError:
             # No tool call, handle upstream
             self.tool_call = None
 

@@ -151,6 +151,18 @@ class AnthropicStreamingInterface:
             arguments = str(json.dumps(tool_input, indent=2))
         return ToolCall(id=self.tool_call_id, function=FunctionCall(arguments=arguments, name=self.tool_call_name))
 
+    def get_tool_call_objects(self) -> list[ToolCall]:
+        """Return list of tool calls for parallel tool call support.
+        
+        The regular Anthropic interface only tracks a single tool call,
+        so this returns a list with at most one element.
+        """
+        try:
+            tool_call = self.get_tool_call_object()
+            return [tool_call]
+        except ValueError:
+            return []
+
     def _check_inner_thoughts_complete(self, combined_args: str) -> bool:
         """
         Check if inner thoughts are complete in the current tool call arguments
