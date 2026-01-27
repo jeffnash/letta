@@ -440,6 +440,38 @@ class LLMConfig(BaseModel):
         return config.model_endpoint_type == "openai" and config.model.startswith("gpt-5")
 
     @classmethod
+    def supports_developer_role(cls, config: "LLMConfig") -> bool:
+        """Check if the model supports the 'developer' message role.
+
+        Models that support developer role:
+        - OpenAI models (GPT-4, GPT-5, o-series reasoning models)
+        - Anthropic models (Claude)
+
+        Returns True if the model supports developer role, False if user role
+        should be used instead (with <system-reminder> wrapper for context messages).
+        """
+        # OpenAI models support developer role
+        if config.model_endpoint_type == "openai":
+            return True
+
+        # Anthropic models support developer role (equivalent to system)
+        if config.model_endpoint_type in ("anthropic", "bedrock"):
+            return True
+
+        # Other models (Google, local LLMs, etc.) - use user role
+        return False
+
+    @classmethod
+    def get_memory_message_role(cls, config: "LLMConfig") -> str:
+        """Get the appropriate role for memory context messages.
+
+        Returns 'developer' for models that support it (OpenAI, Anthropic),
+        or 'user' for models that don't. When 'user' is returned, the caller
+        should wrap memory content in <system-reminder> tags.
+        """
+        return "developer" if cls.supports_developer_role(config) else "user"
+
+    @classmethod
     def apply_reasoning_setting_to_config(cls, config: "LLMConfig", reasoning: bool, agent_type: Optional["AgentType"] = None):
         """
         Normalize reasoning-related flags on the config based on the requested

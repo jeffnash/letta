@@ -187,6 +187,7 @@ class LettaAgent(BaseAgent):
             agent_id=self.agent_id,
             include_relationships=["tools", "memory", "tool_exec_environment_variables", "sources"],
             actor=self.actor,
+            auto_migrate_memory_mode=True,  # Enable auto-migration on execution
         )
         result = await self._step(
             agent_state=agent_state,
@@ -223,6 +224,7 @@ class LettaAgent(BaseAgent):
             agent_id=self.agent_id,
             include_relationships=["tools", "memory", "tool_exec_environment_variables", "sources"],
             actor=self.actor,
+            auto_migrate_memory_mode=True,  # Enable auto-migration on execution
         )
         current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
             input_messages, agent_state, self.message_manager, self.actor
@@ -936,6 +938,7 @@ class LettaAgent(BaseAgent):
             agent_id=self.agent_id,
             include_relationships=["tools", "memory", "tool_exec_environment_variables", "sources"],
             actor=self.actor,
+            auto_migrate_memory_mode=True,  # Enable auto-migration on execution
         )
         current_in_context_messages, new_in_context_messages = await _prepare_in_context_messages_no_persist_async(
             input_messages, agent_state, self.message_manager, self.actor
@@ -1645,7 +1648,11 @@ class LettaAgent(BaseAgent):
     @trace_method
     async def summarize_conversation_history(self) -> None:
         """Called when the developer explicitly triggers compaction via the API"""
-        agent_state = await self.agent_manager.get_agent_by_id_async(agent_id=self.agent_id, actor=self.actor)
+        agent_state = await self.agent_manager.get_agent_by_id_async(
+            agent_id=self.agent_id,
+            actor=self.actor,
+            auto_migrate_memory_mode=True,  # Enable auto-migration on compaction
+        )
         message_ids = agent_state.message_ids
         in_context_messages = await self.message_manager.get_messages_by_ids_async(message_ids=message_ids, actor=self.actor)
         new_in_context_messages, updated = await self.summarizer.summarize(

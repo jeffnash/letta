@@ -445,7 +445,7 @@ async def compact_conversation(
     num_messages_before = len(in_context_messages)
 
     # Run compaction
-    summary_message, messages, summary = await agent_loop.compact(
+    summary_message, messages, summary, memory_message = await agent_loop.compact(
         messages=in_context_messages,
         compaction_settings=compaction_settings,
     )
@@ -459,7 +459,11 @@ async def compact_conversation(
         )
 
     # Checkpoint the messages (this will update the conversation_messages table)
-    await agent_loop._checkpoint_messages(run_id=None, step_id=None, new_messages=[summary_message], in_context_messages=messages)
+    # Include memory message if created (for context_message mode agents)
+    new_messages = [summary_message]
+    if memory_message:
+        new_messages.append(memory_message)
+    await agent_loop._checkpoint_messages(run_id=None, step_id=None, new_messages=new_messages, in_context_messages=messages)
 
     logger.info(f"Compacted conversation {conversation_id}: {num_messages_before} messages -> {num_messages_after}")
 

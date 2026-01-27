@@ -29,6 +29,20 @@ from letta.services.summarizer.summarizer_config import CompactionSettings
 from letta.utils import calculate_file_defaults_based_on_context_window, create_random_username
 
 
+class MemoryMode(str, Enum):
+    """How memory blocks are delivered to the model.
+
+    - system_prompt: Memory blocks are embedded in the system prompt (legacy behavior)
+    - context_message: Memory blocks are sent as a separate message (developer or user role
+                       depending on model support), keeping the system prompt static for
+                       better prompt caching. The role is determined at runtime based on
+                       model capabilities.
+    """
+
+    system_prompt = "system_prompt"
+    context_message = "context_message"  # Renamed from developer_message to be role-agnostic
+
+
 # TODO: Remove this upon next OSS release, there's a duplicate AgentType in enums
 # TODO: This is done in the interest of time to avoid needing to update the sandbox template IDs on cloud/rebuild
 class AgentType(str, Enum):
@@ -139,6 +153,12 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     enable_sleeptime: Optional[bool] = Field(
         None,
         description="If set to True, memory management will move to a background agent thread.",
+    )
+    memory_mode: Optional[MemoryMode] = Field(
+        None,
+        description="How memory blocks are delivered to the model. 'system_prompt' embeds them in the system message (legacy), "
+        "'context_message' sends them as a separate message (role chosen at runtime based on model support) for better prompt caching. "
+        "None means not yet evaluated (will auto-migrate on supported models).",
     )
 
     multi_agent_group: Optional[Group] = Field(
@@ -312,6 +332,12 @@ class CreateAgent(BaseModel, validate_assignment=True):  #
         description="If set to True, the agent will not remember previous messages (though the agent will still retain state via core memory blocks and archival/recall memory). Not recommended unless you have an advanced use case.",
     )
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    memory_mode: Optional[MemoryMode] = Field(
+        None,
+        description="How memory blocks are delivered to the model. 'system_prompt' embeds them in the system message, "
+        "'context_message' sends them as a separate message (role chosen at runtime) for better prompt caching. "
+        "If None, will auto-select based on model support.",
+    )
     response_format: Optional[ResponseFormatUnion] = Field(
         None,
         description="Deprecated: Use `model_settings` field to configure response format instead. The response format for the agent.",
@@ -478,6 +504,11 @@ class UpdateAgent(BaseModel):
     )
 
     enable_sleeptime: Optional[bool] = Field(None, description="If set to True, memory management will move to a background agent thread.")
+    memory_mode: Optional[MemoryMode] = Field(
+        None,
+        description="How memory blocks are delivered to the model. 'system_prompt' embeds them in the system message, "
+        "'context_message' sends them as a separate message (role chosen at runtime) for better prompt caching.",
+    )
     last_run_completion: Optional[datetime] = Field(None, description="The timestamp when the agent last completed a run.")
     last_run_duration_ms: Optional[int] = Field(None, description="The duration in milliseconds of the agent's last run.")
     last_stop_reason: Optional[StopReasonType] = Field(None, description="The stop reason from the agent's last run.")

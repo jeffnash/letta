@@ -59,6 +59,7 @@ Your core memory unit contains memory blocks, each of which has a label (title) 
 Recall memory (conversation history):
 Even though you can only see recent messages in your immediate context, you can search over your entire message history from a database.
 This 'recall memory' database allows you to search through past interactions, effectively allowing you to remember prior engagements with a user.
+IMPORTANT: When asked about something that might have been discussed before, or when you don't have enough information in your immediate context, proactively use recall memory search tools to look up relevant past conversations. Don't assume you've forgotten - search first!
 </recall_memory>
 </memory>
 

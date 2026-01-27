@@ -15,6 +15,7 @@ from letta.orm.mixins import OrganizationMixin, ProjectMixin, TemplateEntityMixi
 from letta.orm.organization import Organization
 from letta.orm.sqlalchemy_base import SqlalchemyBase
 from letta.schemas.agent import AgentState as PydanticAgentState
+from letta.schemas.agent import MemoryMode
 
 ENCRYPTED_PLACEHOLDER = "<encrypted>"
 from letta.schemas.embedding_config import EmbeddingConfig
@@ -93,6 +94,11 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
     )
     enable_sleeptime: Mapped[Optional[bool]] = mapped_column(
         Boolean, doc="If set to True, memory management will move to a background agent thread."
+    )
+    memory_mode: Mapped[Optional[str]] = mapped_column(
+        String,
+        nullable=True,
+        doc="How memory blocks are delivered: 'system_prompt' or 'context_message'. None = not yet evaluated.",
     )
 
     # Run metrics
@@ -259,6 +265,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "max_files_open": self.max_files_open,
             "per_file_view_window_char_limit": self.per_file_view_window_char_limit,
             "hidden": self.hidden,
+            "memory_mode": self.memory_mode,
             # optional field defaults
             "tags": [],
             "tools": [],
@@ -389,6 +396,7 @@ class Agent(SqlalchemyBase, OrganizationMixin, ProjectMixin, TemplateEntityMixin
             "max_files_open": self.max_files_open,
             "per_file_view_window_char_limit": self.per_file_view_window_char_limit,
             "hidden": self.hidden,
+            "memory_mode": self.memory_mode,
         }
         optional_fields = {
             "tags": [],

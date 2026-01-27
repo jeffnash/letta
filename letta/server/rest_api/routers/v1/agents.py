@@ -2438,7 +2438,7 @@ async def summarize_messages(
         in_context_messages = await server.message_manager.get_messages_by_ids_async(message_ids=agent.message_ids, actor=actor)
         compaction_settings = request.compaction_settings if request else None
         num_messages_before = len(in_context_messages)
-        summary_message, messages, summary = await agent_loop.compact(
+        summary_message, messages, summary, memory_message = await agent_loop.compact(
             messages=in_context_messages,
             compaction_settings=compaction_settings,
         )
@@ -2451,7 +2451,11 @@ async def summarize_messages(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Summarization failed to reduce the number of messages. You may need to use a different CompactionSettings (e.g. using `all` mode).",
             )
-        await agent_loop._checkpoint_messages(run_id=None, step_id=None, new_messages=[summary_message], in_context_messages=messages)
+        # Include memory message if created (for context_message mode agents)
+        new_messages = [summary_message]
+        if memory_message:
+            new_messages.append(memory_message)
+        await agent_loop._checkpoint_messages(run_id=None, step_id=None, new_messages=new_messages, in_context_messages=messages)
         return CompactionResponse(
             summary=summary,
             num_messages_before=num_messages_before,

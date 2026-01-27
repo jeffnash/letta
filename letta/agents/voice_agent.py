@@ -126,6 +126,7 @@ class VoiceAgent(BaseAgent):
             agent_id=self.agent_id,
             include_relationships=["tools", "memory", "tool_exec_environment_variables", "multi_agent_group"],
             actor=self.actor,
+            auto_migrate_memory_mode=True,  # Enable auto-migration on execution
         )
 
         # TODO: Refactor this so it uses our in-house clients
