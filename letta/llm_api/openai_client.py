@@ -1599,6 +1599,25 @@ class OpenAIClient(LLMClientBase):
                         details=details,
                     )
 
+            # Check for rate limit errors in the message (streaming API may not have status code)
+            msg_lower = msg.lower()
+            rate_limit_indicators = [
+                "rate limit",
+                "rate_limit",
+                "too many requests",
+                "requests per min",
+                "tokens per min",
+                "rpm",
+                "tpm",
+            ]
+            if any(indicator in msg_lower for indicator in rate_limit_indicators):
+                logger.warning(f"[OpenAI] Rate limit detected in error message: {type(e).__name__}: {msg}")
+                return LLMRateLimitError(
+                    message=f"Rate limited by OpenAI: {msg}",
+                    code=ErrorCode.RATE_LIMIT_EXCEEDED,
+                    details=details,
+                )
+
             # Check for transport-like errors in the message (stream errors)
             transport_indicators = [
                 "connection",
@@ -1610,7 +1629,6 @@ class OpenAIClient(LLMClientBase):
                 "peer",
                 "broken",
             ]
-            msg_lower = msg.lower()
             if any(indicator in msg_lower for indicator in transport_indicators):
                 logger.warning(f"[OpenAI] Transport error during streaming: {type(e).__name__}: {msg}")
                 return LLMConnectionError(

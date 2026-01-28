@@ -100,6 +100,7 @@ class MessageRole(str, Enum):
     tool = "tool"
     function = "function"
     system = "system"
+    developer = "developer"  # OpenAI/Anthropic role for system-like messages
     approval = "approval"
 
 
