@@ -20,7 +20,7 @@ from letta.agents.helpers import (
 )
 from letta.agents.letta_agent_v2 import LettaAgentV2
 from letta.constants import DEFAULT_MAX_STEPS, NON_USER_MSG_PREFIX, REQUEST_HEARTBEAT_PARAM, SUMMARIZATION_TRIGGER_MULTIPLIER
-from letta.errors import ContextWindowExceededError, LLMError, SystemPromptTokenExceededError
+from letta.errors import ContextWindowExceededError, LLMConnectionError, LLMError, SystemPromptTokenExceededError
 from letta.helpers import ToolRulesSolver
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns
 from letta.helpers.message_helper import convert_message_creates_to_messages
@@ -778,6 +778,26 @@ class LettaAgentV3(LettaAgentV2):
                     except ValueError as e:
                         self.stop_reason = LettaStopReason(stop_reason=StopReasonType.invalid_llm_response.value)
                         raise e
+                    except LLMConnectionError as e:
+                        # Handle connection errors with retry logic before the generic LLMError catch
+                        # since LLMConnectionError is a subclass of LLMError
+                        if llm_request_attempt < summarizer_settings.max_summarizer_retries:
+                            # Retry transient connection errors (e.g., HTTP/2 stream errors, network hiccups)
+                            import asyncio
+
+                            retry_delay = min(2 ** llm_request_attempt, 8)  # Exponential backoff: 1s, 2s, 4s, max 8s
+                            self.logger.warning(
+                                f"LLM connection error (attempt {llm_request_attempt + 1} of {summarizer_settings.max_summarizer_retries + 1}): {e}. "
+                                f"Retrying in {retry_delay}s..."
+                            )
+                            await asyncio.sleep(retry_delay)
+                            continue
+                        else:
+                            self.stop_reason = LettaStopReason(stop_reason=StopReasonType.llm_api_error.value)
+                            self.logger.error(
+                                f"LLM connection error persisted after {llm_request_attempt + 1} attempt(s) for run {run_id}: {e}"
+                            )
+                            raise e
                     except LLMError as e:
                         self.stop_reason = LettaStopReason(stop_reason=StopReasonType.llm_api_error.value)
                         raise e

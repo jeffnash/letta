@@ -1510,6 +1510,123 @@ class OpenAIClient(LLMClientBase):
                     },
                 )
 
+            # Handle generic APIError that is not context window overflow
+            # Extract available metadata from the error
+            body = getattr(e, "body", None)
+            request_id = getattr(e, "request_id", None)
+            status_code = None
+
+            # Try to extract status code from body or response
+            if body and isinstance(body, dict):
+                status_code = body.get("status")
+                if status_code is None:
+                    # Try to get from nested error object
+                    error_obj = body.get("error", {})
+                    if isinstance(error_obj, dict):
+                        # Some errors have code like "rate_limit_exceeded"
+                        error_code = error_obj.get("code")
+                        if error_code == "rate_limit_exceeded":
+                            return LLMRateLimitError(
+                                message=f"Rate limited by OpenAI: {msg}",
+                                code=ErrorCode.RATE_LIMIT_EXCEEDED,
+                                details=body,
+                            )
+
+            # Check for response attribute (some APIError subclasses have this)
+            response = getattr(e, "response", None)
+            if response is not None:
+                status_code = getattr(response, "status_code", None)
+
+            # Build details dict with available metadata
+            details = {
+                "provider_exception_type": type(e).__name__,
+                "body": body,
+            }
+            if request_id:
+                details["request_id"] = request_id
+            if status_code:
+                details["status_code"] = status_code
+
+            # Map to appropriate error based on status code or message content
+            if status_code:
+                if status_code >= 500:
+                    logger.warning(f"[OpenAI] Server error ({status_code}): {msg}")
+                    return LLMServerError(
+                        message=f"OpenAI server error: {msg}",
+                        code=ErrorCode.INTERNAL_SERVER_ERROR,
+                        details=details,
+                    )
+                elif status_code == 429:
+                    logger.warning(f"[OpenAI] Rate limited (429): {msg}")
+                    return LLMRateLimitError(
+                        message=f"Rate limited by OpenAI: {msg}",
+                        code=ErrorCode.RATE_LIMIT_EXCEEDED,
+                        details=details,
+                    )
+                elif status_code == 401:
+                    logger.error(f"[OpenAI] Authentication error (401): {msg}")
+                    return LLMAuthenticationError(
+                        message=f"Authentication failed with OpenAI: {msg}",
+                        code=ErrorCode.UNAUTHENTICATED,
+                        details=details,
+                    )
+                elif status_code == 403:
+                    logger.error(f"[OpenAI] Permission denied (403): {msg}")
+                    return LLMPermissionDeniedError(
+                        message=f"Permission denied by OpenAI: {msg}",
+                        code=ErrorCode.PERMISSION_DENIED,
+                        details=details,
+                    )
+                elif status_code == 404:
+                    logger.warning(f"[OpenAI] Resource not found (404): {msg}")
+                    return LLMNotFoundError(
+                        message=f"Resource not found in OpenAI: {msg}",
+                        code=ErrorCode.NOT_FOUND,
+                        details=details,
+                    )
+                elif status_code == 422:
+                    logger.warning(f"[OpenAI] Unprocessable entity (422): {msg}")
+                    return LLMUnprocessableEntityError(
+                        message=f"Invalid request content for OpenAI: {msg}",
+                        code=ErrorCode.INVALID_ARGUMENT,
+                        details=details,
+                    )
+                elif status_code >= 400:
+                    logger.warning(f"[OpenAI] Bad request ({status_code}): {msg}")
+                    return LLMBadRequestError(
+                        message=f"Bad request to OpenAI: {msg}",
+                        code=ErrorCode.INVALID_ARGUMENT,
+                        details=details,
+                    )
+
+            # Check for transport-like errors in the message (stream errors)
+            transport_indicators = [
+                "connection",
+                "stream",
+                "network",
+                "timeout",
+                "closed",
+                "reset",
+                "peer",
+                "broken",
+            ]
+            msg_lower = msg.lower()
+            if any(indicator in msg_lower for indicator in transport_indicators):
+                logger.warning(f"[OpenAI] Transport error during streaming: {type(e).__name__}: {msg}")
+                return LLMConnectionError(
+                    message=f"Connection error during OpenAI streaming: {msg}",
+                    code=ErrorCode.INTERNAL_SERVER_ERROR,
+                    details=details,
+                )
+
+            # Default: treat as server error with metadata
+            logger.warning(f"[OpenAI] API error: {type(e).__name__}: {msg}")
+            return LLMServerError(
+                message=f"OpenAI API error: {msg}",
+                code=ErrorCode.INTERNAL_SERVER_ERROR,
+                details=details,
+            )
+
         if isinstance(e, openai.AuthenticationError):
             logger.error(f"[OpenAI] Authentication error (401): {str(e)}")  # More severe log level
             return LLMAuthenticationError(
