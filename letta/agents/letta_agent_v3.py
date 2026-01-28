@@ -1712,7 +1712,6 @@ class LettaAgentV3(LettaAgentV2):
         if self.agent_state.memory_mode == MemoryMode.context_message:
             # Build fresh memory content from current agent state
             use_developer_role = LLMConfig.supports_developer_role(self.agent_state.llm_config)
-            role = "developer" if use_developer_role else "user"
             
             memory_content = self.agent_state.memory.compile_for_message(
                 llm_config=self.agent_state.llm_config,
@@ -1721,15 +1720,19 @@ class LettaAgentV3(LettaAgentV2):
                 timezone=self.agent_state.timezone,
             )
             
-            # If using user role, wrap in system-reminder tags
-            if not use_developer_role:
+            # For models that support developer/system role (OpenAI), use system role
+            # For other models, use user role with system-reminder tags for compatibility
+            if use_developer_role:
+                role = MessageRole.system
+            else:
+                role = MessageRole.user
                 memory_content = f"<system-reminder>\n{memory_content}\n</system-reminder>"
             
             # Create the canonical memory message (will be persisted by caller)
             memory_messages = await convert_message_creates_to_messages(
                 message_creates=[
                     MessageCreate(
-                        role=MessageRole(role),
+                        role=role,
                         content=[TextContent(text=memory_content)],
                         name=MEMORY_MESSAGE_NAME,
                     )

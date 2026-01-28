@@ -424,14 +424,32 @@ def supports_verbosity_control(model: str) -> bool:
 
 
 def accepts_developer_role(model: str) -> bool:
-    """Checks if the model accepts the 'developer' role. Note that not all reasoning models accept this role.
+    """Checks if the model accepts the 'developer' role.
+
+    Models that support developer role:
+    - OpenAI reasoning models (o1, o3, o4) except o1-mini
+    - GPT-5.x models (including copilot-gpt-5.x variants)
+
+    Note: Claude models use 'system' role, NOT 'developer'.
 
     See: https://community.openai.com/t/developer-role-not-accepted-for-o1-o1-mini-o3-mini/1110750/7
     """
-    if is_openai_reasoning_model(model) and "o1-mini" not in model or "o1-preview" in model:
+    model_lower = model.lower()
+
+    # GPT-5.x models support developer role
+    # Match: gpt-5, gpt-5.1, gpt-5.2-medium, copilot-gpt-5.2-medium, etc.
+    if "gpt-5" in model_lower:
         return True
-    else:
-        return False
+
+    # OpenAI reasoning models (o1, o3, o4) - except o1-mini which doesn't support it
+    if is_openai_reasoning_model(model) and "o1-mini" not in model_lower:
+        return True
+
+    # o1-preview specifically supports it
+    if "o1-preview" in model_lower:
+        return True
+
+    return False
 
 
 def supports_temperature_param(model: str) -> bool:
