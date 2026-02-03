@@ -271,13 +271,16 @@ async def test_create_agent_with_model_handle_uses_correct_llm_config(server: Sy
         captured_kwargs.update(kwargs)
         handle = kwargs["handle"]
 
-        # Return a minimal but valid LLMConfig with the requested handle
-        return PydanticLLMConfig(
-            model="test-model-name",
-            model_endpoint_type="openai",
-            model_endpoint="https://api.openai.com/v1",
-            context_window=8192,
-            handle=handle,
+        # Return a minimal but valid LLMConfig with the requested handle and empty warnings list
+        return (
+            PydanticLLMConfig(
+                model="test-model-name",
+                model_endpoint_type="openai",
+                model_endpoint="https://api.openai.com/v1",
+                context_window=8192,
+                handle=handle,
+            ),
+            [],
         )
 
     model_handle = "openai/gpt-4o-mini"

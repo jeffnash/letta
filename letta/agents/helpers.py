@@ -409,13 +409,31 @@ async def _prepare_in_context_messages_no_persist_async(
                     new_in_context_messages = []
                 return current_in_context_messages, new_in_context_messages
         else:
-            # Found a matching approval request - log if it wasn't at [-1]
+            # Found a matching approval request - log and fix if it wasn't at [-1]
             if current_in_context_messages and approval_request.id != current_in_context_messages[-1].id:
                 logger.warning(
                     f"Approval request found at non-terminal position. "
                     f"Matched message {approval_request.id} instead of [-1] message {current_in_context_messages[-1].id}. "
                     f"This may indicate message history issues. agent_id={agent_state.id}"
                 )
+                # Defensive reordering: Move approval request to terminal position
+                # This fixes corrupted message history by ensuring the approval request
+                # is at the expected position for subsequent processing
+                approval_idx = next(
+                    (i for i, m in enumerate(current_in_context_messages) if m.id == approval_request.id),
+                    None
+                )
+                if approval_idx is not None:
+                    # Remove from current position and append to end
+                    current_in_context_messages = (
+                        current_in_context_messages[:approval_idx] +
+                        current_in_context_messages[approval_idx + 1:] +
+                        [approval_request]
+                    )
+                    logger.info(
+                        f"Reordered approval request {approval_request.id} to terminal position. "
+                        f"agent_id={agent_state.id}"
+                    )
 
         validate_approval_tool_call_ids(approval_request, input_messages[0])
         new_in_context_messages = create_approval_response_message_from_input(

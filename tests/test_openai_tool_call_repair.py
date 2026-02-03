@@ -282,7 +282,12 @@ class TestValidateAndRepairOpenAIToolCallPairing:
         assert len(result) == 1
 
     def test_system_message_between_tool_call_and_response(self):
-        """System message between tool_call and tool response should trigger synthetic response insertion."""
+        """System message between tool_call and tool response should trigger synthetic response insertion.
+        
+        The late/mispositioned tool response should be REMOVED because Anthropic requires
+        tool_results to be in the user message immediately after the assistant with tool_use.
+        Keeping both synthetic and late responses would cause duplicate tool_result blocks.
+        """
         messages = [
             {
                 "role": "assistant",
@@ -297,16 +302,22 @@ class TestValidateAndRepairOpenAIToolCallPairing:
         result = validate_and_repair_openai_tool_call_pairing(messages)
 
         # The synthetic response should be inserted BEFORE the system message
-        assert len(result) == 4
+        # The late/mispositioned tool response should be REMOVED (not kept)
+        assert len(result) == 3
         assert result[0]["role"] == "assistant"
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_xyz"
         assert "Error" in result[1]["content"]  # This is the synthetic one
         assert result[2]["role"] == "system"
-        assert result[3]["role"] == "tool"  # The original (late) tool response
+        # The late tool response is removed as it's mispositioned
 
     def test_developer_message_between_tool_call_and_response(self):
-        """Developer message between tool_call and tool response should trigger synthetic response insertion."""
+        """Developer message between tool_call and tool response should trigger synthetic response insertion.
+        
+        The late/mispositioned tool response should be REMOVED because Anthropic requires
+        tool_results to be in the user message immediately after the assistant with tool_use.
+        Keeping both synthetic and late responses would cause duplicate tool_result blocks.
+        """
         messages = [
             {
                 "role": "assistant",
@@ -321,13 +332,14 @@ class TestValidateAndRepairOpenAIToolCallPairing:
         result = validate_and_repair_openai_tool_call_pairing(messages)
 
         # The synthetic response should be inserted BEFORE the developer message
-        assert len(result) == 4
+        # The late/mispositioned tool response should be REMOVED (not kept)
+        assert len(result) == 3
         assert result[0]["role"] == "assistant"
         assert result[1]["role"] == "tool"
         assert result[1]["tool_call_id"] == "call_abc"
         assert "Error" in result[1]["content"]
         assert result[2]["role"] == "developer"
-        assert result[3]["role"] == "tool"
+        # The late tool response is removed as it's mispositioned
 
     def test_unknown_role_triggers_boundary(self):
         """Unknown role should also trigger boundary detection."""
@@ -477,6 +489,65 @@ class TestOrphanedToolResultRemoval:
         tool_call_ids = {tr["tool_call_id"] for tr in tool_responses}
         assert tool_call_ids == {"call_A", "call_B"}
 
+    def test_tool_result_before_its_assistant_message_removed(self):
+        """Tool response appearing BEFORE its assistant message should be removed.
+        
+        This is a critical edge case for Anthropic compatibility. The error:
+            "Each `tool_result` block must have a corresponding `tool_use` block
+             in the previous message."
+        
+        If a tool_result references a tool_use that appears LATER in the conversation,
+        it will cause a 400 error when converted to Anthropic format.
+        """
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "tool", "tool_call_id": "call_future", "content": "Result for future call"},  # BEFORE its assistant
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_future", "type": "function", "function": {"name": "get_data", "arguments": "{}"}},
+            ]},
+            {"role": "user", "content": "Thanks"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # The tool response appearing BEFORE its assistant should be removed
+        # A synthetic response should be injected AFTER the assistant
+        assert len(result) == 4
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+        assert result[2]["role"] == "tool"
+        assert result[2]["tool_call_id"] == "call_future"
+        assert "Error" in result[2]["content"]  # This is the synthetic one
+        assert result[3]["role"] == "user"
+
+    def test_tool_result_for_earlier_assistant_removed(self):
+        """Tool response referencing an earlier assistant (not immediately preceding) should be removed.
+        
+        This tests the Anthropic constraint that tool_results must reference tool_uses
+        in the IMMEDIATELY PRECEDING assistant message.
+        """
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_A", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_A", "content": "Result A"},
+            {"role": "user", "content": "Continue"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_B", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_B", "content": "Result B"},
+            {"role": "tool", "tool_call_id": "call_A", "content": "Late duplicate result for A"},  # WRONG: A is not in immediately preceding assistant
+            {"role": "user", "content": "Done"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # The late duplicate tool response for call_A should be removed
+        # because it appears after assistant B, not after assistant A
+        assert len(result) == 6
+        tool_responses = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_responses) == 2
+        tool_call_ids = [tr["tool_call_id"] for tr in tool_responses]
+        assert tool_call_ids == ["call_A", "call_B"]  # Only one response per call
+
     def test_synthetic_response_not_removed(self):
         """Synthetic tool responses injected by first pass should not be removed by second pass."""
         # This tests that synthetic responses added for orphaned tool_calls are not
@@ -499,6 +570,54 @@ class TestOrphanedToolResultRemoval:
         assert result[2]["role"] == "tool"
         assert result[2]["tool_call_id"] == "call_orphan_call"
         assert "Error" in result[2]["content"]
+
+    def test_synthetic_insertion_does_not_remove_existing_tool_response(self):
+        """Regression test: synthetic insertion must not cause existing tool responses to be removed.
+        
+        This tests the fix for a bug where the correctly_positioned_indices calculation was off-by-one,
+        causing existing tool responses to be incorrectly removed after synthetic ones were inserted.
+        
+        The bug scenario:
+        1. Assistant has tool_calls=[call_1, call_2]
+        2. Tool response for call_1 exists at correct position
+        3. Tool response for call_2 is missing (orphaned)
+        4. Synthetic response for call_2 is inserted
+        5. BUG: The existing response for call_1 was incorrectly removed
+        
+        The error manifested as Anthropic 400: "unexpected tool_use_id found in tool_result blocks"
+        because the synthetic response was kept but the original response was removed, leaving
+        mismatched tool_use/tool_result pairs.
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "calculate", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "Search result: 42"},
+            # call_2 is orphaned - no tool response!
+            {"role": "user", "content": "Thanks!"},
+        ]
+        result = validate_and_repair_openai_tool_call_pairing(messages)
+
+        # Should have 4 messages: assistant, synthetic for call_2, existing for call_1, user
+        # Note: synthetic is inserted at position 1, which shifts existing call_1 response to position 2
+        assert len(result) == 4
+        
+        # Both tool responses must be present
+        tool_responses = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_responses) == 2
+        
+        # Verify both tool_call_ids are represented
+        tool_call_ids = {tr["tool_call_id"] for tr in tool_responses}
+        assert tool_call_ids == {"call_1", "call_2"}
+        
+        # Verify the order and content
+        by_id = {tr["tool_call_id"]: tr for tr in tool_responses}
+        assert by_id["call_1"]["content"] == "Search result: 42"  # Original
+        assert "Error" in by_id["call_2"]["content"]  # Synthetic
 
 
 class TestValidateAndRepairResponsesAPIToolCallPairing:

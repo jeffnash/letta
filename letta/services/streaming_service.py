@@ -102,7 +102,7 @@ class StreamingService:
 
         # Handle model override if specified in the request
         if request.override_model:
-            override_llm_config = await self.server.get_llm_config_from_handle_async(
+            override_llm_config, _ = await self.server.get_llm_config_from_handle_async(
                 actor=actor,
                 handle=request.override_model,
             )

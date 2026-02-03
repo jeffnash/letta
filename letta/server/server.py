@@ -529,6 +529,7 @@ class SyncServer(object):
         request: CreateAgent,
         actor: User,
     ) -> AgentState:
+        warnings: List[str] = []  # Track any warnings generated during agent creation
         if request.llm_config is None:
             additional_config_params = {}
             if request.model is None:
@@ -565,7 +566,7 @@ class SyncServer(object):
                 "enable_reasoner": request.enable_reasoner,
             }
             log_event(name="start get_llm_config_from_handle", attributes=config_params)
-            request.llm_config = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
+            request.llm_config, warnings = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
             log_event(name="end get_llm_config_from_handle", attributes=config_params)
             if request.model and isinstance(request.model, str):
                 assert request.llm_config.handle == request.model, (
@@ -605,6 +606,10 @@ class SyncServer(object):
         )
         log_event(name="end create_agent db")
 
+        # Add any warnings from LLM config generation to the agent state
+        if warnings:
+            main_agent = main_agent.model_copy(update={"warnings": warnings})
+
         log_event(name="start insert_files_into_context_window db")
         # Use folder_ids if provided, otherwise fall back to deprecated source_ids for backwards compatibility
         folder_ids_to_attach = request.folder_ids if request.folder_ids else request.source_ids
@@ -634,6 +639,7 @@ class SyncServer(object):
         actor: User,
     ) -> AgentState:
         # Build llm_config from convenience fields if llm_config is not provided
+        warnings: List[str] = []
         if request.llm_config is None and (
             request.model is not None or request.context_window_limit is not None or request.max_tokens is not None
         ):
@@ -651,7 +657,7 @@ class SyncServer(object):
                 "max_tokens": request.max_tokens,
             }
             log_event(name="start get_llm_config_from_handle", attributes=config_params)
-            request.llm_config = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
+            request.llm_config, warnings = await self.get_llm_config_from_handle_async(actor=actor, **config_params)
             log_event(name="end get_llm_config_from_handle", attributes=config_params)
 
         # update with model_settings
@@ -682,11 +688,17 @@ class SyncServer(object):
                 else:
                     await self.create_sleeptime_agent_async(main_agent=agent, actor=actor)
 
-        return await self.agent_manager.update_agent_async(
+        updated_agent = await self.agent_manager.update_agent_async(
             agent_id=agent_id,
             agent_update=request,
             actor=actor,
         )
+
+        # Add any warnings from LLM config generation to the agent state
+        if warnings:
+            updated_agent = updated_agent.model_copy(update={"warnings": warnings})
+
+        return updated_agent
 
     async def create_sleeptime_agent_async(self, main_agent: AgentState, actor: User) -> AgentState:
         if main_agent.embedding_config is None:
@@ -1655,8 +1667,9 @@ class SyncServer(object):
         max_tokens: Optional[int] = None,
         max_reasoning_tokens: Optional[int] = None,
         enable_reasoner: Optional[bool] = None,
-    ) -> LLMConfig:
+    ) -> Tuple[LLMConfig, List[str]]:
         # Use provider_manager to get LLMConfig from handle
+        warnings: List[str] = []
         try:
             llm_config = await self.provider_manager.get_llm_config_from_handle(
                 handle=handle,
@@ -1667,7 +1680,9 @@ class SyncServer(object):
             from letta.orm.errors import NoResultFound
 
             if isinstance(e, NoResultFound):
-                raise HandleNotFoundError(handle, [])
+                # Fetch available LLM model handles to provide helpful suggestions
+                available_handles = await self._get_available_llm_handles_async(actor, handle)
+                raise HandleNotFoundError(handle, available_handles)
             raise
 
         if context_window_limit is not None:
@@ -1675,12 +1690,13 @@ class SyncServer(object):
             # However, provider configs may already have a safety buffer applied (e.g. 0.95).
             # Instead of hard-failing, clamp to the maximum allowed.
             if context_window_limit > llm_config.context_window:
-                logger.warning(
-                    "Requested context_window_limit (%s) exceeds model maximum (%s); clamping",
-                    context_window_limit,
-                    llm_config.context_window,
+                warning_msg = (
+                    f"Requested context_window_limit ({context_window_limit}) exceeds model maximum "
+                    f"({llm_config.context_window}); clamping"
                 )
-                llm_config.context_window = llm_config.context_window
+                logger.warning(warning_msg)
+                warnings.append(warning_msg)
+                # Keep llm_config.context_window as is (clamped to max)
             else:
                 llm_config.context_window = context_window_limit
         else:
@@ -1700,7 +1716,75 @@ class SyncServer(object):
             if enable_reasoner and llm_config.model_endpoint_type == "anthropic":
                 llm_config.put_inner_thoughts_in_kwargs = False
 
-        return llm_config
+        return llm_config, warnings
+
+    async def _get_available_llm_handles_async(
+        self,
+        actor: User,
+        requested_handle: str,
+        max_suggestions: int = 10,
+    ) -> List[str]:
+        """Get available LLM model handles, prioritized by similarity to the requested handle.
+
+        This method is called when a handle lookup fails, to provide helpful suggestions.
+        It uses a simple similarity scoring to show the most relevant alternatives first.
+
+        Args:
+            actor: The user actor for permission checking
+            requested_handle: The handle that was not found (used for similarity matching)
+            max_suggestions: Maximum number of suggestions to return (default: 10)
+
+        Returns:
+            List of available handle strings, sorted by relevance
+        """
+        try:
+            # Fetch all available LLM models
+            available_models = await self.provider_manager.list_models_async(
+                actor=actor,
+                model_type="llm",
+                enabled=True,
+                limit=500,  # Reasonable upper limit
+            )
+
+            if not available_models:
+                return []
+
+            # Extract handles
+            all_handles = [m.handle for m in available_models if m.handle]
+
+            if not all_handles:
+                return []
+
+            # Score handles by similarity to the requested handle for better suggestions
+            requested_lower = requested_handle.lower()
+            requested_parts = set(requested_lower.replace("/", " ").replace("-", " ").replace("_", " ").split())
+
+            def similarity_score(handle: str) -> tuple:
+                """Score handles by similarity. Higher score = more similar.
+                Returns tuple for sorting: (exact_provider_match, partial_matches, -length)
+                """
+                handle_lower = handle.lower()
+                handle_parts = set(handle_lower.replace("/", " ").replace("-", " ").replace("_", " ").split())
+
+                # Check if provider (prefix before /) matches
+                req_provider = requested_lower.split("/")[0] if "/" in requested_lower else ""
+                handle_provider = handle_lower.split("/")[0] if "/" in handle_lower else ""
+                provider_match = 1 if req_provider and handle_provider and req_provider in handle_provider else 0
+
+                # Count partial matches in parts
+                partial_matches = len(requested_parts & handle_parts)
+
+                # Prefer shorter handles (simpler names)
+                return (provider_match, partial_matches, -len(handle))
+
+            # Sort by similarity (descending) and take top suggestions
+            sorted_handles = sorted(all_handles, key=similarity_score, reverse=True)
+            return sorted_handles[:max_suggestions]
+
+        except Exception as e:
+            # If we can't fetch handles, return empty list rather than failing
+            logger.warning(f"Failed to fetch available LLM handles for error message: {e}")
+            return []
 
     @trace_method
     async def get_embedding_config_from_handle_async(

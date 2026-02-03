@@ -173,6 +173,12 @@ class AgentState(OrmMetadataBase, validate_assignment=True):
     # timezone
     timezone: Optional[str] = Field(None, description="The timezone of the agent (IANA format).")
 
+    # warnings generated during agent creation or modification
+    warnings: Optional[List[str]] = Field(
+        None,
+        description="Warnings generated during agent creation or modification (e.g., configuration adjustments)."
+    )
+
     # file related controls
     max_files_open: Optional[int] = Field(
         None,

@@ -64,91 +64,194 @@ def _build_assistant_index_to_tool_response_indices(messages: List[Message], too
     return assistant_idx_to_tool_indices
 
 
+def _find_earliest_safe_cutoff_for_tool_group(
+    candidate_idx: int,
+    messages: List[Message],
+    tool_call_id_to_assistant_idx: dict,
+    assistant_idx_to_tool_indices: dict,
+) -> int:
+    """Find the earliest safe cutoff index that keeps a complete tool call/response group.
+    
+    Given a candidate cutoff index, this function checks if cutting at that point would
+    split a tool call from its responses. If so, it returns an adjusted cutoff that
+    keeps the entire tool group together.
+    
+    Args:
+        candidate_idx: The proposed cutoff index
+        messages: The list of messages
+        tool_call_id_to_assistant_idx: Mapping from tool_call_id to assistant message index
+        assistant_idx_to_tool_indices: Mapping from assistant index to tool response indices
+        
+    Returns:
+        The earliest safe cutoff index that preserves tool pairing (may be <= candidate_idx)
+    """
+    adjusted_idx = candidate_idx
+    
+    # Check all messages that would be kept (from candidate_idx onwards)
+    # and find any tool responses whose assistant would be evicted
+    for kept_idx in range(candidate_idx, len(messages)):
+        kept_msg = messages[kept_idx]
+        if kept_msg.role == MessageRole.tool and kept_msg.tool_call_id:
+            assistant_idx = tool_call_id_to_assistant_idx.get(kept_msg.tool_call_id)
+            if assistant_idx is not None and assistant_idx < adjusted_idx:
+                # This tool response's assistant would be evicted - we need to include the assistant
+                adjusted_idx = assistant_idx
+    
+    # Now check if the adjusted cutoff point is an assistant with tool calls
+    # and ensure ALL its tool responses are also kept
+    while adjusted_idx > 0:
+        msg_at_cutoff = messages[adjusted_idx]
+        if msg_at_cutoff.role == MessageRole.assistant and msg_at_cutoff.tool_calls:
+            tool_response_indices = assistant_idx_to_tool_indices.get(adjusted_idx, [])
+            if tool_response_indices:
+                min_tool_response_idx = min(tool_response_indices)
+                if min_tool_response_idx < adjusted_idx:
+                    # Some tool responses come BEFORE the assistant - this is unusual but handle it
+                    # Move cutoff to include the earliest tool response
+                    adjusted_idx = min_tool_response_idx
+                    continue
+        break
+    
+    return adjusted_idx
+
+
 def _find_safe_cutoff_index(
     messages: List[Message],
     target_cutoff_index: int,
     tool_call_id_to_assistant_idx: dict,
     assistant_idx_to_tool_indices: dict,
     valid_cutoff_roles: Set[MessageRole],
+    maximum_message_index: Optional[int] = None,
 ) -> Optional[int]:
-    """Find a safe cutoff index that respects tool_use → tool_result pairing.
-    
+    """Find a safe cutoff index with improved algorithm and multiple fallback strategies.
+
     The cutoff index is the first message to KEEP (i.e., messages[cutoff:] are kept).
     We need to ensure that:
-    1. The cutoff is at an assistant message (for proper conversation flow)
+    1. The cutoff preserves proper conversation flow (preferably at assistant or user message)
     2. If we're keeping a tool response message, we must also keep its assistant message
     3. If we're evicting an assistant message with tool calls, we must also evict all its tool responses
-    
+
+    The algorithm uses a multi-strategy approach:
+    1. First, try to find a cutoff at a preferred role (assistant first, then user)
+    2. Adjust the cutoff backwards if needed to keep complete tool call groups
+    3. Fall back to ANY safe position if preferred roles don't work
+
     Args:
         messages: The list of messages
         target_cutoff_index: The initial target cutoff index (first message to keep)
         tool_call_id_to_assistant_idx: Mapping from tool_call_id to assistant message index
         assistant_idx_to_tool_indices: Mapping from assistant index to tool response indices
-        valid_cutoff_roles: Set of valid roles for cutoff point (typically just assistant)
-    
+        valid_cutoff_roles: Set of valid roles for cutoff point
+        maximum_message_index: Optional upper bound for cutoff (to preserve terminal messages like approvals)
+
     Returns:
         A safe cutoff index, or None if no valid cutoff can be found
     """
-    # Search backwards from target_cutoff_index to find a valid assistant message
+    # Apply maximum message index constraint if provided
+    if maximum_message_index is not None:
+        target_cutoff_index = min(target_cutoff_index, maximum_message_index)
+
+    # Expand valid cutoff roles to include user messages as fallback
+    # User messages are natural conversation boundaries and safe cutoff points
+    expanded_valid_roles = valid_cutoff_roles | {MessageRole.user}
+
+    # Strategy 1: Try preferred roles (assistant first, then user)
+    # Search in priority order: assistant messages first, then user messages
+    preferred_roles = [MessageRole.assistant, MessageRole.user]
+
+    for role in preferred_roles:
+        if role not in expanded_valid_roles:
+            continue
+
+        # Search backwards from target_cutoff_index to find a message of this role
+        for candidate_idx in reversed(range(1, target_cutoff_index + 1)):
+            if candidate_idx >= len(messages):
+                continue
+
+            candidate_msg = messages[candidate_idx]
+
+            # Skip if not the role we're looking for
+            if candidate_msg.role != role:
+                continue
+
+            # Adjust the cutoff to ensure complete tool groups are preserved
+            adjusted_idx = _find_earliest_safe_cutoff_for_tool_group(
+                candidate_idx,
+                messages,
+                tool_call_id_to_assistant_idx,
+                assistant_idx_to_tool_indices,
+            )
+
+            # Validate that this cutoff doesn't orphan any tool calls or responses
+            if _is_cutoff_safe(
+                adjusted_idx, messages, tool_call_id_to_assistant_idx, assistant_idx_to_tool_indices
+            ):
+                # Don't evict everything including the last message (respect maximum_message_index)
+                if maximum_message_index is None or adjusted_idx < maximum_message_index:
+                    return adjusted_idx
+
+    # Strategy 2: Final fallback - try ANY position that maintains tool safety
+    # This handles edge cases where the conversation has unusual structure
+    # or where preferred role cutoffs would all break tool pairing constraints
     for candidate_idx in reversed(range(1, target_cutoff_index + 1)):
-        if candidate_idx >= len(messages):
-            continue
-        
-        candidate_msg = messages[candidate_idx]
-        
-        # Must be a valid cutoff role (assistant)
-        if candidate_msg.role not in valid_cutoff_roles:
-            continue
-        
-        # Check if this assistant message has tool calls
-        if candidate_msg.tool_calls:
-            # Get all tool response indices for this assistant message
-            tool_response_indices = assistant_idx_to_tool_indices.get(candidate_idx, [])
-            
-            if tool_response_indices:
-                # The last tool response must come BEFORE this cutoff for us to safely evict
-                # Or all tool responses must come AFTER (meaning we keep all of them)
-                max_tool_response_idx = max(tool_response_indices)
-                
-                # If any tool response is >= candidate_idx, they would be in the "keep" portion
-                # which is fine - we're keeping the assistant message too
-                # But if the assistant message is being evicted (< candidate_idx), then
-                # all its tool responses must also be evicted (< candidate_idx)
-                # 
-                # Wait - the candidate_idx IS the assistant message index, and we're considering
-                # keeping messages[candidate_idx:]. So if candidate has tool calls, we're keeping
-                # the assistant message. We need to check that ALL its tool responses are also kept.
-                min_tool_response_idx = min(tool_response_indices)
-                
-                if min_tool_response_idx < candidate_idx:
-                    # Some tool responses would be evicted while assistant message is kept - NOT SAFE
-                    # We need to move the cutoff earlier to include all tool responses
-                    # Actually, we need to either:
-                    # a) Move cutoff to include all tool responses (cutoff = min_tool_response_idx or earlier)
-                    # b) Skip this assistant message and find an earlier one
-                    # 
-                    # Since we want to evict as much as possible, let's try to adjust the cutoff
-                    # to include the tool responses. But we need to find a valid assistant message
-                    # before the first tool response.
-                    continue  # Skip this candidate, try to find an earlier valid cutoff
-        
-        # This candidate is safe to use as cutoff.
-        # But we also need to verify that we're not orphaning any tool responses in the KEPT portion.
-        # Check all kept messages (candidate_idx onwards) for tool responses whose assistant is evicted.
-        safe = True
-        for kept_idx in range(candidate_idx, len(messages)):
-            kept_msg = messages[kept_idx]
-            if kept_msg.role == MessageRole.tool and kept_msg.tool_call_id:
-                assistant_idx = tool_call_id_to_assistant_idx.get(kept_msg.tool_call_id)
-                if assistant_idx is not None and assistant_idx < candidate_idx:
-                    # This tool response's assistant message would be evicted - NOT SAFE
-                    safe = False
-                    break
-        
-        if safe:
-            return candidate_idx
-    
+        adjusted_idx = _find_earliest_safe_cutoff_for_tool_group(
+            candidate_idx,
+            messages,
+            tool_call_id_to_assistant_idx,
+            assistant_idx_to_tool_indices,
+        )
+
+        if _is_cutoff_safe(
+            adjusted_idx, messages, tool_call_id_to_assistant_idx, assistant_idx_to_tool_indices
+        ):
+            if maximum_message_index is None or adjusted_idx < maximum_message_index:
+                return adjusted_idx
+
     return None
+
+
+def _is_cutoff_safe(
+    cutoff_idx: int,
+    messages: List[Message],
+    tool_call_id_to_assistant_idx: dict,
+    assistant_idx_to_tool_indices: dict,
+) -> bool:
+    """Check if a cutoff index is safe (doesn't orphan tool calls or responses).
+    
+    A cutoff is safe if:
+    1. No tool response in the kept portion has its assistant evicted
+    2. No assistant with tool calls in the kept portion has any tool responses evicted
+    
+    Args:
+        cutoff_idx: The proposed cutoff index (first message to keep)
+        messages: The list of messages
+        tool_call_id_to_assistant_idx: Mapping from tool_call_id to assistant message index
+        assistant_idx_to_tool_indices: Mapping from assistant index to tool response indices
+        
+    Returns:
+        True if the cutoff is safe, False otherwise
+    """
+    if cutoff_idx < 1 or cutoff_idx >= len(messages):
+        return False
+    
+    # Check all kept messages for orphaned tool responses
+    for kept_idx in range(cutoff_idx, len(messages)):
+        kept_msg = messages[kept_idx]
+        
+        # Check if this is a tool response whose assistant would be evicted
+        if kept_msg.role == MessageRole.tool and kept_msg.tool_call_id:
+            assistant_idx = tool_call_id_to_assistant_idx.get(kept_msg.tool_call_id)
+            if assistant_idx is not None and assistant_idx < cutoff_idx:
+                return False
+        
+        # Check if this is an assistant with tool calls where some responses would be evicted
+        if kept_msg.role == MessageRole.assistant and kept_msg.tool_calls:
+            tool_response_indices = assistant_idx_to_tool_indices.get(kept_idx, [])
+            for tool_idx in tool_response_indices:
+                if tool_idx < cutoff_idx:
+                    return False
+    
+    return True
 
 
 async def count_tokens(actor: User, llm_config: LLMConfig, messages: List[Message]) -> int:
@@ -262,6 +365,7 @@ async def summarize_via_sliding_window(
             tool_call_id_to_assistant_idx=tool_call_id_to_assistant_idx,
             assistant_idx_to_tool_indices=assistant_idx_to_tool_indices,
             valid_cutoff_roles=valid_cutoff_roles,
+            maximum_message_index=maximum_message_index,
         )
         
         if safe_cutoff_index is None:

@@ -1529,7 +1529,7 @@ async def send_message(
 
     # Handle model override if specified in the request
     if request.override_model:
-        override_llm_config = await server.get_llm_config_from_handle_async(
+        override_llm_config, _ = await server.get_llm_config_from_handle_async(
             actor=actor,
             handle=request.override_model,
         )
@@ -1996,7 +1996,7 @@ async def _process_message_background(
 
         # Handle model override if specified
         if override_model:
-            override_llm_config = await server.get_llm_config_from_handle_async(
+            override_llm_config, _ = await server.get_llm_config_from_handle_async(
                 actor=actor,
                 handle=override_model,
             )

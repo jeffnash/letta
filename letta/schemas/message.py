@@ -261,7 +261,9 @@ class Message(BaseMessage):
     @field_validator("role")
     @classmethod
     def validate_role(cls, v: str) -> str:
-        roles = ["system", "assistant", "user", "tool", "approval"]
+        # Keep this aligned with MessageRole in `letta/schemas/enums.py`.
+        # OpenAI-compatible clients may send `developer`, and some providers use legacy `function`.
+        roles = ["system", "developer", "assistant", "user", "tool", "function", "approval"]
         assert v in roles, f"Role must be one of {roles}"
         return v
 
@@ -1287,10 +1289,12 @@ class Message(BaseMessage):
         # But for now, it's OK until we support multi-modal,
         # since the only "parts" we have are for supporting various COT
 
-        if self.role == "system":
+        # If we store provider-agnostic system-like messages as either "system" or "developer",
+        # normalize them here. The caller can request mapping system->developer for OpenAI models.
+        if self.role in ("system", "developer"):
             openai_message = {
                 "content": text_content,
-                "role": "developer" if use_developer_message else self.role,
+                "role": "developer" if use_developer_message else "system",
             }
 
         elif self.role == "user":
@@ -1447,7 +1451,9 @@ class Message(BaseMessage):
 
         message_dicts = []
 
-        if self.role == "system":
+        # Responses API uses a dedicated "developer" role for instruction messages.
+        # If we stored the message as either system or developer in the DB, normalize to developer here.
+        if self.role in ("system", "developer"):
             assert len(self.content) == 1 and isinstance(self.content[0], TextContent), vars(self)
             message_dicts.append(
                 {

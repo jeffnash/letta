@@ -172,6 +172,19 @@ class OpenAIStreamingInterface:
         self.total_events_received: int = 0
         self.stream_was_cancelled: bool = False
 
+    def is_empty_stream(self) -> bool:
+        """Check if the stream yielded no events.
+        
+        Returns True if 0 events were received, which indicates a potential problem:
+        - Network interruption after connection was established
+        - API timeout before any response data
+        - Rate limiting that silently dropped the stream
+        - Early cancellation (check stream_was_cancelled for context)
+        
+        This is distinct from a stream that yielded events but produced no content.
+        """
+        return self.total_events_received == 0
+
     def get_reasoning_content(self) -> list[TextContent | OmittedReasoningContent]:
         content = "".join(self.reasoning_messages).strip()
 
@@ -306,12 +319,24 @@ class OpenAIStreamingInterface:
                         # Don't raise the exception here
                         continue
 
-                # Stream iterator exited normally
-                logger.info(
-                    f"Chat Completions stream iterator exited. "
-                    f"Received {self.total_events_received} events, "
-                    f"last event: {self.last_event_type}"
-                )
+                # Stream iterator exited normally - check for 0 events anomaly
+                if self.total_events_received == 0:
+                    # 0 events is abnormal and indicates a problem:
+                    # - Network issues (connection reset, timeout after connect)
+                    # - API errors not surfaced as exceptions
+                    # - Rate limiting that silently drops the stream
+                    # - Early cancellation (check stream_was_cancelled flag)
+                    logger.warning(
+                        f"Chat Completions stream exited with 0 events received. "
+                        f"This indicates a potential issue: network interruption, API error, or rate limiting. "
+                        f"stream_was_cancelled={self.stream_was_cancelled}, model={self.model}"
+                    )
+                else:
+                    logger.info(
+                        f"Chat Completions stream iterator exited. "
+                        f"Received {self.total_events_received} events, "
+                        f"last event: {self.last_event_type}"
+                    )
 
         except Exception as e:
             import traceback
@@ -325,11 +350,14 @@ class OpenAIStreamingInterface:
             yield LettaStopReason(stop_reason=StopReasonType.error)
             raise e
         finally:
-            logger.info(
+            # Use warning level for 0 events to aid debugging
+            log_level = logger.warning if self.total_events_received == 0 else logger.info
+            log_level(
                 f"OpenAIStreamingInterface: Stream processing complete. "
                 f"Received {self.total_events_received} events, "
                 f"last event: {self.last_event_type}, "
-                f"stream was cancelled: {self.stream_was_cancelled}"
+                f"stream was cancelled: {self.stream_was_cancelled}, "
+                f"model={self.model}, message_id={self.message_id}"
             )
 
     async def _process_chunk(
@@ -669,6 +697,19 @@ class SimpleOpenAIStreamingInterface:
 
         self.requires_approval_tools = requires_approval_tools
 
+    def is_empty_stream(self) -> bool:
+        """Check if the stream yielded no events.
+        
+        Returns True if 0 events were received, which indicates a potential problem:
+        - Network interruption after connection was established
+        - API timeout before any response data
+        - Rate limiting that silently dropped the stream
+        - Early cancellation (check stream_was_cancelled for context)
+        
+        This is distinct from a stream that yielded events but produced no content.
+        """
+        return self.total_events_received == 0
+
     def get_content(self) -> list[TextContent | OmittedReasoningContent | ReasoningContent]:
         shown_omitted = False
         concat_content = ""
@@ -801,12 +842,24 @@ class SimpleOpenAIStreamingInterface:
                         # Don't raise the exception here
                         continue
 
-                # Stream iterator exited normally
-                logger.info(
-                    f"Chat Completions stream iterator exited (SimpleOpenAIStreamingInterface). "
-                    f"Received {self.total_events_received} events, "
-                    f"last event: {self.last_event_type}"
-                )
+                # Stream iterator exited normally - check for 0 events anomaly
+                if self.total_events_received == 0:
+                    # 0 events is abnormal and indicates a problem:
+                    # - Network issues (connection reset, timeout after connect)
+                    # - API errors not surfaced as exceptions
+                    # - Rate limiting that silently drops the stream
+                    # - Early cancellation (check stream_was_cancelled flag)
+                    logger.warning(
+                        f"SimpleOpenAI Chat Completions stream exited with 0 events received. "
+                        f"This indicates a potential issue: network interruption, API error, or rate limiting. "
+                        f"stream_was_cancelled={self.stream_was_cancelled}, model={self.model}"
+                    )
+                else:
+                    logger.info(
+                        f"Chat Completions stream iterator exited (SimpleOpenAIStreamingInterface). "
+                        f"Received {self.total_events_received} events, "
+                        f"last event: {self.last_event_type}"
+                    )
 
         except Exception as e:
             import traceback
@@ -828,11 +881,14 @@ class SimpleOpenAIStreamingInterface:
             yield LettaStopReason(stop_reason=StopReasonType.error)
             raise e
         finally:
-            logger.info(
+            # Use warning level for 0 events to aid debugging
+            log_level = logger.warning if self.total_events_received == 0 else logger.info
+            log_level(
                 f"SimpleOpenAIStreamingInterface: Stream processing complete. "
                 f"Received {self.total_events_received} events, "
                 f"last event: {self.last_event_type}, "
-                f"stream was cancelled: {self.stream_was_cancelled}"
+                f"stream was cancelled: {self.stream_was_cancelled}, "
+                f"model={self.model}, message_id={self.message_id}"
             )
 
     async def _process_chunk(
@@ -842,6 +898,10 @@ class SimpleOpenAIStreamingInterface:
         prev_message_type: Optional[str] = None,
         message_index: int = 0,
     ) -> AsyncGenerator[LettaMessage | LettaStopReason, None]:
+        # Track events for diagnostics
+        self.total_events_received += 1
+        self.last_event_type = "ChatCompletionChunk"
+
         if not self.model or not self.message_id:
             self.model = chunk.model
             self.message_id = chunk.id
@@ -1039,6 +1099,19 @@ class SimpleOpenAIResponsesStreamingInterface:
         self.total_events_received: int = 0
         self.stream_was_cancelled: bool = False
 
+    def is_empty_stream(self) -> bool:
+        """Check if the stream yielded no events.
+        
+        Returns True if 0 events were received, which indicates a potential problem:
+        - Network interruption after connection was established
+        - API timeout before any response data
+        - Rate limiting that silently dropped the stream
+        - Early cancellation (check stream_was_cancelled for context)
+        
+        This is distinct from a stream that yielded events but produced no content.
+        """
+        return self.total_events_received == 0
+
     # -------- Mapping helpers (no broad try/except) --------
     def _record_tool_mapping(self, event: object, item: object) -> tuple[str | None, str | None, int | None, str | None]:
         """Record call_id/name mapping for this tool-call using output_index and item.id if present.
@@ -1206,13 +1279,23 @@ class SimpleOpenAIResponsesStreamingInterface:
             yield LettaStopReason(stop_reason=StopReasonType.error)
             raise e
         finally:
-            logger.info(
+            # Use warning level for 0 events to aid debugging
+            log_level = logger.warning if self.total_events_received == 0 else logger.info
+            log_level(
                 f"ResponsesAPI Stream processing complete. "
                 f"Received {self.total_events_received} events, "
                 f"last event: {self.last_event_type}, "
                 f"has final_response: {self.final_response is not None}, "
-                f"stream was cancelled: {self.stream_was_cancelled}"
+                f"stream was cancelled: {self.stream_was_cancelled}, "
+                f"model={self.model}, message_id={self.message_id}"
             )
+            # Additional diagnostic for 0 events in Responses API
+            if self.total_events_received == 0:
+                logger.warning(
+                    f"ResponsesAPI stream exited with 0 events. "
+                    f"This indicates a potential issue: network interruption, API error, or rate limiting. "
+                    f"No ResponseCompletedEvent was received."
+                )
 
     async def _process_event(
         self,

@@ -1195,6 +1195,10 @@ def test_include_return_message_types(client: LettaSDKClient, agent: AgentState,
 def test_base_tools_upsert_on_list(client: LettaSDKClient):
     """Test that base tools are automatically upserted when missing on tools list call"""
     from letta.constants import LETTA_TOOL_SET
+    from letta.services.tool_manager import ToolManager
+
+    # Clear the base tools verification cache to ensure clean test state
+    ToolManager.clear_base_tools_cache()
 
     # First, get the initial list of tools to establish baseline
     initial_tools = client.tools.list()
@@ -1215,6 +1219,9 @@ def test_base_tools_upsert_on_list(client: LettaSDKClient):
                     tools_to_delete.append(tool)
                     client.tools.delete(tool_id=tool.id)
                     break
+
+    # Clear the cache again after deleting tools so the next list() call will re-check
+    ToolManager.clear_base_tools_cache()
 
     # Now call list_tools() which should trigger the base tools check and upsert
     updated_tools = client.tools.list()
