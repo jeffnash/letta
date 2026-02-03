@@ -195,6 +195,27 @@ def modal_tool_wrapper(tool: PydanticTool, actor: PydanticUser, sandbox_env_vars
 class ToolManager:
     """Manager class to handle business logic related to Tools."""
 
+    # Cache of organization IDs that have had base tools verified this server session.
+    # This eliminates redundant DB checks and upserts after the first successful verification.
+    # Reset on server restart, which is acceptable since upsert_base_tools_async is idempotent.
+    _base_tools_verified_orgs: Set[str] = set()
+
+    @classmethod
+    def clear_base_tools_cache(cls, organization_id: Optional[str] = None) -> None:
+        """Clear the base tools verification cache.
+
+        Args:
+            organization_id: If provided, only clear the cache for this specific org.
+                           If None, clears the entire cache.
+
+        This is primarily useful for testing scenarios where tools are deliberately
+        deleted and need to be re-upserted.
+        """
+        if organization_id:
+            cls._base_tools_verified_orgs.discard(organization_id)
+        else:
+            cls._base_tools_verified_orgs.clear()
+
     @enforce_types
     @trace_method
     async def create_or_update_tool_async(
@@ -569,6 +590,24 @@ class ToolManager:
             return count > 0
 
     @enforce_types
+    @trace_method
+    async def _get_existing_base_tool_names_async(self, actor: PydanticUser) -> Set[str]:
+        """Get the set of base tool names that already exist for the organization.
+
+        This is an optimized query that only fetches tool names matching the base tool set,
+        avoiding the pagination issues that can occur when checking against list_tools_async results.
+        """
+        base_tool_names = LETTA_TOOL_SET - set(LOCAL_ONLY_MULTI_AGENT_TOOLS) if settings.environment == "prod" else LETTA_TOOL_SET
+
+        async with db_registry.async_session() as session:
+            query = select(ToolModel.name).where(
+                ToolModel.name.in_(base_tool_names),
+                ToolModel.organization_id == actor.organization_id
+            )
+            result = await session.execute(query)
+            return {row[0] for row in result.fetchall()}
+
+    @enforce_types
     async def _check_tool_name_conflict_with_lock_async(self, session, tool_name: str, exclude_tool_id: str, actor: PydanticUser) -> bool:
         """Check if a tool with the given name exists (excluding the current tool), with row locking.
 
@@ -633,17 +672,19 @@ class ToolManager:
             project_id=project_id,
         )
 
-        # Check if all base tools are present if we requested all the tools w/o cursor
-        # TODO: This is a temporary hack to resolve this issue
-        # TODO: This requires a deeper rethink about how we keep all our internal tools up-to-date
-        if not after and upsert_base_tools:
-            existing_tool_names = {tool.name for tool in tools}
+        # Ensure base tools exist for this organization (lazy initialization with caching).
+        # This check only runs once per organization per server session, eliminating redundant
+        # DB queries and upserts on subsequent list_tools calls.
+        if not after and upsert_base_tools and actor.organization_id not in self._base_tools_verified_orgs:
+            # Use optimized query to check for missing base tools
+            # This avoids false positives from pagination (e.g., when limit=50 but org has >50 tools)
             base_tool_names = LETTA_TOOL_SET - set(LOCAL_ONLY_MULTI_AGENT_TOOLS) if settings.environment == "prod" else LETTA_TOOL_SET
-            missing_base_tools = base_tool_names - existing_tool_names
+            existing_base_tool_names = await self._get_existing_base_tool_names_async(actor)
+            missing_base_tools = base_tool_names - existing_base_tool_names
 
             # If any base tools are missing, upsert all base tools
             if missing_base_tools:
-                logger.info(f"Missing base tools detected: {missing_base_tools}. Upserting all base tools.")
+                logger.info(f"Missing base tools detected for org {actor.organization_id}: {missing_base_tools}. Upserting all base tools.")
                 await self.upsert_base_tools_async(actor=actor)
                 # Re-fetch the tools list after upserting base tools
                 tools = await self._list_tools_async(
@@ -660,6 +701,9 @@ class ToolManager:
                     return_only_letta_tools=return_only_letta_tools,
                     project_id=project_id,
                 )
+
+            # Mark this organization as verified for the remainder of this server session
+            self._base_tools_verified_orgs.add(actor.organization_id)
 
         return tools
 
@@ -1064,6 +1108,10 @@ class ToolManager:
     @trace_method
     async def delete_tool_by_id_async(self, tool_id: str, actor: PydanticUser) -> None:
         """Delete a tool by its ID."""
+        # Clear the base tools cache for this org so that if a base tool is deleted,
+        # it can be re-upserted on the next list_tools call
+        ToolManager.clear_base_tools_cache(actor.organization_id)
+
         async with db_registry.async_session() as session:
             try:
                 tool = await ToolModel.read_async(db_session=session, identifier=tool_id, actor=actor)
@@ -1173,13 +1221,19 @@ class ToolManager:
             tool_data_list.append(pydantic_tool)
 
         if not tool_data_list:
+            # Mark as verified even if empty (no tools to upsert means we're done)
+            self._base_tools_verified_orgs.add(actor.organization_id)
             return []
 
         if settings.letta_pg_uri_no_default:
             async with db_registry.async_session() as session:
-                return await self._bulk_upsert_postgresql(session, tool_data_list, actor)
+                result = await self._bulk_upsert_postgresql(session, tool_data_list, actor)
         else:
-            return await self._upsert_tools_individually(tool_data_list, actor)
+            result = await self._upsert_tools_individually(tool_data_list, actor)
+
+        # Mark this organization as verified after successful upsert
+        self._base_tools_verified_orgs.add(actor.organization_id)
+        return result
 
     @trace_method
     async def _bulk_upsert_postgresql(
