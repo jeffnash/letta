@@ -13,10 +13,12 @@ from .google_vertex import GoogleVertexProvider
 from .groq import GroqProvider
 from .letta import LettaProvider
 from .lmstudio import LMStudioOpenAIProvider
+from .minimax import MiniMaxProvider
 from .mistral import MistralProvider
 from .ollama import OllamaProvider
 from .openai import OpenAIProvider
 from .openrouter import OpenRouterProvider
+from .sglang import SGLangProvider
 from .together import TogetherProvider
 from .vllm import VLLMProvider
 from .xai import XAIProvider
@@ -42,11 +44,13 @@ __all__ = [
     "GroqProvider",
     "LettaProvider",
     "LMStudioOpenAIProvider",
+    "MiniMaxProvider",
     "MistralProvider",
     "OllamaProvider",
     "OpenAIProvider",
     "TogetherProvider",
     "VLLMProvider",
+    "SGLangProvider",
     "XAIProvider",
     "ZAIProvider",
     "OpenRouterProvider",

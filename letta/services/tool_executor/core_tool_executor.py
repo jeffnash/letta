@@ -11,6 +11,7 @@ from letta.constants import (
 from letta.helpers.json_helpers import json_dumps
 from letta.helpers.tpuf_client import should_use_tpuf_for_messages
 from letta.log import get_logger
+from letta.orm.errors import NoResultFound
 from letta.schemas.agent import AgentState
 from letta.schemas.block import BlockUpdate
 from letta.schemas.enums import MessageRole, TagMatchMode
@@ -474,14 +475,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         snippet = "\n".join(new_value.split("\n")[start_line : end_line + 1])
 
         # Prepare the success message
-        success_msg = f"The core memory block with label `{label}` has been edited. "
-        # success_msg += self._make_output(
-        #     snippet, f"a snippet of {path}", start_line + 1
-        # )
-        # success_msg += f"A snippet of core memory block `{label}`:\n{snippet}\n"
-        success_msg += (
-            "Review the changes and make sure they are as expected (correct indentation, "
-            "no duplicate lines, etc). Edit the memory block again if necessary."
+        success_msg = (
+            f"The core memory block with label `{label}` has been successfully edited. "
+            f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+            f"Review the changes and make sure they are as expected (correct indentation, "
+            f"no duplicate lines, etc). Edit the memory block again if necessary."
         )
 
         # return None
@@ -622,9 +620,10 @@ class LettaCoreToolExecutor(ToolExecutor):
             await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
             return (
-                f"The core memory block with label `{label}` has been edited. "
-                "Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). "
-                "Edit the memory block again if necessary."
+                f"The core memory block with label `{label}` has been successfully edited. "
+                f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+                f"Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). "
+                f"Edit the memory block again if necessary."
             )
 
         # Extended mode: parse codex-like patch operations for memory blocks
@@ -765,7 +764,11 @@ class LettaCoreToolExecutor(ToolExecutor):
             else:
                 raise ValueError(f"Unknown operation kind: {kind}")
 
-        return "Successfully applied memory patch operations:\n- " + "\n- ".join(results)
+        return (
+            "Successfully applied memory patch operations. "
+            "Your system prompt has been recompiled with the updated memory contents and is now active in your context.\n\n"
+            "Operations completed:\n- " + "\n- ".join(results)
+        )
 
     async def memory_insert(
         self,
@@ -826,16 +829,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
         # Prepare the success message
-        success_msg = f"The core memory block with label `{label}` has been edited. "
-        # success_msg += self._make_output(
-        #     snippet,
-        #     "a snippet of the edited file",
-        #     max(1, insert_line - SNIPPET_LINES + 1),
-        # )
-        # success_msg += f"A snippet of core memory block `{label}`:\n{snippet}\n"
-        success_msg += (
-            "Review the changes and make sure they are as expected (correct indentation, "
-            "no duplicate lines, etc). Edit the memory block again if necessary."
+        success_msg = (
+            f"The core memory block with label `{label}` has been successfully edited. "
+            f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+            f"Review the changes and make sure they are as expected (correct indentation, "
+            f"no duplicate lines, etc). Edit the memory block again if necessary."
         )
 
         return success_msg
@@ -871,14 +869,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
 
         # Prepare the success message
-        success_msg = f"The core memory block with label `{label}` has been edited. "
-        # success_msg += self._make_output(
-        #     snippet, f"a snippet of {path}", start_line + 1
-        # )
-        # success_msg += f"A snippet of core memory block `{label}`:\n{snippet}\n"
-        success_msg += (
-            "Review the changes and make sure they are as expected (correct indentation, "
-            "no duplicate lines, etc). Edit the memory block again if necessary."
+        success_msg = (
+            f"The core memory block with label `{label}` has been successfully edited. "
+            f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+            f"Review the changes and make sure they are as expected (correct indentation, "
+            f"no duplicate lines, etc). Edit the memory block again if necessary."
         )
 
         # return None
@@ -906,8 +901,14 @@ class LettaCoreToolExecutor(ToolExecutor):
             # Update the agent state with the updated memory from the database
             agent_state.memory = updated_agent_state.memory
 
-            return f"Successfully deleted memory block '{label}'"
+            return (
+                f"Successfully deleted memory block '{label}'. "
+                f"Your system prompt has been recompiled without this memory block and is now active in your context."
+            )
 
+        except NoResultFound:
+            # Catch the specific error and re-raise with human-readable names
+            raise ValueError(f"Memory block '{label}' is not attached to agent '{agent_state.name}'")
         except Exception as e:
             return f"Error performing delete: {str(e)}"
 
@@ -932,8 +933,14 @@ class LettaCoreToolExecutor(ToolExecutor):
                 new_content=description,
             )
 
-            return f"Successfully updated description of memory block '{label}'"
+            return (
+                f"Successfully updated description of memory block '{label}'. "
+                f"Your system prompt has been recompiled with the updated description and is now active in your context."
+            )
 
+        except NoResultFound:
+            # Catch the specific error and re-raise with human-readable names
+            raise ValueError(f"Memory block '{label}' not found for agent '{agent_state.name}'")
         except Exception as e:
             raise Exception(f"Error performing update_description: {str(e)}")
 
@@ -958,8 +965,14 @@ class LettaCoreToolExecutor(ToolExecutor):
                 new_content=new_label,
             )
 
-            return f"Successfully renamed memory block '{old_label}' to '{new_label}'"
+            return (
+                f"Successfully renamed memory block '{old_label}' to '{new_label}'. "
+                f"Your system prompt has been recompiled with the renamed memory block and is now active in your context."
+            )
 
+        except NoResultFound:
+            # Catch the specific error and re-raise with human-readable names
+            raise ValueError(f"Memory block '{old_label}' not found for agent '{agent_state.name}'")
         except Exception as e:
             raise Exception(f"Error performing rename: {str(e)}")
 
@@ -1102,7 +1115,7 @@ class LettaCoreToolExecutor(ToolExecutor):
         """Create a memory block by setting its value to an empty string."""
         from letta.schemas.block import Block
 
-        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/")
 
         # Create a new block and persist it to the database
         new_block = Block(label=label, value=file_text if file_text else "", description=description)
@@ -1115,11 +1128,14 @@ class LettaCoreToolExecutor(ToolExecutor):
         agent_state.memory.set_block(persisted_block)
 
         await self.agent_manager.update_memory_if_changed_async(agent_id=agent_state.id, new_memory=agent_state.memory, actor=actor)
-        return f"Successfully created memory block '{label}'"
+        return (
+            f"Successfully created memory block '{label}'. "
+            f"Your system prompt has been recompiled with the new memory block and is now active in your context."
+        )
 
     async def memory_str_replace(self, agent_state: AgentState, actor: User, path: str, old_str: str, new_str: str) -> str:
         """Replace text in a memory block."""
-        label = path.removeprefix("/memories/").removeprefix("/").replace("/", "_")
+        label = path.removeprefix("/memories/").removeprefix("/")
 
         memory_block = agent_state.memory.get_block(label)
         if memory_block is None:
@@ -1179,10 +1195,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         )
 
         # Prepare the success message
-        success_msg = f"The core memory block with label `{label}` has been edited. "
-        success_msg += (
-            "Review the changes and make sure they are as expected (correct indentation, "
-            "no duplicate lines, etc). Edit the memory block again if necessary."
+        success_msg = (
+            f"The core memory block with label `{label}` has been successfully edited. "
+            f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+            f"Review the changes and make sure they are as expected (correct indentation, "
+            f"no duplicate lines, etc). Edit the memory block again if necessary."
         )
 
         return success_msg
@@ -1252,10 +1269,11 @@ class LettaCoreToolExecutor(ToolExecutor):
         )
 
         # Prepare the success message
-        success_msg = f"The core memory block with label `{label}` has been edited. "
-        success_msg += (
-            "Review the changes and make sure they are as expected (correct indentation, "
-            "no duplicate lines, etc). Edit the memory block again if necessary."
+        success_msg = (
+            f"The core memory block with label `{label}` has been successfully edited. "
+            f"Your system prompt has been recompiled with the updated memory contents and is now active in your context. "
+            f"Review the changes and make sure they are as expected (correct indentation, "
+            f"no duplicate lines, etc). Edit the memory block again if necessary."
         )
 
         return success_msg

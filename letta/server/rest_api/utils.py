@@ -20,7 +20,7 @@ from letta.constants import (
 )
 from letta.errors import ContextWindowExceededError, RateLimitExceededError
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns, ns_to_ms
-from letta.helpers.message_helper import convert_message_creates_to_messages
+from letta.helpers.message_helper import convert_message_creates_to_messages, resolve_tool_return_images
 from letta.log import get_logger
 from letta.otel.context import get_ctx_attributes
 from letta.otel.metric_registry import MetricRegistry
@@ -172,43 +172,27 @@ async def create_input_messages(
     return messages
 
 
-def create_approval_response_message_from_input(
+async def create_approval_response_message_from_input(
     agent_state: AgentState, input_message: ApprovalCreate, run_id: Optional[str] = None
 ) -> List[Message]:
-    def _displayable_tool_return(tool_return: Any) -> str:
-        if tool_return is None:
-            return ""
-        if isinstance(tool_return, str):
-            return tool_return
-        if isinstance(tool_return, list):
-            text_parts: List[str] = []
-            image_parts = 0
-            for part in tool_return:
-                if isinstance(part, TextContent):
-                    text_parts.append(part.text)
-                elif isinstance(part, ImageContent):
-                    image_parts += 1
-            text = "\n".join([t for t in text_parts if t])
-            if image_parts:
-                suffix = f"\n[image x{image_parts}]" if text else f"[image x{image_parts}]"
-                return f"{text}{suffix}"
-            return text
-        return str(tool_return)
-
-    def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
+    async def maybe_convert_tool_return_message(maybe_tool_return: LettaToolReturn):
         if isinstance(maybe_tool_return, LettaToolReturn):
-            raw_tool_return = maybe_tool_return.tool_return
-            display_text = _displayable_tool_return(raw_tool_return)
-            packaged_function_response = package_function_response(
-                maybe_tool_return.status == "success",
-                display_text,
-                agent_state.timezone,
-            )
+            tool_return_content = maybe_tool_return.tool_return
+
+            # Handle tool_return content - can be string or list of content parts (text/image)
+            if isinstance(tool_return_content, str):
+                # String content - wrap with package_function_response as before
+                func_response = package_function_response(maybe_tool_return.status == "success", tool_return_content, agent_state.timezone)
+            else:
+                # List of content parts (text/image) - resolve URL images to base64 first
+                resolved_content = await resolve_tool_return_images(tool_return_content)
+                func_response = resolved_content
+
             return ToolReturn(
                 tool_call_id=maybe_tool_return.tool_call_id,
                 status=maybe_tool_return.status,
-                func_response=packaged_function_response,
-                tool_return=raw_tool_return,
+                func_response=func_response,
+                tool_return=tool_return_content,
                 stdout=maybe_tool_return.stdout,
                 stderr=maybe_tool_return.stderr,
             )
@@ -222,6 +206,11 @@ def create_approval_response_message_from_input(
             getattr(input_message, "approval_request_id", None),
         )
 
+    # Process all tool returns concurrently (for async image resolution)
+    import asyncio
+
+    converted_approvals = await asyncio.gather(*[maybe_convert_tool_return_message(approval) for approval in approvals_list])
+
     return [
         Message(
             role=MessageRole.approval,
@@ -230,7 +219,7 @@ def create_approval_response_message_from_input(
             approval_request_id=input_message.approval_request_id,
             approve=input_message.approve,
             denial_reason=input_message.reason,
-            approvals=[maybe_convert_tool_return_message(approval) for approval in approvals_list],
+            approvals=list(converted_approvals),
             run_id=run_id,
             group_id=input_message.group_id
             if input_message.group_id
