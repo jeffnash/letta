@@ -1505,7 +1505,6 @@ class LettaAgent(BaseAgent):
                         run_id=self.current_run_id,
                         step_id=step_metrics.id,
                         call_type="agent_step",
-                        step_id=step_id,
                     )
                     response = await llm_client.request_async_with_telemetry(request_data, agent_state.llm_config)
 
@@ -1579,7 +1578,6 @@ class LettaAgent(BaseAgent):
                     run_id=self.current_run_id,
                     step_id=step_id,
                     call_type="agent_step",
-                    step_id=step_id,
                 )
 
                 # Attempt LLM request with telemetry wrapper
