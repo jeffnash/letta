@@ -39,7 +39,11 @@ class ArchiveManager:
         try:
             async with db_registry.async_session() as session:
                 # determine vector db provider based on settings
-                vector_db_provider = VectorDBProvider.TPUF if should_use_tpuf() else VectorDBProvider.NATIVE
+                # Default to NATIVE for text-only archives (no embedding_config) to avoid routing them to Turbopuffer
+                if embedding_config is None:
+                    vector_db_provider = VectorDBProvider.NATIVE
+                else:
+                    vector_db_provider = VectorDBProvider.TPUF if should_use_tpuf() else VectorDBProvider.NATIVE
 
                 archive = ArchiveModel(
                     name=name,
@@ -347,8 +351,9 @@ class ArchiveManager:
             actor=actor,
         )
 
-        # If archive uses Turbopuffer, also write to Turbopuffer (dual-write)
-        if archive.vector_db_provider == VectorDBProvider.TPUF:
+        # If archive uses Turbopuffer and has embedding_config, also write to Turbopuffer (dual-write)
+        # Skip Turbopuffer insertion for text-only archives (embedding_config is None)
+        if archive.vector_db_provider == VectorDBProvider.TPUF and archive.embedding_config is not None:
             try:
                 from letta.helpers.tpuf_client import TurbopufferClient
 
@@ -403,14 +408,20 @@ class ArchiveManager:
         archive = await self.get_archive_by_id_async(archive_id=archive_id, actor=actor)
 
         texts = [passage["text"] for passage in passages]
-        embedding_client = LLMClient.create(
-            provider_type=archive.embedding_config.embedding_endpoint_type,
-            actor=actor,
-        )
-        embeddings = await embedding_client.request_embeddings(texts, archive.embedding_config)
 
-        if len(embeddings) != len(passages):
-            raise ValueError("Embedding response count does not match passages count")
+        # Generate embeddings only if embedding_config is available
+        if archive.embedding_config is not None:
+            embedding_client = LLMClient.create(
+                provider_type=archive.embedding_config.embedding_endpoint_type,
+                actor=actor,
+            )
+            embeddings = await embedding_client.request_embeddings(texts, archive.embedding_config)
+
+            if len(embeddings) != len(passages):
+                raise ValueError("Embedding response count does not match passages count")
+        else:
+            # No embedding config, set all embeddings to None
+            embeddings = [None] * len(passages)
 
         # Build PydanticPassage objects for batch creation
         pydantic_passages: List[PydanticPassage] = []
@@ -439,7 +450,8 @@ class ArchiveManager:
             actor=actor,
         )
 
-        if archive.vector_db_provider == VectorDBProvider.TPUF:
+        # Skip Turbopuffer insertion if embedding_config is None (text-only mode)
+        if archive.vector_db_provider == VectorDBProvider.TPUF and archive.embedding_config is not None:
             try:
                 from letta.helpers.tpuf_client import TurbopufferClient
 
