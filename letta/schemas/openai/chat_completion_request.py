@@ -57,6 +57,9 @@ def cast_message_to_subtype(m_dict: dict) -> ChatMessage:
     elif role == "assistant" or role == "approval":
         return AssistantMessage(**m_dict)
     elif role == "tool":
+        # OpenAI requires tool message content to be a string, never None
+        if m_dict.get("content") is None:
+            m_dict["content"] = ""
         return ToolMessage(**m_dict)
     else:
         raise ValueError(f"Unknown message role: {role}")

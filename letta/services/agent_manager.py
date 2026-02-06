@@ -1628,7 +1628,7 @@ class AgentManager:
         )
 
         # Persist the message
-        memory_message = await self.message_manager.create_message_async(message=memory_message, actor=actor)
+        [memory_message] = await self.message_manager.create_many_messages_async(pydantic_msgs=[memory_message], actor=actor)
 
         # Add to in-context messages
         message_ids = agent_state.message_ids or []

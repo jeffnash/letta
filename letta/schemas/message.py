@@ -1416,7 +1416,7 @@ class Message(BaseMessage):
                     raise TypeError("OpenAI API requires tool_call_id to be set.")
                 # Convert to text first (replaces images with placeholders), then truncate
                 func_response_text = tool_return_to_text(tool_return.func_response)
-                func_response = truncate_tool_return(func_response_text, tool_return_truncation_chars)
+                func_response = truncate_tool_return(func_response_text, tool_return_truncation_chars) or ""
                 openai_message = {
                     "content": func_response,
                     "role": self.role,
@@ -1425,7 +1425,7 @@ class Message(BaseMessage):
             else:
                 # Legacy fallback for old message format
                 assert self.tool_call_id is not None, vars(self)
-                legacy_content = truncate_tool_return(text_content, tool_return_truncation_chars)
+                legacy_content = truncate_tool_return(text_content, tool_return_truncation_chars) or ""
                 openai_message = {
                     "content": legacy_content,
                     "role": self.role,
@@ -1473,7 +1473,7 @@ class Message(BaseMessage):
                         raise TypeError("ToolReturn came back without a tool_call_id.")
                     # Convert multi-modal to text (images → placeholders), then truncate
                     func_response_text = tool_return_to_text(tr.func_response)
-                    func_response = truncate_tool_return(func_response_text, tool_return_truncation_chars)
+                    func_response = truncate_tool_return(func_response_text, tool_return_truncation_chars) or ""
                     result.append(
                         {
                             "content": func_response,
