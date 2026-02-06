@@ -2314,6 +2314,10 @@ class RepairMessageHistoryResponse(BaseModel):
     injected_tool_call_ids: List[str] = Field(
         default_factory=list, description="List of tool_call_ids that had synthetic tool_results injected"
     )
+    pruned_message_ids: List[str] = Field(
+        default_factory=list,
+        description="List of existing message IDs removed from in-context history during repair pruning",
+    )
 
 
 @router.post("/{agent_id}/repair-message-history", response_model=RepairMessageHistoryResponse, operation_id="repair_message_history")

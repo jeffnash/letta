@@ -353,6 +353,15 @@ class Settings(BaseSettings):
     # Gate using Temporal (Lettuce) for file uploads via folders endpoint
     use_lettuce_for_file_uploads: bool = False
 
+    # /repair hardening toggle:
+    # When enabled, conversation/agent in-context message lists will be pruned of tool
+    # messages that only contain orphaned Responses API function_call_output payloads.
+    # This is OFF by default to preserve existing repair semantics.
+    repair_prune_orphan_function_outputs: bool = Field(
+        default=False,
+        description="Enable pruning of orphaned Responses API function_call_output-only tool messages during /repair.",
+    )
+
     # Database pool monitoring
     enable_db_pool_monitoring: bool = True  # Enable connection pool monitoring
     db_pool_monitoring_interval: int = 30  # Seconds between pool stats collection

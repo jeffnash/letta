@@ -710,6 +710,18 @@ class TestValidateAndRepairResponsesAPIToolCallPairing:
         assert by_id["call_has_output"]["output"] == "Result A"
         assert "Error" in by_id["call_missing"]["output"]
 
+    def test_orphaned_function_call_output_removed(self):
+        """function_call_output without matching function_call should be removed."""
+        items = [
+            {"type": "message", "role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {"type": "function_call_output", "call_id": "call_orphan", "output": "orphan"},
+            {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "Hi"}]},
+        ]
+        result = validate_and_repair_responses_api_tool_call_pairing(items)
+
+        assert len(result) == 2
+        assert all(item.get("type") != "function_call_output" for item in result)
+
     def test_function_call_without_call_id_skipped(self):
         """Function_call without call_id should be skipped (not cause errors)."""
         items = [
@@ -738,16 +750,20 @@ class TestValidateAndRepairResponsesAPIToolCallPairing:
         assert result[2]["call_id"] == "call_1"
         assert result[3]["type"] == "message"
 
-    def test_output_before_call_still_matches(self):
-        """Output appearing before its function_call in the list should still be considered matched."""
+    def test_output_before_call_is_removed_and_repaired(self):
+        """Output before its function_call should be removed and replaced with synthetic output."""
         items = [
             {"type": "function_call_output", "call_id": "call_early", "output": "Early output"},
             {"type": "function_call", "call_id": "call_early", "name": "tool", "arguments": "{}"},
         ]
         result = validate_and_repair_responses_api_tool_call_pairing(items)
 
-        # Should pass through unchanged - output exists (even if ordered weirdly)
+        # Mispositioned output is removed; missing output is repaired immediately after the call.
         assert len(result) == 2
+        assert result[0]["type"] == "function_call"
+        assert result[1]["type"] == "function_call_output"
+        assert result[1]["call_id"] == "call_early"
+        assert "Error" in result[1]["output"]
 
     def test_duplicate_function_calls_each_get_one_output(self):
         """Multiple function_calls with the same call_id should not cause duplicate synthetic outputs."""

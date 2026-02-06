@@ -26,16 +26,16 @@ APPROX_TOKEN_SAFETY_MARGIN = 1.3
 
 
 def _build_tool_call_id_to_assistant_index(messages: List[Message]) -> dict:
-    """Build a mapping from tool_call_id to the index of the assistant message that made the call.
+    """Build a mapping from tool_call_id to the index of the assistant/approval message that made the call.
     
     This is used to ensure we don't evict tool response messages without their corresponding
-    assistant message (which contains the tool_use block).
+    assistant/approval message (which contains the tool_use/function_call block).
     
     Note: Tool calls without an `id` are ignored since they cannot be paired with tool responses.
     """
     tool_call_id_to_assistant_idx = {}
     for i, msg in enumerate(messages):
-        if msg.role == MessageRole.assistant and msg.tool_calls:
+        if msg.role in (MessageRole.assistant, MessageRole.approval) and msg.tool_calls:
             for tc in msg.tool_calls:
                 # Only include tool calls that have a valid id
                 if tc.id:
@@ -43,10 +43,36 @@ def _build_tool_call_id_to_assistant_index(messages: List[Message]) -> dict:
     return tool_call_id_to_assistant_idx
 
 
+def _get_tool_response_call_ids(message: Message) -> Set[str]:
+    """Extract all tool-call IDs referenced by a tool response message.
+
+    Tool messages can represent responses in two ways:
+    1. Legacy single-return form via message.tool_call_id
+    2. Multi-return form via message.tool_returns[*].tool_call_id
+
+    We combine both to avoid missing pairings during cutoff safety checks.
+    """
+    if message.role != MessageRole.tool:
+        return set()
+
+    tool_call_ids: Set[str] = set()
+
+    if message.tool_returns:
+        for tr in message.tool_returns:
+            tcid = getattr(tr, "tool_call_id", None)
+            if isinstance(tcid, str) and tcid:
+                tool_call_ids.add(tcid)
+
+    if isinstance(message.tool_call_id, str) and message.tool_call_id:
+        tool_call_ids.add(message.tool_call_id)
+
+    return tool_call_ids
+
+
 def _build_assistant_index_to_tool_response_indices(messages: List[Message], tool_call_id_to_assistant_idx: dict) -> dict:
-    """Build a mapping from assistant message index to the indices of all tool response messages.
+    """Build a mapping from assistant/approval message index to tool response message indices.
     
-    This is used to ensure we don't evict an assistant message (with tool_use) without also
+    This is used to ensure we don't evict an assistant/approval message (with tool call) without also
     evicting all its corresponding tool response messages.
     
     Note: Tool response messages without a `tool_call_id` are ignored since they cannot be
@@ -54,13 +80,13 @@ def _build_assistant_index_to_tool_response_indices(messages: List[Message], too
     """
     assistant_idx_to_tool_indices = {}
     for i, msg in enumerate(messages):
-        # Only include tool responses that have a valid tool_call_id
-        if msg.role == MessageRole.tool and msg.tool_call_id:
-            assistant_idx = tool_call_id_to_assistant_idx.get(msg.tool_call_id)
+        for tcid in _get_tool_response_call_ids(msg):
+            assistant_idx = tool_call_id_to_assistant_idx.get(tcid)
             if assistant_idx is not None:
                 if assistant_idx not in assistant_idx_to_tool_indices:
                     assistant_idx_to_tool_indices[assistant_idx] = []
-                assistant_idx_to_tool_indices[assistant_idx].append(i)
+                if i not in assistant_idx_to_tool_indices[assistant_idx]:
+                    assistant_idx_to_tool_indices[assistant_idx].append(i)
     return assistant_idx_to_tool_indices
 
 
@@ -91,17 +117,17 @@ def _find_earliest_safe_cutoff_for_tool_group(
     # and find any tool responses whose assistant would be evicted
     for kept_idx in range(candidate_idx, len(messages)):
         kept_msg = messages[kept_idx]
-        if kept_msg.role == MessageRole.tool and kept_msg.tool_call_id:
-            assistant_idx = tool_call_id_to_assistant_idx.get(kept_msg.tool_call_id)
+        for tool_call_id in _get_tool_response_call_ids(kept_msg):
+            assistant_idx = tool_call_id_to_assistant_idx.get(tool_call_id)
             if assistant_idx is not None and assistant_idx < adjusted_idx:
                 # This tool response's assistant would be evicted - we need to include the assistant
                 adjusted_idx = assistant_idx
     
-    # Now check if the adjusted cutoff point is an assistant with tool calls
+    # Now check if the adjusted cutoff point is an assistant/approval with tool calls
     # and ensure ALL its tool responses are also kept
     while adjusted_idx > 0:
         msg_at_cutoff = messages[adjusted_idx]
-        if msg_at_cutoff.role == MessageRole.assistant and msg_at_cutoff.tool_calls:
+        if msg_at_cutoff.role in (MessageRole.assistant, MessageRole.approval) and msg_at_cutoff.tool_calls:
             tool_response_indices = assistant_idx_to_tool_indices.get(adjusted_idx, [])
             if tool_response_indices:
                 min_tool_response_idx = min(tool_response_indices)
@@ -239,13 +265,13 @@ def _is_cutoff_safe(
         kept_msg = messages[kept_idx]
         
         # Check if this is a tool response whose assistant would be evicted
-        if kept_msg.role == MessageRole.tool and kept_msg.tool_call_id:
-            assistant_idx = tool_call_id_to_assistant_idx.get(kept_msg.tool_call_id)
+        for tool_call_id in _get_tool_response_call_ids(kept_msg):
+            assistant_idx = tool_call_id_to_assistant_idx.get(tool_call_id)
             if assistant_idx is not None and assistant_idx < cutoff_idx:
                 return False
         
-        # Check if this is an assistant with tool calls where some responses would be evicted
-        if kept_msg.role == MessageRole.assistant and kept_msg.tool_calls:
+        # Check if this is an assistant/approval with tool calls where some responses would be evicted
+        if kept_msg.role in (MessageRole.assistant, MessageRole.approval) and kept_msg.tool_calls:
             tool_response_indices = assistant_idx_to_tool_indices.get(kept_idx, [])
             for tool_idx in tool_response_indices:
                 if tool_idx < cutoff_idx:

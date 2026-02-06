@@ -315,7 +315,15 @@ def validate_and_repair_openai_tool_call_pairing(messages: List[dict]) -> List[d
 def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict]) -> List[dict]:
     """Validate that every function_call has a matching function_call_output in the Responses API format.
 
-    If orphaned function_calls are found, inject synthetic function_call_output items.
+    This function handles TWO types of pairing issues:
+
+    1. Orphaned/mispositioned function_call_output items: outputs whose call_id does not
+       appear in any function_call item, or outputs that appear before the corresponding
+       function_call item. These are removed.
+
+    2. Orphaned function_call items: function_call items with no corresponding
+       function_call_output. These are repaired by injecting synthetic function_call_output
+       items immediately after the function_call.
 
     OpenAI Responses API format:
     - function_call items have 'type': 'function_call', 'call_id', 'name', 'arguments'
@@ -324,20 +332,80 @@ def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict])
     if not input_items or len(input_items) < 1:
         return input_items
 
+    # ==========================================================================
+    # FIRST PASS: Build map of function_call call_id -> first index
+    # ==========================================================================
+    function_call_to_index: dict[str, int] = {}
+    for idx, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        call_id = item.get("call_id")
+        if call_id and call_id not in function_call_to_index:
+            function_call_to_index[call_id] = idx
+
+    # ==========================================================================
+    # SECOND PASS: Remove orphaned/mispositioned function_call_output items
+    # ==========================================================================
+    filtered_items = []
+    removed_orphan_output_ids: list[str] = []
+    removed_mispositioned_output_ids: list[str] = []
+
+    for idx, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            filtered_items.append(item)
+            continue
+
+        call_id = item.get("call_id")
+        if not call_id:
+            # Malformed output without call_id: keep it unchanged.
+            filtered_items.append(item)
+            continue
+
+        function_call_index = function_call_to_index.get(call_id)
+        if function_call_index is None:
+            removed_orphan_output_ids.append(call_id)
+            logger.warning(
+                f"[OpenAI Responses] Removing orphaned function_call_output with call_id={call_id} "
+                "(no matching function_call in input)"
+            )
+            continue
+
+        if idx < function_call_index:
+            removed_mispositioned_output_ids.append(call_id)
+            logger.warning(
+                f"[OpenAI Responses] Removing mispositioned function_call_output with call_id={call_id} "
+                "(appears before corresponding function_call)"
+            )
+            continue
+
+        filtered_items.append(item)
+
+    removed_output_count = len(removed_orphan_output_ids) + len(removed_mispositioned_output_ids)
+    if removed_output_count > 0:
+        logger.error(
+            "[OpenAI Responses] Removed %d invalid function_call_output item(s): orphaned=%s, mispositioned=%s",
+            removed_output_count,
+            removed_orphan_output_ids,
+            removed_mispositioned_output_ids,
+        )
+
+    # ==========================================================================
+    # THIRD PASS: Inject synthetic outputs for orphaned function_call items
+    # ==========================================================================
     repaired_items = []
     orphaned_count = 0
     repaired_call_ids: list[str] = []
 
-    # First, collect all function_call_output call_ids in the input
+    # Collect all currently-valid function_call_output call_ids
     existing_outputs = set()
-    for item in input_items:
+    for item in filtered_items:
         if isinstance(item, dict) and item.get("type") == "function_call_output":
             call_id = item.get("call_id")
             if call_id:
                 existing_outputs.add(call_id)
 
-    # Process items and inject synthetic outputs for orphaned function_calls
-    for item in input_items:
+    # Process items and inject synthetic outputs for function_calls missing outputs
+    for item in filtered_items:
         repaired_items.append(item)
 
         if not isinstance(item, dict) or item.get("type") != "function_call":

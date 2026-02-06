@@ -49,6 +49,7 @@ class TestRepairMessageHistoryEndpoint:
         assert result.status == "ok"
         assert result.injected_message_ids == []
         assert result.injected_tool_call_ids == []
+        assert result.pruned_message_ids == []
 
     @pytest.mark.asyncio
     async def test_endpoint_returns_repaired_with_injected_messages(self, mock_server):
@@ -80,6 +81,7 @@ class TestRepairMessageHistoryEndpoint:
         assert len(result.injected_tool_call_ids) == 2
         assert "toolu_1" in result.injected_tool_call_ids
         assert "toolu_2" in result.injected_tool_call_ids
+        assert result.pruned_message_ids == []
 
     @pytest.mark.asyncio
     async def test_endpoint_handles_no_message_history(self, mock_server):
@@ -128,6 +130,7 @@ class TestRepairMessageHistoryResponseModel:
         assert len(response.orphaned_tool_calls) == 3
         assert len(response.injected_message_ids) == 3
         assert len(response.injected_tool_call_ids) == 3
+        assert response.pruned_message_ids == []
 
     def test_response_model_ok_status_defaults(self):
         """Test response model with ok status uses defaults."""
@@ -142,6 +145,7 @@ class TestRepairMessageHistoryResponseModel:
         assert response.orphaned_tool_calls == []
         assert response.injected_message_ids == []
         assert response.injected_tool_call_ids == []
+        assert response.pruned_message_ids == []
 
     def test_response_model_error_status(self):
         """Test response model with error status."""
