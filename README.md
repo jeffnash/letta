@@ -125,6 +125,26 @@ for message in response.messages:
     print(message)
 ```
 
+## Configuration
+
+### Model group preferences
+
+Letta Code uses **model groups** (`fast`, `strong`, etc.) to select which model backs each subagent. You can override the default ordering within a group by setting environment variables with a **comma-separated list of model handles**, checked in priority order:
+
+| Variable | Purpose |
+|---|---|
+| `LETTA_FAST_MODEL_PREFERENCE` | Preferred models for the `fast` group (lightweight / low-latency tasks) |
+| `LETTA_STRONG_MODEL_PREFERENCE` | Preferred models for the `strong` group (complex / high-quality tasks) |
+
+**Example** (`.env` or exported in your shell):
+
+```bash
+LETTA_FAST_MODEL_PREFERENCE="cliproxy/gpt-5.3-codex-low,cliproxy/copilot-claude-haiku-4.5"
+LETTA_STRONG_MODEL_PREFERENCE="cliproxy/gpt-5.3-high,cliproxy/copilot-claude-opus-4.6"
+```
+
+If a variable is unset or empty, the server falls back to its built-in default ordering.
+
 ## Contributing
 
 Letta is an open source project built by over a hundred contributors from around the world. There are many ways to get involved in the Letta OSS project!

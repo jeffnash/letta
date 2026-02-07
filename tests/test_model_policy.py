@@ -383,6 +383,50 @@ class TestModelGroupingHeuristics:
         assert "openai/gpt-5.1-medium" in groups.get("planning", [])
         assert "openai/gpt-5.2-medium" in groups.get("planning", [])
 
+    def test_fast_group_prefers_requested_cliproxy_handles(self, monkeypatch):
+        monkeypatch.setenv(
+            "LETTA_FAST_MODEL_PREFERENCE",
+            "cliproxy/gpt-5.3-codex-low,cliproxy/copilot-claude-haiku-4.5",
+        )
+
+        server = SyncServer.__new__(SyncServer)
+        handles = {
+            "cliproxy/gpt-5.3-codex-low",
+            "cliproxy/copilot-claude-haiku-4.5",
+            "cliproxy/gemini-3-flash-preview",
+        }
+
+        groups = server._build_model_groups(handles, [SimpleNamespace(handle=h) for h in handles])
+        fast_group = groups.get("fast", [])
+
+        assert fast_group[:2] == [
+            "cliproxy/gpt-5.3-codex-low",
+            "cliproxy/copilot-claude-haiku-4.5",
+        ]
+
+    def test_strong_group_prefers_requested_cliproxy_handles(self, monkeypatch):
+        monkeypatch.setenv(
+            "LETTA_STRONG_MODEL_PREFERENCE",
+            "cliproxy/gpt-5.3-high,cliproxy/copilot-claude-opus-4.6,cliproxy/chutes-moonshotai/Kimi-K2.5",
+        )
+
+        server = SyncServer.__new__(SyncServer)
+        handles = {
+            "cliproxy/gpt-5.3-high",
+            "cliproxy/copilot-claude-opus-4.6",
+            "cliproxy/chutes-moonshotai/Kimi-K2.5",
+            "cliproxy/claude-sonnet-4.5",
+        }
+
+        groups = server._build_model_groups(handles, [SimpleNamespace(handle=h) for h in handles])
+        strong_group = groups.get("strong", [])
+
+        assert strong_group[:3] == [
+            "cliproxy/gpt-5.3-high",
+            "cliproxy/copilot-claude-opus-4.6",
+            "cliproxy/chutes-moonshotai/Kimi-K2.5",
+        ]
+
 
 class TestResolveModelSelectorAsync:
     """Tests for resolve_model_selector_async behavior."""

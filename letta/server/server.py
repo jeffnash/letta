@@ -1566,6 +1566,53 @@ class SyncServer(object):
 
             return False
 
+        def _preferred_fast_handles() -> list[str]:
+            """Return optional preferred ordering for the `fast` group.
+
+            Set LETTA_FAST_MODEL_PREFERENCE to a comma-separated handle list.
+            Example:
+            LETTA_FAST_MODEL_PREFERENCE="cliproxy/gpt-5.3-codex-low,cliproxy/copilot-claude-haiku-4.5"
+            """
+            raw_override = os.environ.get("LETTA_FAST_MODEL_PREFERENCE", "")
+            if not raw_override.strip():
+                return []
+            return [h.strip() for h in raw_override.split(",") if h.strip()]
+
+        def _preferred_strong_handles() -> list[str]:
+            """Return optional preferred ordering for the `strong` group.
+
+            Set LETTA_STRONG_MODEL_PREFERENCE to a comma-separated handle list.
+            Example:
+            LETTA_STRONG_MODEL_PREFERENCE="cliproxy/gpt-5.3-high,cliproxy/copilot-claude-opus-4.6"
+            """
+            raw_override = os.environ.get("LETTA_STRONG_MODEL_PREFERENCE", "")
+            if not raw_override.strip():
+                return []
+            return [h.strip() for h in raw_override.split(",") if h.strip()]
+
+        def _apply_preferred_order(
+            handles: list[str],
+            preferred_handles: list[str],
+            available: set[str],
+        ) -> list[str]:
+            if not preferred_handles:
+                return handles
+
+            # Allow explicit preferences to inject currently-available handles even
+            # when heuristics wouldn't otherwise classify them into the group.
+            preferred_present = []
+            seen: set[str] = set()
+            for handle in preferred_handles:
+                if handle in available and handle not in seen:
+                    preferred_present.append(handle)
+                    seen.add(handle)
+
+            if not preferred_present:
+                return handles
+
+            remainder = [h for h in handles if h not in seen]
+            return preferred_present + remainder
+
         def _is_strong(provider: str, model: str) -> bool:
             tokens = _parse_tokens(model)
             if provider == "cliproxy" or model.startswith("cliproxy-"):
@@ -1647,6 +1694,18 @@ class SyncServer(object):
 
             if _is_planning(provider, model):
                 groups["planning"].append(handle)
+
+        # Keep classifier behavior stable while allowing explicit `fast` tie-break priorities.
+        groups["fast"] = _apply_preferred_order(
+            groups["fast"],
+            _preferred_fast_handles(),
+            available_handles,
+        )
+        groups["strong"] = _apply_preferred_order(
+            groups["strong"],
+            _preferred_strong_handles(),
+            available_handles,
+        )
 
         # Remove empty groups (except default which references other groups)
         groups = {k: v for k, v in groups.items() if v or k == "default"}
