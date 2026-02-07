@@ -675,14 +675,15 @@ class ProviderManager:
             for llm_config in llm_models:
                 logger.info(f"  Checking LLM model: {llm_config.handle} (name: {llm_config.model})")
 
-                # Check if model already exists (excluding soft-deleted ones)
+                # Check if model already exists (including soft-deleted ones, since DB-level
+                # unique constraints apply to all rows regardless of is_deleted)
                 # We need to check both unique constraints:
                 # 1. unique_handle_per_org_and_type: (handle, organization_id, model_type)
                 # 2. unique_model_per_provider_and_type: (name, provider_id, model_type)
                 existing_by_handle = await ProviderModelORM.list_async(
                     db_session=session,
                     limit=1,
-                    check_is_deleted=True,  # Filter out soft-deleted models
+                    check_is_deleted=False,  # Include soft-deleted to avoid UniqueViolation on INSERT
                     **{
                         "handle": llm_config.handle,
                         "organization_id": organization_id,
@@ -692,13 +693,28 @@ class ProviderManager:
                 existing_by_name = await ProviderModelORM.list_async(
                     db_session=session,
                     limit=1,
-                    check_is_deleted=True,  # Filter out soft-deleted models
+                    check_is_deleted=False,  # Include soft-deleted to avoid UniqueViolation on INSERT
                     **{
                         "name": llm_config.model,
                         "provider_id": provider.id,
                         "model_type": "llm",
                     },
                 )
+
+                # If both queries found different rows, we have a data-integrity conflict
+                # (one row holds the handle, another holds the name). Log and skip.
+                if (
+                    existing_by_handle
+                    and existing_by_name
+                    and existing_by_handle[0].id != existing_by_name[0].id
+                ):
+                    logger.warning(
+                        f"    ⚠ LLM model {llm_config.handle}: handle matches row {existing_by_handle[0].id} "
+                        f"but name '{llm_config.model}' matches different row {existing_by_name[0].id}. "
+                        f"Skipping to avoid data corruption — manual reconciliation needed."
+                    )
+                    continue
+
                 existing = existing_by_handle or existing_by_name
 
                 if not existing:
@@ -738,25 +754,39 @@ class ProviderManager:
                         # Roll back the session to clear the failed transaction
                         await session.rollback()
                 else:
-                    # Check if max_context_window or model_endpoint_type needs to be updated
                     existing_model = existing[0]
                     needs_update = False
 
-                    if existing_model.max_context_window != llm_config.context_window:
+                    # Revive soft-deleted model: restore it and sync all identity/display fields
+                    if existing_model.is_deleted:
                         logger.info(
-                            f"    Updating LLM model {llm_config.handle} max_context_window: "
-                            f"{existing_model.max_context_window} -> {llm_config.context_window}"
+                            f"    Reviving soft-deleted LLM model {llm_config.handle} (ID: {existing_model.id})"
                         )
+                        existing_model.is_deleted = False
+                        existing_model.handle = llm_config.handle
+                        existing_model.name = llm_config.model
+                        existing_model.display_name = llm_config.model
+                        existing_model.enabled = True
                         existing_model.max_context_window = llm_config.context_window
-                        needs_update = True
-
-                    if existing_model.model_endpoint_type != llm_config.model_endpoint_type:
-                        logger.info(
-                            f"    Updating LLM model {llm_config.handle} model_endpoint_type: "
-                            f"{existing_model.model_endpoint_type} -> {llm_config.model_endpoint_type}"
-                        )
                         existing_model.model_endpoint_type = llm_config.model_endpoint_type
                         needs_update = True
+                    else:
+                        # Check if max_context_window or model_endpoint_type needs to be updated
+                        if existing_model.max_context_window != llm_config.context_window:
+                            logger.info(
+                                f"    Updating LLM model {llm_config.handle} max_context_window: "
+                                f"{existing_model.max_context_window} -> {llm_config.context_window}"
+                            )
+                            existing_model.max_context_window = llm_config.context_window
+                            needs_update = True
+
+                        if existing_model.model_endpoint_type != llm_config.model_endpoint_type:
+                            logger.info(
+                                f"    Updating LLM model {llm_config.handle} model_endpoint_type: "
+                                f"{existing_model.model_endpoint_type} -> {llm_config.model_endpoint_type}"
+                            )
+                            existing_model.model_endpoint_type = llm_config.model_endpoint_type
+                            needs_update = True
 
                     if needs_update:
                         await existing_model.update_async(session)
@@ -768,14 +798,15 @@ class ProviderManager:
             for embedding_config in embedding_models:
                 logger.info(f"  Checking embedding model: {embedding_config.handle} (name: {embedding_config.embedding_model})")
 
-                # Check if model already exists (excluding soft-deleted ones)
+                # Check if model already exists (including soft-deleted ones, since DB-level
+                # unique constraints apply to all rows regardless of is_deleted)
                 # We need to check both unique constraints:
                 # 1. unique_handle_per_org_and_type: (handle, organization_id, model_type)
                 # 2. unique_model_per_provider_and_type: (name, provider_id, model_type)
                 existing_by_handle = await ProviderModelORM.list_async(
                     db_session=session,
                     limit=1,
-                    check_is_deleted=True,  # Filter out soft-deleted models
+                    check_is_deleted=False,  # Include soft-deleted to avoid UniqueViolation on INSERT
                     **{
                         "handle": embedding_config.handle,
                         "organization_id": organization_id,
@@ -785,13 +816,27 @@ class ProviderManager:
                 existing_by_name = await ProviderModelORM.list_async(
                     db_session=session,
                     limit=1,
-                    check_is_deleted=True,  # Filter out soft-deleted models
+                    check_is_deleted=False,  # Include soft-deleted to avoid UniqueViolation on INSERT
                     **{
                         "name": embedding_config.embedding_model,
                         "provider_id": provider.id,
                         "model_type": "embedding",
                     },
                 )
+
+                # If both queries found different rows, we have a data-integrity conflict
+                if (
+                    existing_by_handle
+                    and existing_by_name
+                    and existing_by_handle[0].id != existing_by_name[0].id
+                ):
+                    logger.warning(
+                        f"    ⚠ Embedding model {embedding_config.handle}: handle matches row {existing_by_handle[0].id} "
+                        f"but name '{embedding_config.embedding_model}' matches different row {existing_by_name[0].id}. "
+                        f"Skipping to avoid data corruption — manual reconciliation needed."
+                    )
+                    continue
+
                 existing = existing_by_handle or existing_by_name
 
                 if not existing:
@@ -829,9 +874,23 @@ class ProviderManager:
                         # Roll back the session to clear the failed transaction
                         await session.rollback()
                 else:
-                    # Check if model_endpoint_type needs to be updated
                     existing_model = existing[0]
-                    if existing_model.model_endpoint_type != embedding_config.embedding_endpoint_type:
+
+                    # Revive soft-deleted model: restore it and sync all identity/display fields
+                    if existing_model.is_deleted:
+                        logger.info(
+                            f"    Reviving soft-deleted embedding model {embedding_config.handle} (ID: {existing_model.id})"
+                        )
+                        existing_model.is_deleted = False
+                        existing_model.handle = embedding_config.handle
+                        existing_model.name = embedding_config.embedding_model
+                        existing_model.display_name = embedding_config.embedding_model
+                        existing_model.enabled = True
+                        existing_model.model_endpoint_type = embedding_config.embedding_endpoint_type
+                        existing_model.embedding_dim = embedding_config.embedding_dim if hasattr(embedding_config, "embedding_dim") else existing_model.embedding_dim
+                        await existing_model.update_async(session)
+                    elif existing_model.model_endpoint_type != embedding_config.embedding_endpoint_type:
+                        # Check if model_endpoint_type needs to be updated
                         logger.info(
                             f"    Updating embedding model {embedding_config.handle} model_endpoint_type: "
                             f"{existing_model.model_endpoint_type} -> {embedding_config.embedding_endpoint_type}"
