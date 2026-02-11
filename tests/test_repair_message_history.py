@@ -131,6 +131,8 @@ class TestRepairMessageHistoryResponseModel:
         assert len(response.injected_message_ids) == 3
         assert len(response.injected_tool_call_ids) == 3
         assert response.pruned_message_ids == []
+        assert response.sanitized_message_ids == []
+        assert response.sanitized_tool_call_ids == []
 
     def test_response_model_ok_status_defaults(self):
         """Test response model with ok status uses defaults."""
@@ -146,6 +148,27 @@ class TestRepairMessageHistoryResponseModel:
         assert response.injected_message_ids == []
         assert response.injected_tool_call_ids == []
         assert response.pruned_message_ids == []
+        assert response.sanitized_message_ids == []
+        assert response.sanitized_tool_call_ids == []
+
+    def test_response_model_with_sanitized_tool_calls(self):
+        """Test response model with malformed tool-call JSON sanitization details."""
+        from letta.server.rest_api.routers.v1.agents import RepairMessageHistoryResponse
+
+        response = RepairMessageHistoryResponse(
+            status="repaired",
+            message="Sanitized malformed tool-call JSON in 2 message(s)",
+            orphaned_tool_calls=[],
+            injected_message_ids=[],
+            injected_tool_call_ids=[],
+            pruned_message_ids=[],
+            sanitized_message_ids=["message-1", "message-2"],
+            sanitized_tool_call_ids=["toolu-1", "toolu-2", "toolu-3"],
+        )
+
+        assert response.status == "repaired"
+        assert response.sanitized_message_ids == ["message-1", "message-2"]
+        assert response.sanitized_tool_call_ids == ["toolu-1", "toolu-2", "toolu-3"]
 
     def test_response_model_error_status(self):
         """Test response model with error status."""
