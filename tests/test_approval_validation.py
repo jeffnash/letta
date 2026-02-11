@@ -32,8 +32,8 @@ class TestValidateApprovalToolCallIds:
         # Should not raise
         validate_approval_tool_call_ids(approval_request, approval_response)
 
-    def test_invalid_approval_with_mismatched_single_tool_call_id(self):
-        """Test that approval with mismatched tool call ID fails validation."""
+    def test_mismatched_single_tool_call_id_is_filtered_and_missing_is_autofilled(self):
+        """Unexpected response IDs are filtered; missing expected IDs are auto-filled with error responses."""
         tc = OpenAIToolCall(id='call_expected', function=OpenAIFunction(name='Bash', arguments='{}'), type='function')
         approval_request = Message(
             role=MessageRole.approval,
@@ -44,8 +44,12 @@ class TestValidateApprovalToolCallIds:
             approvals=[ApprovalReturn(tool_call_id='call_wrong', approve=True)]
         )
 
-        with pytest.raises(ValueError, match="Invalid tool call IDs"):
-            validate_approval_tool_call_ids(approval_request, approval_response)
+        # Should not raise under current lenient validation behavior
+        validate_approval_tool_call_ids(approval_request, approval_response)
+
+        assert len(approval_response.approvals) == 1
+        assert approval_response.approvals[0].tool_call_id == 'call_expected'
+        assert approval_response.approvals[0].status == 'error'
 
     def test_valid_approval_with_multiple_matching_tool_call_ids(self):
         """Test that approval with multiple matching tool call IDs passes validation."""
@@ -103,8 +107,8 @@ class TestValidateApprovalToolCallIds:
         assert auto_filled.status == 'error'
         assert 'interrupted' in auto_filled.tool_return.lower() or 'error' in auto_filled.tool_return.lower()
 
-    def test_invalid_approval_with_extra_tool_call_id(self):
-        """Test that approval with extra tool call ID fails validation (unexpected IDs are still errors)."""
+    def test_extra_tool_call_id_is_ignored_when_expected_id_present(self):
+        """Unexpected extra IDs are ignored while valid expected IDs are preserved."""
         tc1 = OpenAIToolCall(id='call_1', function=OpenAIFunction(name='Read', arguments='{}'), type='function')
         approval_request = Message(
             role=MessageRole.approval,
@@ -118,9 +122,11 @@ class TestValidateApprovalToolCallIds:
             ]
         )
 
-        # Unexpected IDs are still a hard error (only missing IDs are auto-filled)
-        with pytest.raises(ValueError, match="unexpected tool_call_ids"):
-            validate_approval_tool_call_ids(approval_request, approval_response)
+        # Should not raise; extra IDs are filtered
+        validate_approval_tool_call_ids(approval_request, approval_response)
+
+        assert len(approval_response.approvals) == 1
+        assert approval_response.approvals[0].tool_call_id == 'call_1'
 
     # =========================================================================
     # Edge cases - tool_calls is empty or None

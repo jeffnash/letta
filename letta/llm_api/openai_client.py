@@ -441,6 +441,26 @@ def validate_and_repair_responses_api_tool_call_pairing(input_items: List[dict])
     return repaired_items
 
 
+def is_anthropic_backed_proxy(llm_config: LLMConfig) -> bool:
+    """Return True when llm_config appears to target Anthropic via an OpenAI-compatible proxy.
+
+    This helper is specifically intended for proxy routes like CLIProxy where the provider
+    is `openai`-compatible at the transport layer but the underlying model family may be
+    Anthropic (Claude/Opus/Sonnet/Haiku).
+
+    Direct Anthropic provider configs should return False because they are handled by the
+    Anthropic client path, not OpenAI-compatible proxy handling.
+    """
+    provider = (llm_config.provider_name or "").lower()
+    if provider != "cliproxy":
+        return False
+
+    model_lower = (llm_config.model or "").lower()
+    handle_lower = (llm_config.handle or "").lower()
+    anthropic_patterns = ["claude", "opus", "sonnet", "haiku", "anthropic"]
+    return any(p in model_lower for p in anthropic_patterns) or any(p in handle_lower for p in anthropic_patterns)
+
+
 def supports_parallel_tool_calls(llm_config: LLMConfig) -> bool:
     """Determine if the model supports parallel tool calls at inference time.
 
