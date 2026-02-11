@@ -2318,6 +2318,14 @@ class RepairMessageHistoryResponse(BaseModel):
         default_factory=list,
         description="List of existing message IDs removed from in-context history during repair pruning",
     )
+    sanitized_message_ids: List[str] = Field(
+        default_factory=list,
+        description="List of message IDs whose tool_call.function.arguments were sanitized to valid JSON",
+    )
+    sanitized_tool_call_ids: List[str] = Field(
+        default_factory=list,
+        description="List of tool_call_ids whose malformed arguments were sanitized",
+    )
 
 
 @router.post("/{agent_id}/repair-message-history", response_model=RepairMessageHistoryResponse, operation_id="repair_message_history")

@@ -788,9 +788,9 @@ class MessageManager:
         Modifies the existing message object to update the database in the sync/async functions.
         """
         # Some safety checks specific to messages
-        if message_update.tool_calls and message.role != MessageRole.assistant:
+        if message_update.tool_calls and message.role not in (MessageRole.assistant, MessageRole.approval):
             raise ValueError(
-                f"Tool calls {message_update.tool_calls} can only be added to assistant messages. Message {message_id} has role {message.role}."
+                f"Tool calls {message_update.tool_calls} can only be added to assistant/approval messages. Message {message_id} has role {message.role}."
             )
         if message_update.tool_call_id and message.role != MessageRole.tool:
             raise ValueError(
