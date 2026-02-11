@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Optional
@@ -788,6 +789,21 @@ class SimpleOpenAIStreamingInterface:
             name = "".join(ctx.get("name_parts", [])) if "name_parts" in ctx else ctx.get("name", "")
             args = "".join(ctx.get("arguments_parts", [])) if "arguments_parts" in ctx else ctx.get("arguments", "")
             call_id = "".join(ctx.get("id_parts", [])) if "id_parts" in ctx else ctx.get("id", "")
+
+            # Validate that accumulated arguments form valid JSON
+            # Truncated streams (e.g. from context window overflow) can produce incomplete JSON
+            # that poisons message history if persisted
+            if args:
+                try:
+                    json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    logger.error(
+                        "Truncated/invalid JSON in streamed tool call arguments for tool_call_id=%s, "
+                        "name=%s. Replacing with empty dict. Original (truncated to 200 chars): %s",
+                        call_id, name, args[:200],
+                    )
+                    args = "{}"
+
             if call_id and name:
                 result.append(ToolCall(id=call_id, function=FunctionCall(arguments=args or "", name=name)))
         return result

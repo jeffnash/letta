@@ -374,17 +374,31 @@ def create_approval_request_message_from_llm_response(
     
     messages = []
     if allowed_tool_calls:
-        oai_tool_calls = [
-            OpenAIToolCall(
-                id=tool_call.id,
-                function=OpenAIFunction(
-                    name=tool_call.function.name,
-                    arguments=tool_call.function.arguments,
-                ),
-                type="function",
+        oai_tool_calls = []
+        for tool_call in allowed_tool_calls:
+            # Validate arguments JSON before persisting
+            # Truncated LLM responses can produce invalid JSON that poisons message history
+            args_str = tool_call.function.arguments
+            try:
+                parsed = json.loads(args_str) if args_str else {}
+                args_str = json.dumps(parsed)  # Re-serialize to ensure clean JSON
+            except (json.JSONDecodeError, TypeError):
+                _logger.error(
+                    f"Truncated/invalid JSON in allowed tool call arguments for tool_call_id={tool_call.id}, "
+                    f"name={tool_call.function.name}. Replacing with empty dict. "
+                    f"Original (truncated to 200 chars): {(args_str or '')[:200]}"
+                )
+                args_str = "{}"
+            oai_tool_calls.append(
+                OpenAIToolCall(
+                    id=tool_call.id,
+                    function=OpenAIFunction(
+                        name=tool_call.function.name,
+                        arguments=args_str,
+                    ),
+                    type="function",
+                )
             )
-            for tool_call in allowed_tool_calls
-        ]
         tool_message = Message(
             role=MessageRole.assistant,
             content=reasoning_content if reasoning_content else [],
@@ -400,17 +414,31 @@ def create_approval_request_message_from_llm_response(
             tool_message.id = pre_computed_assistant_message_id
         messages.append(tool_message)
     # Construct the tool call with the assistant's message
-    oai_tool_calls = [
-        OpenAIToolCall(
-            id=tool_call.id,
-            function=OpenAIFunction(
-                name=tool_call.function.name,
-                arguments=tool_call.function.arguments,
-            ),
-            type="function",
+    oai_tool_calls = []
+    for tool_call in requested_tool_calls:
+        # Validate arguments JSON before persisting
+        # Truncated LLM responses can produce invalid JSON that poisons message history
+        args_str = tool_call.function.arguments
+        try:
+            parsed = json.loads(args_str) if args_str else {}
+            args_str = json.dumps(parsed)  # Re-serialize to ensure clean JSON
+        except (json.JSONDecodeError, TypeError):
+            _logger.error(
+                f"Truncated/invalid JSON in approval tool call arguments for tool_call_id={tool_call.id}, "
+                f"name={tool_call.function.name}. Replacing with empty dict. "
+                f"Original (truncated to 200 chars): {(args_str or '')[:200]}"
+            )
+            args_str = "{}"
+        oai_tool_calls.append(
+            OpenAIToolCall(
+                id=tool_call.id,
+                function=OpenAIFunction(
+                    name=tool_call.function.name,
+                    arguments=args_str,
+                ),
+                type="function",
+            )
         )
-        for tool_call in requested_tool_calls
-    ]
     # TODO: Use ToolCallContent instead of tool_calls
     # TODO: This helps preserve ordering
     approval_message = Message(

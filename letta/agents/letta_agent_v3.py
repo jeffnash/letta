@@ -976,16 +976,12 @@ class LettaAgentV3(LettaAgentV2):
                     if include_return_message_types is None or message.message_type in include_return_message_types:
                         yield message
 
-            # check compaction
-            # Skip compaction if the last message is a pending approval request - compaction would
-            # insert a summary message after the approval request, breaking the approval validation
-            # which expects the approval request to be the last message in context.
-            has_pending_approval = messages and messages[-1].is_approval_request()
-            if has_pending_approval:
-                self.logger.info(
-                    "Skipping compaction: pending approval request must remain as last message in context"
-                )
-            elif self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
+            # Check compaction.
+            #
+            # Even with a pending approval request as the last message, compaction is safe because
+            # the summary is inserted at the front of the buffer (see compact()), and the approval
+            # message remains the final message in context.
+            if self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
                 self.logger.info(
                     f"Context window exceeded (current: {self.context_token_estimate}, threshold: {self.agent_state.llm_config.context_window}), trying to compact messages"
                 )

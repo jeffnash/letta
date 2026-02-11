@@ -12,6 +12,7 @@ Key failure modes addressed:
 - Additional: finish_reason = None, model = None, id = None
 """
 
+import json
 import uuid
 from typing import Any, Dict, Optional
 
@@ -166,6 +167,23 @@ def normalize_chat_completion_response(
                             if func.get("arguments") is None:
                                 func["arguments"] = "{}"
                                 normalizations_applied.append(f"choices[{i}].tool_calls[{j}].function.arguments=null->{{}}")
+                            else:
+                                # Validate that arguments is valid JSON
+                                # Truncated LLM responses (e.g. from stream cutoff due to context window overflow)
+                                # can produce incomplete JSON that poisons message history if persisted
+                                try:
+                                    json.loads(func["arguments"])
+                                except (json.JSONDecodeError, TypeError):
+                                    logger.error(
+                                        "Truncated/invalid JSON in tool call arguments, replacing with empty dict. "
+                                        "Original (truncated to 200 chars): %s",
+                                        str(func["arguments"])[:200],
+                                        extra={"run_id": run_id, "step_id": step_id, "provider": provider},
+                                    )
+                                    func["arguments"] = "{}"
+                                    normalizations_applied.append(
+                                        f"choices[{i}].tool_calls[{j}].function.arguments=invalid_json->{{}}"
+                                    )
     
     # Log normalizations if any were applied
     if normalizations_applied:
