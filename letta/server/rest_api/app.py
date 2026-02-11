@@ -77,6 +77,7 @@ from letta.server.rest_api.auth.index import setup_auth_router  # TODO: probably
 from letta.server.rest_api.interface import StreamingServerInterface
 from letta.server.rest_api.middleware import CheckPasswordMiddleware, LoggingMiddleware, RequestIdMiddleware
 from letta.server.rest_api.routers.v1 import ROUTERS as v1_routes
+from letta.server.rest_api.routers.v1.admin_providers import router as admin_providers_router
 from letta.server.rest_api.routers.v1.organizations import router as organizations_router
 from letta.server.rest_api.routers.v1.users import router as users_router  # TODO: decide on admin
 from letta.server.rest_api.static_files import mount_static_files
@@ -721,6 +722,7 @@ def create_application() -> "FastAPI":
     # admin/users
     app.include_router(users_router, prefix=ADMIN_PREFIX)
     app.include_router(organizations_router, prefix=ADMIN_PREFIX)
+    app.include_router(admin_providers_router, prefix=ADMIN_PREFIX)
 
     # /api/auth endpoints
     app.include_router(setup_auth_router(server, interface, random_password), prefix=API_PREFIX)

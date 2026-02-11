@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 import traceback
 from abc import abstractmethod
 from datetime import datetime
@@ -477,15 +478,39 @@ class SyncServer(object):
                 return provider
         return None
 
-    async def _sync_provider_models_async(self):
-        """Sync all provider models to database at startup."""
-        logger.info("Syncing provider models to database")
+    async def _sync_provider_models_async(self, *, provider_name: str | None = None) -> dict:
+        """Sync provider models to database.
+
+        Args:
+            provider_name: If set, only sync models for this provider name.
+        """
+        if provider_name:
+            logger.info(f"Syncing provider models to database (provider_name={provider_name})")
+        else:
+            logger.info("Syncing provider models to database")
+
+        started_ns = time.time_ns()
 
         # Get persisted providers from database (they now have IDs)
         persisted_providers = await self.provider_manager.list_providers_async(actor=self.default_user)
 
+        # If a specific provider was requested, fail fast when it doesn't exist in persisted providers.
+        # Returning status=ok with no-op sync hides operational errors for callers.
+        if provider_name and not any(p.name == provider_name for p in persisted_providers):
+            raise NoResultFound(f"Provider '{provider_name}' not found in persisted providers")
+
+        providers_attempted: list[str] = []
+        providers_synced: list[str] = []
+        llm_models_synced = 0
+        embedding_models_synced = 0
+
         for persisted_provider in persisted_providers:
             try:
+                if provider_name and persisted_provider.name != provider_name:
+                    continue
+
+                providers_attempted.append(persisted_provider.name)
+
                 # Find the matching enabled provider instance to call list_models on
                 enabled_provider = self._get_enabled_provider(persisted_provider.name)
 
@@ -518,11 +543,25 @@ class SyncServer(object):
                 )
                 # Update last_synced timestamp
                 await self.provider_manager.update_provider_last_synced_async(persisted_provider.id)
+                providers_synced.append(persisted_provider.name)
+                llm_models_synced += len(llm_models)
+                embedding_models_synced += len(embedding_models)
                 logger.info(
                     f"Synced {len(llm_models)} LLM models and {len(embedding_models)} embedding models for provider {persisted_provider.name}"
                 )
             except Exception as e:
                 logger.error(f"Failed to sync models for provider {persisted_provider.name}: {e}", exc_info=True)
+
+        duration_ms = (time.time_ns() - started_ns) / 1_000_000
+        return {
+            "status": "ok",
+            "provider_name": provider_name,
+            "providers_attempted": providers_attempted,
+            "providers_synced": providers_synced,
+            "llm_models_synced": llm_models_synced,
+            "embedding_models_synced": embedding_models_synced,
+            "duration_ms": duration_ms,
+        }
 
     async def init_mcp_clients(self):
         # TODO: remove this
