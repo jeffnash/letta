@@ -1170,6 +1170,34 @@ class LettaAgentV3(LettaAgentV2):
             return messages_to_persist, continue_stepping, stop_reason
 
         # 2. Check whether tool call requires approval (includes client-side tools)
+        malformed_tool_returns: list[ToolReturn] = []
+        if tool_calls:
+            valid_tool_calls: list[ToolCall] = []
+            for tc in tool_calls:
+                parsed_args = _safe_load_tool_call_str(tc.function.arguments)
+                if bool(parsed_args.get(MALFORMED_TOOL_ARGS_KEY, False)):
+                    call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
+                    self.logger.warning(
+                        "MALFORMED_TOOL_ARGS_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s (pre-approval)",
+                        run_id,
+                        step_id,
+                        call_id,
+                        tc.function.name,
+                    )
+                    malformed_tool_returns.append(
+                        ToolReturn(
+                            tool_call_id=call_id,
+                            status="error",
+                            func_response=(
+                                "[Error: LLM produced malformed tool arguments JSON for this tool call. "
+                                "Execution was skipped. Please retry the tool call.]"
+                            ),
+                        )
+                    )
+                else:
+                    valid_tool_calls.append(tc)
+            tool_calls = valid_tool_calls
+
         if not is_approval_response:
             # Get names of client-side tools (these are executed by client, not server)
             client_tool_names = {ct.name for ct in self.client_tools} if self.client_tools else set()
@@ -1200,6 +1228,8 @@ class LettaAgentV3(LettaAgentV2):
                 return messages_to_persist, False, LettaStopReason(stop_reason=StopReasonType.requires_approval.value)
 
         result_tool_returns = []
+        if malformed_tool_returns:
+            result_tool_returns.extend(malformed_tool_returns)
 
         # 3. Handle client side tool execution
         if tool_returns:
@@ -1238,7 +1268,7 @@ class LettaAgentV3(LettaAgentV2):
 
             continue_stepping = True
             stop_reason = None
-            result_tool_returns = tool_returns
+            result_tool_returns.extend(tool_returns)
 
         # 4. Handle denial cases
         if tool_call_denials:
@@ -1472,7 +1502,7 @@ class LettaAgentV3(LettaAgentV2):
 
         # 5g. Aggregate continuation decisions
         aggregate_continue = any(persisted_continue_flags) if persisted_continue_flags else False
-        aggregate_continue = aggregate_continue or tool_call_denials or tool_returns
+        aggregate_continue = aggregate_continue or bool(tool_call_denials) or bool(result_tool_returns)
 
         # Determine aggregate stop reason
         aggregate_stop_reason = None

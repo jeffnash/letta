@@ -801,7 +801,7 @@ class SimpleOpenAIStreamingInterface:
                 except (json.JSONDecodeError, TypeError):
                     logger.error(
                         "Truncated/invalid JSON in streamed tool call arguments for tool_call_id=%s, "
-                        "name=%s. Replacing with empty dict. Original (truncated to 200 chars): %s",
+                        "name=%s. Replacing with malformed-args sentinel. Original (truncated to 200 chars): %s",
                         call_id, name, args[:200],
                     )
                     args = json.dumps({MALFORMED_TOOL_ARGS_KEY: True})
