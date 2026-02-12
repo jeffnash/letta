@@ -1395,6 +1395,10 @@ class Message(BaseMessage):
             }
 
         elif self.role == "assistant" or self.role == "approval":
+            # Corrupted histories can contain empty assistant stubs (no text, no tool calls).
+            # Skip these so token counting/serialization doesn't crash on assertion.
+            if self.role == "assistant" and self.tool_calls is None and (self.content is None or len(self.content) == 0):
+                return None
             try:
                 assert self.tool_calls is not None or text_content is not None, vars(self)
             except AssertionError as e:

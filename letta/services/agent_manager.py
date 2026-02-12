@@ -2381,6 +2381,27 @@ class AgentManager:
             current_message_ids = list(agent.message_ids or [])
 
         pruned_message_ids: List[str] = []
+        invalid_assistant_stub_ids: Set[str] = set()
+
+        # Prune invalid assistant stubs from in-context history.
+        # These can appear after interrupted flows and will crash token counting/serialization.
+        current_message_id_set = set(current_message_ids)
+        for msg in filtered_messages:
+            if msg.id not in current_message_id_set:
+                continue
+            if msg.role == MessageRole.assistant and not msg.tool_calls and (msg.content is None or len(msg.content) == 0):
+                invalid_assistant_stub_ids.add(msg.id)
+
+        if invalid_assistant_stub_ids:
+            removed_invalid = [mid for mid in current_message_ids if mid in invalid_assistant_stub_ids]
+            current_message_ids = [mid for mid in current_message_ids if mid not in invalid_assistant_stub_ids]
+            pruned_message_ids.extend(removed_invalid)
+            logger.warning(
+                "[REPAIR] Pruning %d invalid assistant stub message(s) from in-context history: %s",
+                len(removed_invalid),
+                removed_invalid,
+            )
+
         if settings.repair_prune_orphan_function_outputs and provider_removed_orphan_output_ids:
             removed_output_call_ids = set(provider_removed_orphan_output_ids)
             current_message_id_set = set(current_message_ids)
@@ -2404,12 +2425,13 @@ class AgentManager:
                     candidate_prunable_ids.add(msg.id)
 
             if candidate_prunable_ids:
-                pruned_message_ids = [mid for mid in current_message_ids if mid in candidate_prunable_ids]
+                newly_pruned = [mid for mid in current_message_ids if mid in candidate_prunable_ids]
                 current_message_ids = [mid for mid in current_message_ids if mid not in candidate_prunable_ids]
+                pruned_message_ids.extend(newly_pruned)
                 logger.warning(
                     "[REPAIR] Pruning %d orphan function_call_output-only tool message(s) from in-context history: %s",
-                    len(pruned_message_ids),
-                    pruned_message_ids,
+                    len(newly_pruned),
+                    newly_pruned,
                 )
 
         if not orphaned_tool_calls and not pruned_message_ids and not sanitized_message_ids:
