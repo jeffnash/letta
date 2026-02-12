@@ -27,6 +27,7 @@ from letta.helpers import ToolRulesSolver
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns
 from letta.helpers.message_helper import convert_message_creates_to_messages
 from letta.helpers.tool_execution_helper import enable_strict_mode
+from letta.log import get_logger
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
@@ -62,9 +63,24 @@ from letta.settings import settings, summarizer_settings
 from letta.system import package_function_response, package_summarize_message_no_counts
 from letta.utils import log_telemetry, validate_function_response
 
+logger = get_logger(__name__)
+
 ENABLE_TOOL_ARG_SIZE_GUARD = os.getenv("LETTA_ENABLE_TOOL_ARG_SIZE_GUARD", "false").lower() == "true"
-MAX_TOOL_ARG_SIZE_BYTES = int(os.getenv("LETTA_MAX_TOOL_ARG_SIZE_BYTES", "32768"))
-MALFORMED_TOOL_ARGS_RETRY_CAP = int(os.getenv("LETTA_MALFORMED_TOOL_ARGS_RETRY_CAP", "2"))
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; falling back to default %d", name, value, default)
+        return default
+
+
+MAX_TOOL_ARG_SIZE_BYTES = _safe_int_env("LETTA_MAX_TOOL_ARG_SIZE_BYTES", 32768)
+MALFORMED_TOOL_ARGS_RETRY_CAP = _safe_int_env("LETTA_MALFORMED_TOOL_ARGS_RETRY_CAP", 2)
 
 
 class LettaAgentV3(LettaAgentV2):
