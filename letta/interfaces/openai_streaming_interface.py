@@ -66,6 +66,8 @@ from letta.streaming_utils import (
 
 logger = get_logger(__name__)
 
+MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
+
 
 class OpenAIStreamingInterface:
     """
@@ -802,7 +804,7 @@ class SimpleOpenAIStreamingInterface:
                         "name=%s. Replacing with empty dict. Original (truncated to 200 chars): %s",
                         call_id, name, args[:200],
                     )
-                    args = "{}"
+                    args = json.dumps({MALFORMED_TOOL_ARGS_KEY: True})
 
             if call_id and name:
                 result.append(ToolCall(id=call_id, function=FunctionCall(arguments=args or "", name=name)))

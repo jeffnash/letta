@@ -26,6 +26,8 @@ from letta.schemas.openai.chat_completion_response import (
 
 logger = get_logger(__name__)
 
+MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
+
 
 def normalize_chat_completion_response(
     response_data: Dict[str, Any],
@@ -180,9 +182,9 @@ def normalize_chat_completion_response(
                                         str(func["arguments"])[:200],
                                         extra={"run_id": run_id, "step_id": step_id, "provider": provider},
                                     )
-                                    func["arguments"] = "{}"
+                                    func["arguments"] = json.dumps({MALFORMED_TOOL_ARGS_KEY: True})
                                     normalizations_applied.append(
-                                        f"choices[{i}].tool_calls[{j}].function.arguments=invalid_json->{{}}"
+                                        f"choices[{i}].tool_calls[{j}].function.arguments=invalid_json->malformed_sentinel"
                                     )
     
     # Log normalizations if any were applied

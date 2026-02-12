@@ -5,6 +5,7 @@ from letta.log import get_logger
 logger = get_logger(__name__)
 
 import copy
+import hashlib
 import json
 import re
 import uuid
@@ -120,6 +121,43 @@ def add_inner_thoughts_to_tool_call(
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to put inner thoughts in kwargs: {e}")
         raise e
+
+
+def sanitize_tool_identifier(raw_id: str, seen_ids: Optional[set[str]] = None) -> str:
+    """Normalize tool IDs for provider compatibility and per-message uniqueness.
+
+    Anthropic/OpenAI-compatible proxies can reject tool IDs containing punctuation
+    beyond `[a-zA-Z0-9_-]`. We normalize to that character set and, when needed,
+    append a deterministic hash so IDs stay unique for parallel calls.
+    """
+    raw_id_str = str(raw_id)
+    digest = hashlib.sha1(raw_id_str.encode("utf-8")).hexdigest()[:8]
+
+    normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id_str)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    if not normalized:
+        normalized = "toolu"
+
+    changed_by_normalization = normalized != raw_id_str
+    candidate = f"{normalized}_{digest}" if changed_by_normalization else normalized
+
+    if seen_ids is not None and candidate in seen_ids:
+        if changed_by_normalization:
+            # Rare fallback when a same-raw duplicate appears in the same message.
+            candidate = f"{normalized}_{digest[:6]}_{digest[6:8]}"
+        else:
+            candidate = f"{normalized}_{digest}"
+        logger.warning(
+            "Tool identifier collision detected during sanitization; using deterministic unique ID: '%s' -> '%s'",
+            raw_id_str,
+            candidate,
+        )
+    elif changed_by_normalization:
+        logger.warning("Sanitized tool identifier for provider compatibility: '%s' -> '%s'", raw_id_str, candidate)
+
+    if seen_ids is not None:
+        seen_ids.add(candidate)
+    return candidate
 
 
 class MessageCreateType(str, Enum):
@@ -1934,6 +1972,7 @@ class Message(BaseMessage):
                     )
             # Tool calling
             if self.tool_calls is not None:
+                seen_tool_ids: set[str] = set()
                 for tool_call in self.tool_calls:
                     if put_inner_thoughts_in_kwargs:
                         tool_call_input = add_inner_thoughts_to_tool_call(
@@ -1950,7 +1989,7 @@ class Message(BaseMessage):
                     content.append(
                         {
                             "type": "tool_use",
-                            "id": tool_call.id,
+                            "id": sanitize_tool_identifier(tool_call.id, seen_tool_ids),
                             "name": tool_call.function.name,
                             "input": tool_call_input,
                         }
@@ -1961,6 +2000,7 @@ class Message(BaseMessage):
         elif self.role == "tool":
             # NOTE: Anthropic uses role "user" for "tool" responses
             content = []
+            seen_tool_result_ids: set[str] = set()
             # Handle the case where tool_returns is None or empty
             if self.tool_returns:
                 # For single tool returns, we can use the message's tool_call_id as fallback
@@ -1994,7 +2034,7 @@ class Message(BaseMessage):
                     content.append(
                         {
                             "type": "tool_result",
-                            "tool_use_id": resolved_tool_call_id,
+                            "tool_use_id": sanitize_tool_identifier(resolved_tool_call_id, seen_tool_result_ids),
                             "content": tool_result_content,
                         }
                     )
@@ -2015,7 +2055,7 @@ class Message(BaseMessage):
                         # TODO support error types etc
                         {
                             "type": "tool_result",
-                            "tool_use_id": self.tool_call_id,
+                            "tool_use_id": sanitize_tool_identifier(self.tool_call_id, seen_tool_result_ids),
                             "content": legacy_content,
                         }
                     ],

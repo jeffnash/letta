@@ -55,6 +55,7 @@ SSE_ARTIFICIAL_DELAY = 0.1
 
 
 logger = get_logger(__name__)
+MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
 
 
 def sse_formatter(data: Union[dict, str]) -> str:
@@ -356,7 +357,7 @@ def create_approval_request_message_from_llm_response(
     """
     from letta.log import get_logger
     _logger = get_logger(__name__)
-    
+
     # Validate that all requested tool calls have non-None IDs - critical for approval flow
     for tc in requested_tool_calls:
         if tc.id is None:
@@ -388,7 +389,7 @@ def create_approval_request_message_from_llm_response(
                     f"name={tool_call.function.name}. Replacing with empty dict. "
                     f"Original (truncated to 200 chars): {(args_str or '')[:200]}"
                 )
-                args_str = "{}"
+                args_str = json.dumps({MALFORMED_TOOL_ARGS_KEY: True})
             oai_tool_calls.append(
                 OpenAIToolCall(
                     id=tool_call.id,
@@ -428,7 +429,7 @@ def create_approval_request_message_from_llm_response(
                 f"name={tool_call.function.name}. Replacing with empty dict. "
                 f"Original (truncated to 200 chars): {(args_str or '')[:200]}"
             )
-            args_str = "{}"
+            args_str = json.dumps({MALFORMED_TOOL_ARGS_KEY: True})
         oai_tool_calls.append(
             OpenAIToolCall(
                 id=tool_call.id,

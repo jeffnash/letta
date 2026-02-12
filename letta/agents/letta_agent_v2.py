@@ -11,6 +11,7 @@ from letta.adapters.letta_llm_stream_adapter import LettaLLMStreamAdapter
 from letta.agents.base_agent_v2 import BaseAgentV2
 from letta.agents.ephemeral_summary_agent import EphemeralSummaryAgent
 from letta.agents.helpers import (
+    MALFORMED_TOOL_ARGS_KEY,
     _build_rule_violation_result,
     _load_last_function_response,
     _maybe_get_approval_messages,
@@ -1071,6 +1072,7 @@ class LettaAgentV2(BaseAgentV2):
         tool_call_name: str = tool_call.function.name
 
         tool_args = _safe_load_tool_call_str(tool_call.function.arguments)
+        malformed_tool_args = bool(tool_args.pop(MALFORMED_TOOL_ARGS_KEY, False))
         request_heartbeat: bool = _pop_heartbeat(tool_args)
         tool_args.pop(INNER_THOUGHTS_KWARG, None)
 
@@ -1083,7 +1085,48 @@ class LettaAgentV2(BaseAgentV2):
             request_heartbeat=request_heartbeat,
         )
 
-        if not is_approval and tool_rules_solver.is_requires_approval_tool(tool_call_name):
+        if malformed_tool_args:
+            self.logger.warning(
+                "MALFORMED_TOOL_ARGS_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s",
+                run_id,
+                step_id,
+                tool_call_id,
+                tool_call_name,
+            )
+            tool_execution_result = ToolExecutionResult(
+                status="error",
+                func_return=(
+                    "[Error: LLM produced malformed tool arguments JSON for this tool call. "
+                    "Execution was skipped. Please retry the tool call.]"
+                ),
+            )
+            function_response_string = validate_function_response(
+                tool_execution_result.func_return,
+                return_char_limit=None,
+                truncate=False,
+            )
+            continue_stepping = True
+            heartbeat_reason = f"{NON_USER_MSG_PREFIX}Continuing: malformed tool arguments were skipped."
+            stop_reason = None
+            tool_call_messages = create_letta_messages_from_llm_response(
+                agent_id=agent_state.id,
+                model=agent_state.llm_config.model,
+                function_name=tool_call_name,
+                function_arguments={},
+                tool_execution_result=tool_execution_result,
+                tool_call_id=tool_call_id,
+                function_response=function_response_string,
+                timezone=agent_state.timezone,
+                continue_stepping=continue_stepping,
+                heartbeat_reason=heartbeat_reason,
+                reasoning_content=reasoning_content,
+                pre_computed_assistant_message_id=pre_computed_assistant_message_id,
+                step_id=step_id,
+                run_id=run_id,
+                is_approval_response=is_approval or is_denial,
+            )
+            messages_to_persist = (initial_messages or []) + tool_call_messages
+        elif not is_approval and tool_rules_solver.is_requires_approval_tool(tool_call_name):
             tool_args[REQUEST_HEARTBEAT_PARAM] = request_heartbeat
             approval_messages = create_approval_request_message_from_llm_response(
                 agent_id=agent_state.id,

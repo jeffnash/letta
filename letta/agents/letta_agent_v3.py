@@ -9,6 +9,7 @@ from letta.adapters.letta_llm_adapter import LettaLLMAdapter
 from letta.adapters.simple_llm_request_adapter import SimpleLLMRequestAdapter
 from letta.adapters.simple_llm_stream_adapter import SimpleLLMStreamAdapter
 from letta.agents.helpers import (
+    MALFORMED_TOOL_ARGS_KEY,
     _build_rule_violation_result,
     _load_last_function_response,
     _maybe_get_approval_messages,
@@ -1260,8 +1261,32 @@ class LettaAgentV3(LettaAgentV2):
             call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
             name = tc.function.name
             args = _safe_load_tool_call_str(tc.function.arguments)
+            malformed_tool_args = bool(args.pop(MALFORMED_TOOL_ARGS_KEY, False))
             args.pop(REQUEST_HEARTBEAT_PARAM, None)
             args.pop(INNER_THOUGHTS_KWARG, None)
+
+            if malformed_tool_args:
+                self.logger.warning(
+                    "MALFORMED_TOOL_ARGS_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s",
+                    run_id,
+                    step_id,
+                    call_id,
+                    name,
+                )
+                exec_specs.append(
+                    {
+                        "id": call_id,
+                        "name": name,
+                        "args": {},
+                        "violated": False,
+                        "malformed_args": True,
+                        "error": (
+                            "[Error: LLM produced malformed tool arguments JSON for this tool call. "
+                            "Execution was skipped. Please retry the tool call.]"
+                        ),
+                    }
+                )
+                continue
 
             # Validate against allowed tools
             tool_rule_violated = name not in valid_tool_names and not is_approval_response
@@ -1290,6 +1315,7 @@ class LettaAgentV3(LettaAgentV2):
                                 "name": name,
                                 "args": args,
                                 "violated": False,
+                                "malformed_args": False,
                                 "error": err_msg,
                             }
                         )
@@ -1301,6 +1327,7 @@ class LettaAgentV3(LettaAgentV2):
                     "name": name,
                     "args": args,
                     "violated": tool_rule_violated,
+                    "malformed_args": False,
                     "error": None,
                 }
             )
@@ -1370,6 +1397,7 @@ class LettaAgentV3(LettaAgentV2):
         for idx, spec in enumerate(exec_specs):
             tool_execution_result, _ = results[idx]
             has_prefill_error = bool(spec.get("error"))
+            is_malformed_args = bool(spec.get("malformed_args"))
 
             # Validate and format function response
             truncate = spec["name"] not in {"conversation_search", "conversation_search_date", "archival_memory_search"}
@@ -1393,7 +1421,11 @@ class LettaAgentV3(LettaAgentV2):
                 tool_rules_solver.register_tool_call(spec["name"])
 
             # Decide continuation for this tool
-            if has_prefill_error:
+            if has_prefill_error and is_malformed_args:
+                cont = True
+                hb_reason = f"{NON_USER_MSG_PREFIX}Continuing: malformed tool arguments were skipped."
+                sr = None
+            elif has_prefill_error:
                 cont = False
                 hb_reason = None
                 sr = LettaStopReason(stop_reason=StopReasonType.invalid_tool_call.value)

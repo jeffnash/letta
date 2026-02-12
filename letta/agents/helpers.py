@@ -24,6 +24,8 @@ from letta.services.message_manager import MessageManager
 
 logger = get_logger(__name__)
 
+MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
+
 
 def _find_matching_approval_request(
     messages: List[Message], 
@@ -587,7 +589,7 @@ def _safe_load_tool_call_str(tool_call_args_str: str) -> dict:
             tool_args = json.loads(tool_args)
     except json.JSONDecodeError:
         logger.error("Failed to JSON decode tool call argument string: %s", tool_call_args_str)
-        tool_args = {}
+        tool_args = {MALFORMED_TOOL_ARGS_KEY: True}
 
     return tool_args
 

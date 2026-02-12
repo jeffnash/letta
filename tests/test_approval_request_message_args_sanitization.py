@@ -9,6 +9,9 @@ from letta.schemas.enums import MessageRole
 from letta.server.rest_api.utils import create_approval_request_message_from_llm_response
 
 
+MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
+
+
 def _tool_call(call_id: str, name: str, arguments: str) -> OpenAIToolCall:
     return OpenAIToolCall(
         id=call_id,
@@ -35,7 +38,7 @@ def test_sanitizes_invalid_requested_tool_call_arguments():
     assert approval_message.role == MessageRole.approval
     assert approval_message.tool_calls is not None
     assert approval_message.tool_calls[0].id == "call_bad"
-    assert approval_message.tool_calls[0].function.arguments == "{}"
+    assert json.loads(approval_message.tool_calls[0].function.arguments) == {MALFORMED_TOOL_ARGS_KEY: True}
 
 
 def test_sanitizes_invalid_allowed_tool_call_arguments():
@@ -60,7 +63,7 @@ def test_sanitizes_invalid_allowed_tool_call_arguments():
     assert assistant_message.role == MessageRole.assistant
     assert assistant_message.tool_calls is not None
     assert assistant_message.tool_calls[0].id == "call_allowed_bad"
-    assert assistant_message.tool_calls[0].function.arguments == "{}"
+    assert json.loads(assistant_message.tool_calls[0].function.arguments) == {MALFORMED_TOOL_ARGS_KEY: True}
 
     assert approval_message.role == MessageRole.approval
     assert approval_message.tool_calls is not None
