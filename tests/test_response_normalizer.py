@@ -5,8 +5,6 @@ Tests the normalization of OpenAI-compatible proxy responses to ensure
 they can be parsed by Pydantic without validation errors.
 """
 
-import json
-
 import pytest
 
 from letta.llm_api.response_normalizer import (
@@ -16,9 +14,6 @@ from letta.llm_api.response_normalizer import (
     validate_and_normalize_response,
 )
 from letta.schemas.openai.chat_completion_response import ChatCompletionResponse
-
-
-MALFORMED_TOOL_ARGS_KEY = "__letta_malformed_tool_args"
 
 
 class TestNormalizeChatCompletionResponse:
@@ -275,59 +270,6 @@ class TestNormalizeChatCompletionResponse:
         assert tool_call["function"]["arguments"] == "{}"
 
         # Should parse without error
-        ChatCompletionResponse(**normalized)
-
-
-class TestNormalizeTruncatedToolCallArguments:
-    """Tests for truncated/invalid JSON in tool call arguments normalization."""
-
-    def _make_response_with_arguments(self, arguments: str) -> dict:
-        return {
-            "id": "chatcmpl-123",
-            "object": "chat.completion",
-            "created": 1234567890,
-            "model": "gpt-4",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_abc123",
-                                "type": "function",
-                                "function": {"name": "memory", "arguments": arguments},
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-        }
-
-    def test_valid_json_arguments_pass_through(self):
-        valid_args = '{"command": "str_replace", "path": "/test"}'
-        response_data = self._make_response_with_arguments(valid_args)
-        normalized = normalize_chat_completion_response(response_data)
-        tool_call = normalized["choices"][0]["message"]["tool_calls"][0]
-        assert tool_call["function"]["arguments"] == valid_args
-        ChatCompletionResponse(**normalized)
-
-    def test_truncated_json_arguments_replaced_with_sentinel(self):
-        truncated_args = '{"command": "str_replace", "new_string": "Electron proxy'
-        response_data = self._make_response_with_arguments(truncated_args)
-        normalized = normalize_chat_completion_response(response_data)
-        tool_call = normalized["choices"][0]["message"]["tool_calls"][0]
-        assert json.loads(tool_call["function"]["arguments"]) == {MALFORMED_TOOL_ARGS_KEY: True}
-        ChatCompletionResponse(**normalized)
-
-    def test_completely_invalid_arguments_replaced(self):
-        response_data = self._make_response_with_arguments("not json at all")
-        normalized = normalize_chat_completion_response(response_data)
-        tool_call = normalized["choices"][0]["message"]["tool_calls"][0]
-        assert json.loads(tool_call["function"]["arguments"]) == {MALFORMED_TOOL_ARGS_KEY: True}
         ChatCompletionResponse(**normalized)
 
 

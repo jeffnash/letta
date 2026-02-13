@@ -1,6 +1,5 @@
 import asyncio
 import json
-import os
 import uuid
 from typing import Any, AsyncGenerator, Dict, Literal, Optional
 
@@ -10,7 +9,6 @@ from letta.adapters.letta_llm_adapter import LettaLLMAdapter
 from letta.adapters.simple_llm_request_adapter import SimpleLLMRequestAdapter
 from letta.adapters.simple_llm_stream_adapter import SimpleLLMStreamAdapter
 from letta.agents.helpers import (
-    MALFORMED_TOOL_ARGS_KEY,
     _build_rule_violation_result,
     _load_last_function_response,
     _maybe_get_approval_messages,
@@ -27,7 +25,6 @@ from letta.helpers import ToolRulesSolver
 from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns
 from letta.helpers.message_helper import convert_message_creates_to_messages
 from letta.helpers.tool_execution_helper import enable_strict_mode
-from letta.log import get_logger
 from letta.local_llm.constants import INNER_THOUGHTS_KWARG
 from letta.otel.tracing import trace_method
 from letta.schemas.agent import AgentState
@@ -62,25 +59,6 @@ from letta.services.summarizer.summarizer_sliding_window import (
 from letta.settings import settings, summarizer_settings
 from letta.system import package_function_response, package_summarize_message_no_counts
 from letta.utils import log_telemetry, validate_function_response
-
-logger = get_logger(__name__)
-
-ENABLE_TOOL_ARG_SIZE_GUARD = os.getenv("LETTA_ENABLE_TOOL_ARG_SIZE_GUARD", "false").lower() == "true"
-
-
-def _safe_int_env(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning("Invalid integer for %s=%r; falling back to default %d", name, value, default)
-        return default
-
-
-MAX_TOOL_ARG_SIZE_BYTES = _safe_int_env("LETTA_MAX_TOOL_ARG_SIZE_BYTES", 32768)
-MALFORMED_TOOL_ARGS_RETRY_CAP = _safe_int_env("LETTA_MALFORMED_TOOL_ARGS_RETRY_CAP", 2)
 
 
 class LettaAgentV3(LettaAgentV2):
@@ -118,7 +96,6 @@ class LettaAgentV3(LettaAgentV2):
         self.conversation_id: str | None = None
         # Client-side tools passed in the request (executed by client, not server)
         self.client_tools: list[ClientToolSchema] = []
-        self._malformed_tool_skip_count: int = 0
 
     def _compute_tool_return_truncation_chars(self) -> int:
         """Compute a dynamic cap for tool returns in requests.
@@ -999,12 +976,16 @@ class LettaAgentV3(LettaAgentV2):
                     if include_return_message_types is None or message.message_type in include_return_message_types:
                         yield message
 
-            # Check compaction.
-            #
-            # Even with a pending approval request as the last message, compaction is safe because
-            # the summary is inserted at the front of the buffer (see compact()), and the approval
-            # message remains the final message in context.
-            if self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
+            # check compaction
+            # Skip compaction if the last message is a pending approval request - compaction would
+            # insert a summary message after the approval request, breaking the approval validation
+            # which expects the approval request to be the last message in context.
+            has_pending_approval = messages and messages[-1].is_approval_request()
+            if has_pending_approval:
+                self.logger.info(
+                    "Skipping compaction: pending approval request must remain as last message in context"
+                )
+            elif self.context_token_estimate is not None and self.context_token_estimate > self.agent_state.llm_config.context_window:
                 self.logger.info(
                     f"Context window exceeded (current: {self.context_token_estimate}, threshold: {self.agent_state.llm_config.context_window}), trying to compact messages"
                 )
@@ -1132,10 +1113,6 @@ class LettaAgentV3(LettaAgentV2):
         """
 
         # 1. Handle no-tool cases (content-only or no-op)
-        had_previous_malformed_skip = (
-            isinstance(self.last_function_response, str)
-            and "malformed tool arguments" in self.last_function_response.lower()
-        )
         if not tool_calls and not tool_call_denials and not tool_returns:
             # Case 1a: No tool call, no content (LLM no-op)
             if content is None or len(content) == 0:
@@ -1196,67 +1173,6 @@ class LettaAgentV3(LettaAgentV2):
             return messages_to_persist, continue_stepping, stop_reason
 
         # 2. Check whether tool call requires approval (includes client-side tools)
-        malformed_tool_specs: list[Dict[str, Any]] = []
-        if tool_calls:
-            valid_tool_calls: list[ToolCall] = []
-            for tc in tool_calls:
-                raw_arguments = tc.function.arguments or ""
-                if ENABLE_TOOL_ARG_SIZE_GUARD and isinstance(raw_arguments, str) and len(raw_arguments) > MAX_TOOL_ARG_SIZE_BYTES:
-                    call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
-                    self.logger.warning(
-                        "TOOL_ARGS_TOO_LARGE_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s size=%d limit=%d",
-                        run_id,
-                        step_id,
-                        call_id,
-                        tc.function.name,
-                        len(raw_arguments),
-                        MAX_TOOL_ARG_SIZE_BYTES,
-                    )
-                    malformed_tool_specs.append(
-                        {
-                            "id": call_id,
-                            "name": tc.function.name,
-                            "args": {},
-                            "violated": False,
-                            "malformed_args": True,
-                            "error": (
-                                "[Error: LLM produced oversized tool arguments for this tool call. "
-                                "Execution was skipped. Please split the edit into smaller chunks and retry.]"
-                            ),
-                        }
-                    )
-                    continue
-
-                parsed_args = _safe_load_tool_call_str(tc.function.arguments)
-                if bool(parsed_args.get(MALFORMED_TOOL_ARGS_KEY, False)):
-                    call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
-                    self.logger.warning(
-                        "MALFORMED_TOOL_ARGS_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s (pre-approval)",
-                        run_id,
-                        step_id,
-                        call_id,
-                        tc.function.name,
-                    )
-                    malformed_tool_specs.append(
-                        {
-                            "id": call_id,
-                            "name": tc.function.name,
-                            "args": {},
-                            "violated": False,
-                            "malformed_args": True,
-                            "error": (
-                                "[Error: LLM produced malformed tool arguments JSON for this tool call. "
-                                "Execution was skipped. Please retry the tool call.]"
-                            ),
-                        }
-                    )
-                else:
-                    valid_tool_calls.append(tc)
-            tool_calls = valid_tool_calls
-
-        if malformed_tool_specs:
-            self._malformed_tool_skip_count += len(malformed_tool_specs)
-
         if not is_approval_response:
             # Get names of client-side tools (these are executed by client, not server)
             client_tool_names = {ct.name for ct in self.client_tools} if self.client_tools else set()
@@ -1325,7 +1241,7 @@ class LettaAgentV3(LettaAgentV2):
 
             continue_stepping = True
             stop_reason = None
-            result_tool_returns.extend(tool_returns)
+            result_tool_returns = tool_returns
 
         # 4. Handle denial cases
         if tool_call_denials:
@@ -1343,64 +1259,13 @@ class LettaAgentV3(LettaAgentV2):
         # Note: When tool rules are present, execution is forced serial (see 5c).
 
         # 5a. Prepare execution specs for all tools
-        exec_specs = list(malformed_tool_specs)
+        exec_specs = []
         for tc in tool_calls:
             call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
             name = tc.function.name
-            raw_arguments = tc.function.arguments or ""
-            if ENABLE_TOOL_ARG_SIZE_GUARD and isinstance(raw_arguments, str) and len(raw_arguments) > MAX_TOOL_ARG_SIZE_BYTES:
-                self.logger.warning(
-                    "TOOL_ARGS_TOO_LARGE_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s size=%d limit=%d",
-                    run_id,
-                    step_id,
-                    call_id,
-                    name,
-                    len(raw_arguments),
-                    MAX_TOOL_ARG_SIZE_BYTES,
-                )
-                exec_specs.append(
-                    {
-                        "id": call_id,
-                        "name": name,
-                        "args": {},
-                        "violated": False,
-                        "malformed_args": True,
-                        "error": (
-                            "[Error: LLM produced oversized tool arguments for this tool call. "
-                            "Execution was skipped. Please split the edit into smaller chunks and retry.]"
-                        ),
-                    }
-                )
-                self._malformed_tool_skip_count += 1
-                continue
-
             args = _safe_load_tool_call_str(tc.function.arguments)
-            malformed_tool_args = bool(args.pop(MALFORMED_TOOL_ARGS_KEY, False))
             args.pop(REQUEST_HEARTBEAT_PARAM, None)
             args.pop(INNER_THOUGHTS_KWARG, None)
-
-            if malformed_tool_args:
-                self.logger.warning(
-                    "MALFORMED_TOOL_ARGS_SKIPPED: run_id=%s step_id=%s tool_call_id=%s tool_name=%s",
-                    run_id,
-                    step_id,
-                    call_id,
-                    name,
-                )
-                exec_specs.append(
-                    {
-                        "id": call_id,
-                        "name": name,
-                        "args": {},
-                        "violated": False,
-                        "malformed_args": True,
-                        "error": (
-                            "[Error: LLM produced malformed tool arguments JSON for this tool call. "
-                            "Execution was skipped. Please retry the tool call.]"
-                        ),
-                    }
-                )
-                continue
 
             # Validate against allowed tools
             tool_rule_violated = name not in valid_tool_names and not is_approval_response
@@ -1429,7 +1294,6 @@ class LettaAgentV3(LettaAgentV2):
                                 "name": name,
                                 "args": args,
                                 "violated": False,
-                                "malformed_args": False,
                                 "error": err_msg,
                             }
                         )
@@ -1441,7 +1305,6 @@ class LettaAgentV3(LettaAgentV2):
                     "name": name,
                     "args": args,
                     "violated": tool_rule_violated,
-                    "malformed_args": False,
                     "error": None,
                 }
             )
@@ -1511,7 +1374,6 @@ class LettaAgentV3(LettaAgentV2):
         for idx, spec in enumerate(exec_specs):
             tool_execution_result, _ = results[idx]
             has_prefill_error = bool(spec.get("error"))
-            is_malformed_args = bool(spec.get("malformed_args"))
 
             # Validate and format function response
             truncate = spec["name"] not in {"conversation_search", "conversation_search_date", "archival_memory_search"}
@@ -1535,17 +1397,7 @@ class LettaAgentV3(LettaAgentV2):
                 tool_rules_solver.register_tool_call(spec["name"])
 
             # Decide continuation for this tool
-            if has_prefill_error and is_malformed_args:
-                # Give the model one retry chance, but avoid infinite malformed-call loops.
-                if had_previous_malformed_skip or self._malformed_tool_skip_count >= MALFORMED_TOOL_ARGS_RETRY_CAP:
-                    cont = False
-                    hb_reason = None
-                    sr = LettaStopReason(stop_reason=StopReasonType.end_turn.value)
-                else:
-                    cont = True
-                    hb_reason = f"{NON_USER_MSG_PREFIX}Continuing: malformed tool arguments were skipped."
-                    sr = None
-            elif has_prefill_error:
+            if has_prefill_error:
                 cont = False
                 hb_reason = None
                 sr = LettaStopReason(stop_reason=StopReasonType.invalid_tool_call.value)
@@ -1592,7 +1444,7 @@ class LettaAgentV3(LettaAgentV2):
 
         # 5g. Aggregate continuation decisions
         aggregate_continue = any(persisted_continue_flags) if persisted_continue_flags else False
-        aggregate_continue = aggregate_continue or bool(tool_call_denials) or bool(result_tool_returns)
+        aggregate_continue = aggregate_continue or tool_call_denials or tool_returns
 
         # Determine aggregate stop reason
         aggregate_stop_reason = None

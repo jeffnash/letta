@@ -82,37 +82,21 @@ async def refresh_model_cache(
     headers: HeaderParams = Depends(get_headers),
 ):
     """
-    Clear the CLIProxyProvider model cache AND re-sync models into the database.
+    Clear the CLIProxyProvider model cache, forcing a fresh fetch on the next request.
     
     This is useful when models have been added/removed from the CLIProxy upstream
     and you want to see the changes immediately without waiting for the cache TTL
     to expire.
     
-    The refresh performs two steps:
-    1. Clears the CLIProxyProvider in-memory cache so fresh data is fetched from upstream.
-    2. Re-syncs the CLIProxy provider models into the database so they appear in /v1/models.
+    Note: Currently only clears the CLIProxyProvider cache. Other providers do not
+    implement model caching.
     """
     from letta.schemas.providers.cliproxy import CLIProxyProvider
     
-    # Step 1: Clear CLIProxy's class-level cache so fresh data is fetched from upstream
+    # Clear CLIProxy's class-level cache
     CLIProxyProvider._model_cache.clear()
     
-    # Step 2: Re-sync provider models into the database
-    # This is the same sync performed on startup and by /admin/providers/sync.
-    # Without this step, the in-memory cache clear alone doesn't update the DB,
-    # and /v1/models reads from DB -- so new models wouldn't appear.
-    try:
-        sync_result = await server._sync_provider_models_async(provider_name="cliproxy")
-        return {
-            "status": "ok",
-            "message": "Model cache cleared and models re-synced from upstream.",
-            "sync_details": sync_result,
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Model cache cleared but DB sync failed: {e}. Models may not appear until next startup.",
-        )
+    return {"status": "ok", "message": "Model cache cleared. Next /models request will fetch fresh data."}
 
 
 @router.post("/resolve", response_model=ModelSelectorResponse, operation_id="resolve_model_selector")

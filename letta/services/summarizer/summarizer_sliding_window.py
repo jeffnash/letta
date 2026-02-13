@@ -1,5 +1,3 @@
-import math
-
 from typing import List, Optional, Set, Tuple
 
 from letta.helpers.message_helper import convert_message_creates_to_messages
@@ -383,22 +381,12 @@ async def summarize_via_sliding_window(
     # also need to grow the cutoff point until the token count is less than the target token count
     # ADDITIONALLY: we must respect tool_use → tool_result pairing to avoid breaking LLM API constraints
 
-    last_message_cutoff_index: int | None = None
-    last_safe_cutoff_index: int | None = None
-
-    while (
-        approx_token_count >= (1 - summarizer_config.sliding_window_percentage) * llm_config.context_window
-        and eviction_percentage < 1.0
-    ):
+    while approx_token_count >= (1 - summarizer_config.sliding_window_percentage) * llm_config.context_window and eviction_percentage < 1.0:
         # more eviction percentage
         eviction_percentage += 0.10
 
         # calculate message_cutoff_index (relative to conversation_messages, not in_context_messages)
-        # Use ceil + monotonic forcing to avoid repeated cutoffs for small message counts.
-        message_cutoff_index = int(math.ceil(eviction_percentage * total_message_count))
-        if last_message_cutoff_index is not None and message_cutoff_index <= last_message_cutoff_index:
-            message_cutoff_index = last_message_cutoff_index + 1
-        last_message_cutoff_index = message_cutoff_index
+        message_cutoff_index = round(eviction_percentage * total_message_count)
 
         # Find a safe cutoff index that respects tool pairing constraints
         safe_cutoff_index = _find_safe_cutoff_index(
@@ -413,18 +401,6 @@ async def summarize_via_sliding_window(
         if safe_cutoff_index is None:
             logger.warning(f"No safe cutoff found for evicting up to index {message_cutoff_index}, incrementing eviction percentage")
             continue
-
-        # If the safe cutoff stops changing even as we try to increase eviction, we
-        # are effectively stuck (often due to maximum_message_index constraints).
-        # Bail out so the caller can fall back to a different summarization strategy.
-        if last_safe_cutoff_index is not None and safe_cutoff_index == last_safe_cutoff_index:
-            logger.warning(
-                f"Sliding-window cutoff stopped progressing (safe_cutoff_index={safe_cutoff_index}). "
-                "Bailing out to avoid repeated compaction attempts."
-            )
-            eviction_percentage = 1.0
-            break
-        last_safe_cutoff_index = safe_cutoff_index
 
         # update token count - note: memory will be added back by caller, so we only count system + retained conversation
         logger.info(f"Attempting to compact messages index 0:{safe_cutoff_index} (conversation only)")

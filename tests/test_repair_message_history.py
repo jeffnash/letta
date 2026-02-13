@@ -84,34 +84,6 @@ class TestRepairMessageHistoryEndpoint:
         assert result.pruned_message_ids == []
 
     @pytest.mark.asyncio
-    async def test_endpoint_reports_malformed_tool_call_json_sanitization(self, mock_server):
-        """Endpoint should surface sanitization details for malformed approval tool-call JSON repair."""
-        from letta.server.rest_api.routers.v1.agents import repair_message_history, RepairMessageHistoryResponse
-
-        mock_server.user_manager.get_actor_or_default_async = AsyncMock(return_value=MagicMock())
-        mock_server.agent_manager.repair_message_history_async = AsyncMock(return_value={
-            "status": "repaired",
-            "message": "Sanitized malformed tool-call JSON in 1 message(s) covering 1 tool_call(s)",
-            "orphaned_tool_calls": [],
-            "injected_message_ids": [],
-            "injected_tool_call_ids": [],
-            "pruned_message_ids": [],
-            "sanitized_message_ids": ["message-malformed-approval-1"],
-            "sanitized_tool_call_ids": ["toolu-malformed-approval-1"],
-        })
-
-        result = await repair_message_history(
-            agent_id="agent-123",
-            server=mock_server,
-            headers=MagicMock(actor_id=None),
-        )
-
-        assert isinstance(result, RepairMessageHistoryResponse)
-        assert result.status == "repaired"
-        assert result.sanitized_message_ids == ["message-malformed-approval-1"]
-        assert result.sanitized_tool_call_ids == ["toolu-malformed-approval-1"]
-        assert "Sanitized malformed tool-call JSON" in result.message
-
     async def test_endpoint_handles_no_message_history(self, mock_server):
         """Endpoint should handle case where agent has no message history."""
         from letta.server.rest_api.routers.v1.agents import repair_message_history, RepairMessageHistoryResponse
@@ -159,8 +131,6 @@ class TestRepairMessageHistoryResponseModel:
         assert len(response.injected_message_ids) == 3
         assert len(response.injected_tool_call_ids) == 3
         assert response.pruned_message_ids == []
-        assert response.sanitized_message_ids == []
-        assert response.sanitized_tool_call_ids == []
 
     def test_response_model_ok_status_defaults(self):
         """Test response model with ok status uses defaults."""
@@ -176,27 +146,6 @@ class TestRepairMessageHistoryResponseModel:
         assert response.injected_message_ids == []
         assert response.injected_tool_call_ids == []
         assert response.pruned_message_ids == []
-        assert response.sanitized_message_ids == []
-        assert response.sanitized_tool_call_ids == []
-
-    def test_response_model_with_sanitized_tool_calls(self):
-        """Test response model with malformed tool-call JSON sanitization details."""
-        from letta.server.rest_api.routers.v1.agents import RepairMessageHistoryResponse
-
-        response = RepairMessageHistoryResponse(
-            status="repaired",
-            message="Sanitized malformed tool-call JSON in 2 message(s)",
-            orphaned_tool_calls=[],
-            injected_message_ids=[],
-            injected_tool_call_ids=[],
-            pruned_message_ids=[],
-            sanitized_message_ids=["message-1", "message-2"],
-            sanitized_tool_call_ids=["toolu-1", "toolu-2", "toolu-3"],
-        )
-
-        assert response.status == "repaired"
-        assert response.sanitized_message_ids == ["message-1", "message-2"]
-        assert response.sanitized_tool_call_ids == ["toolu-1", "toolu-2", "toolu-3"]
 
     def test_response_model_error_status(self):
         """Test response model with error status."""

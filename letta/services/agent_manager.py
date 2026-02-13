@@ -2030,69 +2030,11 @@ class AgentManager:
                 "orphaned_tool_calls": [],
                 "injected_message_ids": [],
                 "injected_tool_call_ids": [],
-                "pruned_message_ids": [],
-                "sanitized_message_ids": [],
-                "sanitized_tool_call_ids": [],
             }
 
         # Get agent state to access llm_config for provider-specific formatting
         agent_state = await self.get_agent_by_id_async(agent_id=agent_id, actor=actor)
         llm_config = agent_state.llm_config
-
-        # Sanitize malformed tool_call.function.arguments JSON in existing messages.
-        # This remediates persisted truncated JSON that can cause invalid_tool_call_format on replay.
-        sanitized_message_ids: List[str] = []
-        sanitized_tool_call_ids: List[str] = []
-
-        for msg in messages:
-            if not msg.tool_calls:
-                continue
-
-            updated_tool_calls = []
-            message_needs_update = False
-
-            for tc in msg.tool_calls:
-                updated_tc = tc
-                args = tc.function.arguments if tc.function else None
-                is_valid_json = False
-                if isinstance(args, str):
-                    try:
-                        json.loads(args)
-                        is_valid_json = True
-                    except (json.JSONDecodeError, TypeError):
-                        is_valid_json = False
-
-                if not is_valid_json:
-                    if tc.function:
-                        updated_tc = tc.model_copy(
-                            update={
-                                "function": tc.function.model_copy(update={"arguments": "{}"})
-                            }
-                        )
-                    message_needs_update = True
-                    if tc.id:
-                        sanitized_tool_call_ids.append(tc.id)
-
-                updated_tool_calls.append(updated_tc)
-
-            if message_needs_update:
-                await self.message_manager.update_message_by_id_async(
-                    message_id=msg.id,
-                    message_update=MessageUpdate(tool_calls=updated_tool_calls),
-                    actor=actor,
-                    project_id=agent_state.project_id,
-                    template_id=agent_state.template_id,
-                )
-                msg.tool_calls = updated_tool_calls
-                sanitized_message_ids.append(msg.id)
-
-        if sanitized_message_ids:
-            logger.warning(
-                "[REPAIR] %s: sanitized malformed tool-call JSON in %d message(s), %d tool_call(s)",
-                repair_target,
-                len(sanitized_message_ids),
-                len(sanitized_tool_call_ids),
-            )
 
         # IMPORTANT: Apply the same filtering that happens before sending to the LLM API
         # This ensures we detect orphans the same way the API would see them
@@ -2381,27 +2323,6 @@ class AgentManager:
             current_message_ids = list(agent.message_ids or [])
 
         pruned_message_ids: List[str] = []
-        invalid_assistant_stub_ids: Set[str] = set()
-
-        # Prune invalid assistant stubs from in-context history.
-        # These can appear after interrupted flows and will crash token counting/serialization.
-        current_message_id_set = set(current_message_ids)
-        for msg in filtered_messages:
-            if msg.id not in current_message_id_set:
-                continue
-            if msg.role == MessageRole.assistant and not msg.tool_calls and (msg.content is None or len(msg.content) == 0):
-                invalid_assistant_stub_ids.add(msg.id)
-
-        if invalid_assistant_stub_ids:
-            removed_invalid = [mid for mid in current_message_ids if mid in invalid_assistant_stub_ids]
-            current_message_ids = [mid for mid in current_message_ids if mid not in invalid_assistant_stub_ids]
-            pruned_message_ids.extend(removed_invalid)
-            logger.warning(
-                "[REPAIR] Pruning %d invalid assistant stub message(s) from in-context history: %s",
-                len(removed_invalid),
-                removed_invalid,
-            )
-
         if settings.repair_prune_orphan_function_outputs and provider_removed_orphan_output_ids:
             removed_output_call_ids = set(provider_removed_orphan_output_ids)
             current_message_id_set = set(current_message_ids)
@@ -2425,16 +2346,15 @@ class AgentManager:
                     candidate_prunable_ids.add(msg.id)
 
             if candidate_prunable_ids:
-                newly_pruned = [mid for mid in current_message_ids if mid in candidate_prunable_ids]
+                pruned_message_ids = [mid for mid in current_message_ids if mid in candidate_prunable_ids]
                 current_message_ids = [mid for mid in current_message_ids if mid not in candidate_prunable_ids]
-                pruned_message_ids.extend(newly_pruned)
                 logger.warning(
                     "[REPAIR] Pruning %d orphan function_call_output-only tool message(s) from in-context history: %s",
-                    len(newly_pruned),
-                    newly_pruned,
+                    len(pruned_message_ids),
+                    pruned_message_ids,
                 )
 
-        if not orphaned_tool_calls and not pruned_message_ids and not sanitized_message_ids:
+        if not orphaned_tool_calls and not pruned_message_ids:
             return {
                 "status": "ok",
                 "message": "No orphaned tool_use blocks found",
@@ -2442,8 +2362,6 @@ class AgentManager:
                 "injected_message_ids": [],
                 "injected_tool_call_ids": [],
                 "pruned_message_ids": [],
-                "sanitized_message_ids": [],
-                "sanitized_tool_call_ids": [],
             }
 
         if pruned_message_ids and not orphaned_tool_calls:
@@ -2458,16 +2376,11 @@ class AgentManager:
 
             return {
                 "status": "repaired",
-                "message": (
-                    f"Pruned {len(pruned_message_ids)} orphan function_call_output-only tool message(s); "
-                    f"sanitized malformed tool-call JSON in {len(sanitized_message_ids)} message(s)"
-                ),
+                "message": f"Pruned {len(pruned_message_ids)} orphan function_call_output-only tool message(s)",
                 "orphaned_tool_calls": [],
                 "injected_message_ids": [],
                 "injected_tool_call_ids": [],
                 "pruned_message_ids": pruned_message_ids,
-                "sanitized_message_ids": sanitized_message_ids,
-                "sanitized_tool_call_ids": sanitized_tool_call_ids,
             }
 
         # Inject synthetic tool result messages (do NOT remove any messages).
@@ -2511,27 +2424,17 @@ class AgentManager:
                 )
 
         if not synthetic_messages:
-            if orphaned_tool_calls:
-                msg_text = "Orphaned tool_use blocks detected but no synthetic tool results needed injection"
-            elif pruned_message_ids:
-                msg_text = f"No synthetic injections needed; pruned {len(pruned_message_ids)} orphan function_call_output-only tool message(s)"
-            elif sanitized_message_ids:
-                msg_text = (
-                    f"Sanitized malformed tool-call JSON in {len(sanitized_message_ids)} message(s) "
-                    f"covering {len(sanitized_tool_call_ids)} tool_call(s)"
-                )
-            else:
-                msg_text = "No issues found"
-
             return {
-                "status": "repaired" if (pruned_message_ids or sanitized_message_ids or orphaned_tool_calls) else "ok",
-                "message": msg_text,
+                "status": "repaired" if pruned_message_ids else "ok",
+                "message": (
+                    "Orphaned tool_use blocks detected but no synthetic tool results needed injection"
+                    if not pruned_message_ids
+                    else f"No synthetic injections needed; pruned {len(pruned_message_ids)} orphan function_call_output-only tool message(s)"
+                ),
                 "orphaned_tool_calls": orphaned_tool_calls,
                 "injected_message_ids": [],
                 "injected_tool_call_ids": [],
                 "pruned_message_ids": pruned_message_ids,
-                "sanitized_message_ids": sanitized_message_ids,
-                "sanitized_tool_call_ids": sanitized_tool_call_ids,
             }
 
         # Persist the synthetic messages.
@@ -2579,23 +2482,19 @@ class AgentManager:
 
         logger.warning(
             f"Repaired {repair_target} message history: injected {len(injected_message_ids)} synthetic tool result message(s) "
-            f"for {len(injected_tool_call_ids)} orphaned tool_call(s); pruned {len(pruned_message_ids)} orphan function_call_output-only message(s); "
-            f"sanitized malformed tool-call JSON in {len(sanitized_message_ids)} message(s)"
+            f"for {len(injected_tool_call_ids)} orphaned tool_call(s); pruned {len(pruned_message_ids)} orphan function_call_output-only message(s)"
         )
 
         return {
             "status": "repaired",
             "message": (
                 f"Injected {len(injected_message_ids)} synthetic tool result message(s) for {len(injected_tool_call_ids)} orphaned tool_call(s); "
-                f"pruned {len(pruned_message_ids)} orphan function_call_output-only message(s); "
-                f"sanitized malformed tool-call JSON in {len(sanitized_message_ids)} message(s)"
+                f"pruned {len(pruned_message_ids)} orphan function_call_output-only message(s)"
             ),
             "orphaned_tool_calls": orphaned_tool_calls,
             "injected_message_ids": injected_message_ids,
             "injected_tool_call_ids": injected_tool_call_ids,
             "pruned_message_ids": pruned_message_ids,
-            "sanitized_message_ids": sanitized_message_ids,
-            "sanitized_tool_call_ids": sanitized_tool_call_ids,
         }
 
     @enforce_types
