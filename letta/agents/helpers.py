@@ -574,19 +574,70 @@ def generate_step_id(uid: Optional[UUID] = None) -> str:
     return f"step-{uid}"
 
 
-def _safe_load_tool_call_str(tool_call_args_str: str) -> dict:
-    """Lenient JSON → dict with fallback to eval on assertion failure."""
+def _tool_args_preview(raw_args: Any, max_chars: int = 140) -> tuple[int, str, str]:
+    """Summarize tool args for logs without dumping full payloads."""
+    if raw_args is None:
+        s = ""
+    elif isinstance(raw_args, str):
+        s = raw_args
+    else:
+        s = str(raw_args)
+    if len(s) <= max_chars:
+        return len(s), s, s
+    return len(s), s[:max_chars], s[-max_chars:]
+
+
+def _safe_load_tool_call_str(
+    tool_call_args_str: str,
+    *,
+    tool_call_id: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    run_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+    source: Optional[str] = None,
+) -> dict:
+    """Lenient JSON -> dict with logging-rich diagnostics."""
+    raw_args = tool_call_args_str if isinstance(tool_call_args_str, str) else str(tool_call_args_str)
+
     # Temp hack to gracefully handle parallel tool calling attempt, only take first one
-    if "}{" in tool_call_args_str:
-        tool_call_args_str = tool_call_args_str.split("}{", 1)[0] + "}"
+    if "}{" in raw_args:
+        arg_len, head, tail = _tool_args_preview(raw_args)
+        logger.warning(
+            "Tool args contained concatenated JSON objects; truncating at first object "
+            "(source=%s tool_call_id=%s tool_name=%s run_id=%s step_id=%s len=%d head=%r tail=%r)",
+            source,
+            tool_call_id,
+            tool_name,
+            run_id,
+            step_id,
+            arg_len,
+            head,
+            tail,
+        )
+        raw_args = raw_args.split("}{", 1)[0] + "}"
 
     try:
-        tool_args = json.loads(tool_call_args_str)
+        tool_args = json.loads(raw_args)
         if not isinstance(tool_args, dict):
             # Load it again - this is due to sometimes Anthropic returning weird json @caren
             tool_args = json.loads(tool_args)
-    except json.JSONDecodeError:
-        logger.error("Failed to JSON decode tool call argument string: %s", tool_call_args_str)
+            if not isinstance(tool_args, dict):
+                raise TypeError(f"tool args JSON must decode to object, got {type(tool_args).__name__}")
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        arg_len, head, tail = _tool_args_preview(raw_args)
+        logger.error(
+            "Failed to decode tool call arguments; using {} fallback "
+            "(source=%s tool_call_id=%s tool_name=%s run_id=%s step_id=%s err=%s len=%d head=%r tail=%r)",
+            source,
+            tool_call_id,
+            tool_name,
+            run_id,
+            step_id,
+            e,
+            arg_len,
+            head,
+            tail,
+        )
         tool_args = {}
 
     return tool_args

@@ -1828,7 +1828,14 @@ class LettaAgent(BaseAgent):
         # 1.  Parse and validate the tool-call envelope
         tool_call_name: str = tool_call.function.name
 
-        tool_args = _safe_load_tool_call_str(tool_call.function.arguments)
+        tool_args = _safe_load_tool_call_str(
+            tool_call.function.arguments,
+            tool_call_id=tool_call_id,
+            tool_name=tool_call_name,
+            run_id=self.current_run_id,
+            step_id=step_id,
+            source="letta_agent._handle_ai_response",
+        )
         request_heartbeat: bool = _pop_heartbeat(tool_args)
         tool_args.pop(INNER_THOUGHTS_KWARG, None)
 

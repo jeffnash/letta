@@ -13,6 +13,7 @@ Key failure modes addressed:
 """
 
 import uuid
+import json
 from typing import Any, Dict, Optional
 
 from letta.log import get_logger
@@ -24,6 +25,23 @@ from letta.schemas.openai.chat_completion_response import (
 )
 
 logger = get_logger(__name__)
+
+
+def _tool_args_look_valid_json_object(arguments: Any) -> tuple[bool, str]:
+    """Best-effort check used only for diagnostics in the normalizer."""
+    if arguments is None:
+        return True, "none"
+    if not isinstance(arguments, str):
+        return False, f"non-string type={type(arguments).__name__}"
+    try:
+        parsed = json.loads(arguments)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if not isinstance(parsed, dict):
+            return False, f"decoded type={type(parsed).__name__}"
+        return True, "ok"
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        return False, str(e)
 
 
 def normalize_chat_completion_response(
@@ -166,6 +184,32 @@ def normalize_chat_completion_response(
                             if func.get("arguments") is None:
                                 func["arguments"] = "{}"
                                 normalizations_applied.append(f"choices[{i}].tool_calls[{j}].function.arguments=null->{{}}")
+                            else:
+                                args = func.get("arguments")
+                                looks_valid, reason = _tool_args_look_valid_json_object(args)
+                                if not looks_valid:
+                                    args_str = args if isinstance(args, str) else str(args)
+                                    arg_len = len(args_str)
+                                    head = args_str[:160]
+                                    tail = args_str[-160:] if arg_len > 160 else args_str
+                                    logger.warning(
+                                        "Tool-call arguments looked malformed during response normalization; "
+                                        "keeping payload for downstream sanitizer "
+                                        "(run_id=%s step_id=%s provider=%s model=%s choice=%d tool_index=%d "
+                                        "tool_call_id=%s tool_name=%s reason=%s len=%d head=%r tail=%r)",
+                                        run_id,
+                                        step_id,
+                                        provider,
+                                        model,
+                                        i,
+                                        j,
+                                        tc.get("id"),
+                                        func.get("name"),
+                                        reason,
+                                        arg_len,
+                                        head,
+                                        tail,
+                                    )
     
     # Log normalizations if any were applied
     if normalizations_applied:

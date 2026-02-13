@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from typing import Optional
@@ -64,6 +65,27 @@ from letta.streaming_utils import (
 )
 
 logger = get_logger(__name__)
+
+
+def _tool_args_preview(raw_args: Optional[str], max_chars: int = 140) -> tuple[int, str, str]:
+    s = raw_args if isinstance(raw_args, str) else ("" if raw_args is None else str(raw_args))
+    if len(s) <= max_chars:
+        return len(s), s, s
+    return len(s), s[:max_chars], s[-max_chars:]
+
+
+def _tool_args_look_valid_json_object(raw_args: Optional[str]) -> tuple[bool, str]:
+    if raw_args in (None, ""):
+        return True, "empty"
+    try:
+        parsed = json.loads(raw_args)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)
+        if not isinstance(parsed, dict):
+            return False, f"decoded type={type(parsed).__name__}"
+        return True, "ok"
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        return False, str(e)
 
 
 class OpenAIStreamingInterface:
@@ -723,6 +745,8 @@ class SimpleOpenAIStreamingInterface:
         # Accumulate per-index tool call fragments and preserve order
         self._tool_calls_acc: dict[int, dict[str, str]] = {}
         self._tool_call_start_order: list[int] = []
+        self._warned_missing_tool_call_id_indices: set[int] = set()
+        self._warned_missing_responses_mapping_keys: set[str] = set()
 
         self.content_messages = []
         self.emitted_hidden_reasoning = False  # Track if we've emitted hidden reasoning message
@@ -788,8 +812,40 @@ class SimpleOpenAIStreamingInterface:
             name = "".join(ctx.get("name_parts", [])) if "name_parts" in ctx else ctx.get("name", "")
             args = "".join(ctx.get("arguments_parts", [])) if "arguments_parts" in ctx else ctx.get("arguments", "")
             call_id = "".join(ctx.get("id_parts", [])) if "id_parts" in ctx else ctx.get("id", "")
-            if call_id and name:
-                result.append(ToolCall(id=call_id, function=FunctionCall(arguments=args or "", name=name)))
+            if not call_id or not name:
+                arg_len, head, tail = _tool_args_preview(args)
+                logger.warning(
+                    "Dropping incomplete accumulated tool call at stream finalize "
+                    "(run_id=%s step_id=%s index=%s has_call_id=%s has_name=%s args_len=%d head=%r tail=%r)",
+                    self.run_id,
+                    self.step_id,
+                    idx,
+                    bool(call_id),
+                    bool(name),
+                    arg_len,
+                    head,
+                    tail,
+                )
+                continue
+
+            looks_valid, reason = _tool_args_look_valid_json_object(args)
+            if not looks_valid:
+                arg_len, head, tail = _tool_args_preview(args)
+                logger.warning(
+                    "Final accumulated tool-call arguments look malformed "
+                    "(run_id=%s step_id=%s index=%s tool_call_id=%s tool_name=%s reason=%s args_len=%d head=%r tail=%r)",
+                    self.run_id,
+                    self.step_id,
+                    idx,
+                    call_id,
+                    name,
+                    reason,
+                    arg_len,
+                    head,
+                    tail,
+                )
+
+            result.append(ToolCall(id=call_id, function=FunctionCall(arguments=args or "", name=name)))
         return result
 
     def get_tool_call_object(self) -> ToolCall:
@@ -1073,6 +1129,21 @@ class SimpleOpenAIStreamingInterface:
                     resolved_id = "".join(acc.get("id_parts", [])) if acc.get("id_parts") else None
                     # If we don't yet have an id for this tool_call index, skip emitting unusable delta
                     if resolved_id is None:
+                        if idx not in self._warned_missing_tool_call_id_indices:
+                            arg_frag = tool_call.function.arguments if (tool_call.function and tool_call.function.arguments) else None
+                            arg_len, head, tail = _tool_args_preview(arg_frag)
+                            logger.warning(
+                                "Skipping tool-call delta because tool_call_id is missing "
+                                "(run_id=%s step_id=%s index=%s name_fragment=%r args_len=%d head=%r tail=%r)",
+                                self.run_id,
+                                self.step_id,
+                                idx,
+                                tool_call.function.name if tool_call.function else None,
+                                arg_len,
+                                head,
+                                tail,
+                            )
+                            self._warned_missing_tool_call_id_indices.add(idx)
                         continue
 
                     delta = ToolCallDelta(
@@ -1612,6 +1683,21 @@ class SimpleOpenAIResponsesStreamingInterface:
 
             if resolved_call_id is None:
                 # Mapping not yet available (unexpected); skip emitting unusable delta
+                map_key = f"{out_idx}:{item_id}"
+                if map_key not in self._warned_missing_responses_mapping_keys:
+                    arg_len, head, tail = _tool_args_preview(delta)
+                    logger.warning(
+                        "Responses stream delta missing tool-call mapping; skipping unusable delta "
+                        "(run_id=%s step_id=%s output_index=%s item_id=%s args_len=%d head=%r tail=%r)",
+                        self.run_id,
+                        self.step_id,
+                        out_idx,
+                        item_id,
+                        arg_len,
+                        head,
+                        tail,
+                    )
+                    self._warned_missing_responses_mapping_keys.add(map_key)
                 return
 
             # We have a call id; emit approval or tool-call message accordingly

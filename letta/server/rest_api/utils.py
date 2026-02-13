@@ -64,29 +64,50 @@ def _sanitize_tool_call_arguments_for_persistence(
     tool_name: Optional[str],
     run_id: Optional[str],
     step_id: Optional[str],
+    source: Optional[str] = None,
 ) -> str:
     """Ensure persisted tool-call arguments are valid JSON objects."""
     if not arguments:
         return "{}"
 
+    arg_str = arguments if isinstance(arguments, str) else str(arguments)
+    arg_len = len(arg_str)
+    head = arg_str[:160]
+    tail = arg_str[-160:] if arg_len > 160 else arg_str
+
     try:
-        parsed = json.loads(arguments)
+        parsed = json.loads(arg_str)
         if isinstance(parsed, str):
             # Some providers occasionally double-encode the JSON payload.
             parsed = json.loads(parsed)
+            logger.warning(
+                "Tool-call arguments were double-encoded before persistence; normalized "
+                "(source=%s tool_call_id=%s tool_name=%s run_id=%s step_id=%s len=%d head=%r tail=%r)",
+                source,
+                tool_call_id,
+                tool_name,
+                run_id,
+                step_id,
+                arg_len,
+                head,
+                tail,
+            )
         if not isinstance(parsed, dict):
             raise TypeError(f"tool args JSON must decode to object, got {type(parsed).__name__}")
         return json.dumps(parsed)
     except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.error(
             "Invalid tool_call.function.arguments before persistence; sanitizing to {} "
-            "(tool_call_id=%s tool_name=%s run_id=%s step_id=%s err=%s raw=%s)",
+            "(source=%s tool_call_id=%s tool_name=%s run_id=%s step_id=%s err=%s len=%d head=%r tail=%r)",
+            source,
             tool_call_id,
             tool_name,
             run_id,
             step_id,
             e,
-            str(arguments)[:200],
+            arg_len,
+            head,
+            tail,
         )
         return "{}"
 
@@ -416,6 +437,7 @@ def create_approval_request_message_from_llm_response(
                 tool_name=tool_call.function.name,
                 run_id=run_id,
                 step_id=step_id,
+                source="create_approval_request_message_from_llm_response.allowed",
             )
             oai_tool_calls.append(
                 OpenAIToolCall(
@@ -450,6 +472,7 @@ def create_approval_request_message_from_llm_response(
             tool_name=tool_call.function.name,
             run_id=run_id,
             step_id=step_id,
+            source="create_approval_request_message_from_llm_response.requested",
         )
         oai_tool_calls.append(
             OpenAIToolCall(

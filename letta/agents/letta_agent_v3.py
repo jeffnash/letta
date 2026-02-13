@@ -1263,7 +1263,14 @@ class LettaAgentV3(LettaAgentV2):
         for tc in tool_calls:
             call_id = tc.id or f"call_{uuid.uuid4().hex[:8]}"
             name = tc.function.name
-            args = _safe_load_tool_call_str(tc.function.arguments)
+            args = _safe_load_tool_call_str(
+                tc.function.arguments,
+                tool_call_id=call_id,
+                tool_name=name,
+                run_id=run_id,
+                step_id=step_id,
+                source="letta_agent_v3.exec_specs",
+            )
             args.pop(REQUEST_HEARTBEAT_PARAM, None)
             args.pop(INNER_THOUGHTS_KWARG, None)
 
