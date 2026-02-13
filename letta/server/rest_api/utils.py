@@ -57,6 +57,40 @@ SSE_ARTIFICIAL_DELAY = 0.1
 logger = get_logger(__name__)
 
 
+def _sanitize_tool_call_arguments_for_persistence(
+    arguments: Optional[str],
+    *,
+    tool_call_id: Optional[str],
+    tool_name: Optional[str],
+    run_id: Optional[str],
+    step_id: Optional[str],
+) -> str:
+    """Ensure persisted tool-call arguments are valid JSON objects."""
+    if not arguments:
+        return "{}"
+
+    try:
+        parsed = json.loads(arguments)
+        if isinstance(parsed, str):
+            # Some providers occasionally double-encode the JSON payload.
+            parsed = json.loads(parsed)
+        if not isinstance(parsed, dict):
+            raise TypeError(f"tool args JSON must decode to object, got {type(parsed).__name__}")
+        return json.dumps(parsed)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.error(
+            "Invalid tool_call.function.arguments before persistence; sanitizing to {} "
+            "(tool_call_id=%s tool_name=%s run_id=%s step_id=%s err=%s raw=%s)",
+            tool_call_id,
+            tool_name,
+            run_id,
+            step_id,
+            e,
+            str(arguments)[:200],
+        )
+        return "{}"
+
+
 def sse_formatter(data: Union[dict, str]) -> str:
     """Prefix with 'data: ', and always include double newlines"""
     assert type(data) in [dict, str], f"Expected type dict or str, got type {type(data)}"
@@ -374,17 +408,25 @@ def create_approval_request_message_from_llm_response(
     
     messages = []
     if allowed_tool_calls:
-        oai_tool_calls = [
-            OpenAIToolCall(
-                id=tool_call.id,
-                function=OpenAIFunction(
-                    name=tool_call.function.name,
-                    arguments=tool_call.function.arguments,
-                ),
-                type="function",
+        oai_tool_calls = []
+        for tool_call in allowed_tool_calls:
+            args_str = _sanitize_tool_call_arguments_for_persistence(
+                tool_call.function.arguments,
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.function.name,
+                run_id=run_id,
+                step_id=step_id,
             )
-            for tool_call in allowed_tool_calls
-        ]
+            oai_tool_calls.append(
+                OpenAIToolCall(
+                    id=tool_call.id,
+                    function=OpenAIFunction(
+                        name=tool_call.function.name,
+                        arguments=args_str,
+                    ),
+                    type="function",
+                )
+            )
         tool_message = Message(
             role=MessageRole.assistant,
             content=reasoning_content if reasoning_content else [],
@@ -400,17 +442,25 @@ def create_approval_request_message_from_llm_response(
             tool_message.id = pre_computed_assistant_message_id
         messages.append(tool_message)
     # Construct the tool call with the assistant's message
-    oai_tool_calls = [
-        OpenAIToolCall(
-            id=tool_call.id,
-            function=OpenAIFunction(
-                name=tool_call.function.name,
-                arguments=tool_call.function.arguments,
-            ),
-            type="function",
+    oai_tool_calls = []
+    for tool_call in requested_tool_calls:
+        args_str = _sanitize_tool_call_arguments_for_persistence(
+            tool_call.function.arguments,
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.function.name,
+            run_id=run_id,
+            step_id=step_id,
         )
-        for tool_call in requested_tool_calls
-    ]
+        oai_tool_calls.append(
+            OpenAIToolCall(
+                id=tool_call.id,
+                function=OpenAIFunction(
+                    name=tool_call.function.name,
+                    arguments=args_str,
+                ),
+                type="function",
+            )
+        )
     # TODO: Use ToolCallContent instead of tool_calls
     # TODO: This helps preserve ordering
     approval_message = Message(
