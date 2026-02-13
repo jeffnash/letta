@@ -477,14 +477,37 @@ class SyncServer(object):
                 return provider
         return None
 
-    async def _sync_provider_models_async(self):
-        """Sync all provider models to database at startup."""
-        logger.info("Syncing provider models to database")
+    async def _sync_provider_models_async(self, provider_name: Optional[str] = None) -> Dict[str, Any]:
+        """Sync provider models to the database.
+
+        Args:
+            provider_name: Optional provider name filter. When provided, only that provider is synced.
+
+        Returns:
+            Summary of sync activity for API/debug visibility.
+        """
+        filter_label = provider_name or "all"
+        logger.info(f"Syncing provider models to database (filter={filter_label})")
+
+        if self.default_user is None:
+            raise LettaInvalidArgumentError("Cannot sync provider models without default user context")
+
+        summary: Dict[str, Any] = {
+            "filter": filter_label,
+            "processed": 0,
+            "synced": [],
+            "skipped": [],
+            "failed": [],
+        }
 
         # Get persisted providers from database (they now have IDs)
         persisted_providers = await self.provider_manager.list_providers_async(actor=self.default_user)
 
         for persisted_provider in persisted_providers:
+            if provider_name and persisted_provider.name != provider_name:
+                continue
+
+            summary["processed"] += 1
             try:
                 # Find the matching enabled provider instance to call list_models on
                 enabled_provider = self._get_enabled_provider(persisted_provider.name)
@@ -498,11 +521,29 @@ class SyncServer(object):
                             await self.provider_manager.delete_provider_by_id_async(
                                 provider_id=persisted_provider.id, actor=self.default_user
                             )
+                            summary["skipped"].append(
+                                {
+                                    "provider": persisted_provider.name,
+                                    "reason": "base_provider_not_enabled_deleted",
+                                }
+                            )
                         except NoResultFound:
                             # Provider was already deleted (race condition in multi-pod startup)
                             logger.debug(f"Provider {persisted_provider.name} was already deleted, skipping")
+                            summary["skipped"].append(
+                                {
+                                    "provider": persisted_provider.name,
+                                    "reason": "base_provider_already_deleted",
+                                }
+                            )
                     else:
                         logger.debug(f"No enabled provider for BYOK provider {persisted_provider.name}, skipping model sync")
+                        summary["skipped"].append(
+                            {
+                                "provider": persisted_provider.name,
+                                "reason": "byok_provider_not_enabled",
+                            }
+                        )
                     continue
 
                 # Fetch models from provider
@@ -521,8 +562,28 @@ class SyncServer(object):
                 logger.info(
                     f"Synced {len(llm_models)} LLM models and {len(embedding_models)} embedding models for provider {persisted_provider.name}"
                 )
+                summary["synced"].append(
+                    {
+                        "provider": persisted_provider.name,
+                        "provider_id": persisted_provider.id,
+                        "llm_models": len(llm_models),
+                        "embedding_models": len(embedding_models),
+                    }
+                )
             except Exception as e:
                 logger.error(f"Failed to sync models for provider {persisted_provider.name}: {e}", exc_info=True)
+                summary["failed"].append(
+                    {
+                        "provider": persisted_provider.name,
+                        "provider_id": persisted_provider.id,
+                        "error": str(e),
+                    }
+                )
+
+        if provider_name and summary["processed"] == 0:
+            logger.warning(f"No persisted provider matched filter '{provider_name}' during model sync")
+
+        return summary
 
     async def init_mcp_clients(self):
         # TODO: remove this
