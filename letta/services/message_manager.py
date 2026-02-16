@@ -1279,28 +1279,49 @@ class MessageManager:
             ValueError: If message embedding or Turbopuffer is not enabled
         """
         from letta.helpers.tpuf_client import TurbopufferClient, should_use_tpuf_for_messages
+        from letta.helpers.qdrant_client import QdrantClient, should_use_qdrant_for_messages
+        from letta.settings import settings
 
-        # check if turbopuffer is enabled
-        # TODO: extend to non-Turbopuffer in the future.
-        if not should_use_tpuf_for_messages():
-            raise ValueError("Message search requires message embedding, OpenAI, and Turbopuffer to be enabled.")
-
-        # use turbopuffer for search - TurbopufferClient will generate embeddings internally
-        tpuf_client = TurbopufferClient()
-        results = await tpuf_client.query_messages_by_org_id(
-            organization_id=actor.organization_id,
-            actor=actor,
-            query_text=query_text,
-            search_mode=search_mode,
-            top_k=limit,
-            roles=roles,
-            agent_id=agent_id,
-            project_id=project_id,
-            template_id=template_id,
-            conversation_id=conversation_id,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        # Check which vector database provider to use
+        if should_use_qdrant_for_messages():
+            # Use Qdrant for search
+            qdrant_client = QdrantClient()
+            results = await qdrant_client.query_messages_by_org_id(
+                organization_id=actor.organization_id,
+                actor=actor,
+                query_text=query_text,
+                search_mode=search_mode,
+                top_k=limit,
+                roles=roles,
+                agent_id=agent_id,
+                project_id=project_id,
+                template_id=template_id,
+                conversation_id=conversation_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        elif should_use_tpuf_for_messages():
+            # Use Turbopuffer for search
+            tpuf_client = TurbopufferClient()
+            results = await tpuf_client.query_messages_by_org_id(
+                organization_id=actor.organization_id,
+                actor=actor,
+                query_text=query_text,
+                search_mode=search_mode,
+                top_k=limit,
+                roles=roles,
+                agent_id=agent_id,
+                project_id=project_id,
+                template_id=template_id,
+                conversation_id=conversation_id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        else:
+            raise ValueError(
+                "Message search requires message embedding and a vector database provider (Turbopuffer or Qdrant) to be enabled. "
+                "Set VECTOR_DB_PROVIDER=qdrant and QDRANT_URL, or USE_TPUF=true and TPUF_API_KEY."
+            )
 
         # convert results to MessageSearchResult objects
         if not results:

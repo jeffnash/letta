@@ -396,6 +396,14 @@ class Settings(BaseSettings):
     embed_all_messages: bool = False
     embed_tools: bool = False
 
+    # Vector database provider selection
+    vector_db_provider: str = Field(default="turbopuffer", description="Vector database provider (turbopuffer, qdrant)")
+
+    # For Qdrant - alternative to Turbopuffer
+    qdrant_url: Optional[str] = Field(default="http://localhost:6333", description="Qdrant server URL")
+    qdrant_api_key: Optional[str] = Field(default=None, description="Qdrant API key (optional for local deployment)")
+    qdrant_prefer_grpc: bool = Field(default=False, description="Use gRPC instead of REST API for Qdrant")
+
     # For encryption
     encryption_key: Optional[str] = None
 

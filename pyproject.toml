@@ -136,6 +136,7 @@ external-tools = [
     "langchain-community>=0.3.7",
     "exa-py>=1.15.4",
     "turbopuffer>=0.5.17",
+    "qdrant-client>=1.12.0",
 ]
 desktop = [
     "websockets",
