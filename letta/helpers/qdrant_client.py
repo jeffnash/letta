@@ -761,3 +761,210 @@ class QdrantClient:
         except Exception as e:
             logger.error(f"Failed to delete all messages from Qdrant: {e}")
             raise
+
+    @trace_method
+    async def backfill_messages_for_org(
+        self,
+        organization_id: str,
+        actor: "PydanticUser",
+        agent_id: Optional[str] = None,
+        batch_size: int = 100,
+        force: bool = False,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Backfill messages from PostgreSQL to Qdrant.
+
+        This method fetches existing messages from the database and populates
+        the Qdrant vector database with embeddings. Useful for:
+        - Initial setup when switching to Qdrant
+        - Rebuilding the vector database
+        - Migrating from Turbopuffer
+
+        Args:
+            organization_id: Organization ID to backfill messages for
+            actor: User actor for embedding generation
+            agent_id: Optional agent ID to filter messages
+            batch_size: Number of messages to process per batch (default: 100)
+            force: If True, re-embed messages that already exist in Qdrant
+            start_date: Only backfill messages created after this date
+            end_date: Only backfill messages created before this date
+            dry_run: If True, only show statistics without actually backfilling
+
+        Returns:
+            dict with statistics:
+            - total_messages: Total messages found in database
+            - processed: Messages successfully processed
+            - skipped: Messages skipped (already exist and force=False)
+            - failed: Messages that failed to process
+            - batches: Number of batches processed
+            - time_taken: Time taken in seconds
+        """
+        import time
+
+        from letta.services.message_manager import MessageManager
+
+        start_time = time.time()
+        stats = {
+            "total_messages": 0,
+            "processed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "batches": 0,
+            "time_taken": 0,
+        }
+
+        # Get message manager
+        message_manager = MessageManager()
+
+        # Build filters for querying messages
+        logger.info(f"Fetching messages for organization {organization_id}")
+        if agent_id:
+            logger.info(f"  Filtering by agent_id: {agent_id}")
+        if start_date:
+            logger.info(f"  Filtering by start_date: {start_date}")
+        if end_date:
+            logger.info(f"  Filtering by end_date: {end_date}")
+
+        # Fetch all message IDs that match the criteria
+        # We'll fetch in batches to avoid loading everything into memory
+        try:
+            # Get total count first
+            from sqlalchemy import and_, func, select
+
+            from letta.orm.message import Message as MessageModel
+            from letta.server.server import db_context
+
+            async with db_context() as session:
+                # Build query
+                query = select(func.count(MessageModel.id)).where(MessageModel.organization_id == organization_id)
+
+                if agent_id:
+                    query = query.where(MessageModel.agent_id == agent_id)
+                if start_date:
+                    query = query.where(MessageModel.created_at >= start_date)
+                if end_date:
+                    query = query.where(MessageModel.created_at <= end_date)
+
+                result = await session.execute(query)
+                total_count = result.scalar()
+
+            stats["total_messages"] = total_count
+
+            if total_count == 0:
+                logger.info("No messages found to backfill")
+                return stats
+
+            logger.info(f"Found {total_count} messages to backfill")
+
+            if dry_run:
+                logger.info("Dry run mode - not actually backfilling")
+                # Estimate cost
+                avg_tokens_per_message = 100
+                total_tokens = total_count * avg_tokens_per_message
+                cost_per_1k_tokens = 0.00002  # text-embedding-3-small
+                estimated_cost = (total_tokens / 1000) * cost_per_1k_tokens
+                logger.info(f"Estimated cost: ${estimated_cost:.4f} (OpenAI embeddings)")
+                stats["estimated_cost"] = estimated_cost
+                return stats
+
+            # Get namespace
+            namespace_name = await self._get_message_namespace_name(organization_id)
+
+            # Ensure collection exists
+            await self._ensure_collection_exists(namespace_name)
+
+            # Process in batches
+            num_batches = (total_count + batch_size - 1) // batch_size
+            logger.info(f"Processing in {num_batches} batches of {batch_size}")
+
+            for batch_num in range(num_batches):
+                offset = batch_num * batch_size
+                logger.info(f"Processing batch {batch_num + 1}/{num_batches} (offset: {offset})")
+
+                async with db_context() as session:
+                    # Build query for this batch
+                    query = select(MessageModel).where(MessageModel.organization_id == organization_id)
+
+                    if agent_id:
+                        query = query.where(MessageModel.agent_id == agent_id)
+                    if start_date:
+                        query = query.where(MessageModel.created_at >= start_date)
+                    if end_date:
+                        query = query.where(MessageModel.created_at <= end_date)
+
+                    query = query.offset(offset).limit(batch_size)
+
+                    result = await session.execute(query)
+                    message_models = result.scalars().all()
+
+                if not message_models:
+                    logger.warning(f"No messages found in batch {batch_num + 1}")
+                    continue
+
+                # Convert to PydanticMessage objects
+                from letta.schemas.message import Message as PydanticMessage
+
+                messages = [PydanticMessage.model_validate(msg) for msg in message_models]
+
+                # Check which messages already exist in Qdrant (if not force)
+                messages_to_process = messages
+                if not force:
+                    # Query Qdrant to see which messages already exist
+                    existing_ids = set()
+                    try:
+                        from qdrant_client import models
+
+                        for message in messages:
+                            try:
+                                result = await self.client.retrieve(
+                                    collection_name=namespace_name,
+                                    ids=[message.id],
+                                )
+                                if result:
+                                    existing_ids.add(message.id)
+                            except Exception:
+                                # Message doesn't exist, that's fine
+                                pass
+
+                        if existing_ids:
+                            logger.info(f"Skipping {len(existing_ids)} messages that already exist")
+                            messages_to_process = [msg for msg in messages if msg.id not in existing_ids]
+                            stats["skipped"] += len(existing_ids)
+                    except Exception as e:
+                        logger.warning(f"Failed to check existing messages: {e}")
+                        # Continue with all messages
+
+                if not messages_to_process:
+                    logger.info("All messages in this batch already exist, skipping")
+                    stats["batches"] += 1
+                    continue
+
+                # Insert messages (this will generate embeddings and insert)
+                try:
+                    await self.insert_messages(
+                        messages=messages_to_process,
+                        organization_id=organization_id,
+                        actor=actor,
+                    )
+                    stats["processed"] += len(messages_to_process)
+                    logger.info(f"Successfully processed {len(messages_to_process)} messages")
+                except Exception as e:
+                    logger.error(f"Failed to process batch {batch_num + 1}: {e}")
+                    stats["failed"] += len(messages_to_process)
+
+                stats["batches"] += 1
+
+        except Exception as e:
+            logger.error(f"Failed to backfill messages: {e}")
+            raise
+
+        stats["time_taken"] = time.time() - start_time
+        logger.info(
+            f"Backfill complete: {stats['processed']} processed, "
+            f"{stats['skipped']} skipped, {stats['failed']} failed "
+            f"in {stats['time_taken']:.2f}s"
+        )
+
+        return stats
